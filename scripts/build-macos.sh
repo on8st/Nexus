@@ -95,7 +95,17 @@ if [ "$GUI" = 0 ]; then bold "Modem exes done (--no-gui)."; exit 0; fi
 
 # 3 — UI build deps ------------------------------------------------------------------------------
 bold "3/4  Web UI dependencies"
-( cd "$REPO/ui" && npm install >/dev/null )
+# `npm ci`, NOT `npm install` — the same command every release.yml/ci.yml job already uses.
+# `npm install` REWRITES package-lock.json to whatever the local npm believes: an npm older than
+# the one that wrote the lock silently drops the `libc` ("glibc"/"musl") fields from the optional
+# Linux rollup/esbuild binaries (69 deletions with npm 11.9.0 on 2026-08-13). That is npm's own
+# selector for which native binary a glibc-vs-musl Linux box installs, so a macOS build could
+# quietly degrade Linux installs if the rewrite were ever committed — and short of that it just
+# leaves every macOS builder with a dirty tree after an ordinary build. `npm ci` installs the
+# lockfile exactly as committed and never writes to it, so the build cannot change the source
+# tree. It also fails loudly when package.json and the lock disagree, which is the right outcome
+# for a release build rather than silently resolving something new.
+( cd "$REPO/ui" && npm ci >/dev/null )
 ok "ui/node_modules"
 
 # 4 — the GUI app + .app + .dmg ------------------------------------------------------------------

@@ -500,6 +500,16 @@ const RIG_POLL_MS: f64 = 750.0;
 /// not hammered — a failed `snd_pcm_open` is cheap but not free, and the loop ticks every 20 ms,
 /// so retrying every tick would be 50 probes a second forever on a machine with no sound card.
 const AUDIO_RETRY_MS: f64 = 2_000.0;
+/// How long the sound-card banner stays up after the card comes back (ms).
+///
+/// A device that FLAPS — dies, re-enumerates, dies again — otherwise blinks the banner on and
+/// off, because each successful reopen clears it a second or so before the next death raises it.
+/// The operator sees a flickering UI instead of the one fact that matters: this codec is failing.
+/// Holding the banner for longer than the flap interval turns that stutter into one steady
+/// warning, while a genuine one-off recovery still clears promptly once the card stays up.
+/// 5 s is comfortably above the ~2 s cycle of a dropping USB codec (measured on an ON8ST dongle,
+/// 2026-08-13) and short enough that it never lingers as a stale scare after a real fix.
+const AUDIO_BANNER_HOLD_MS: f64 = 5_000.0;
 /// How often to read the NEXT transmit meter while keyed — the mirror image of the RX health
 /// poll. One meter is read per interval (round-robin over SWR/ALC/Po/COMP), so at 150 ms each
 /// meter refreshes ~1.7×/s: live enough to set mic gain against the moving ALC bar, while never
@@ -1913,6 +1923,11 @@ struct RadioLoop {
     /// a banner telling him to do the one thing that would not help. Found by the change's own
     /// adversarial review, 2026-08-05.
     audio_retry_at: Option<f64>,
+    /// Keep the sound-card banner up at least until this timestamp, even once the card reopens
+    /// successfully — armed by a stream death, cleared when it expires with the card healthy.
+    /// See [`AUDIO_BANNER_HOLD_MS`] for why a flapping device needs this to read as one warning
+    /// rather than a flicker.
+    audio_banner_hold_until: Option<f64>,
     /// The NATIVE RF panadapter worker (Flex SmartSDR VITA / Icom CI-V) for the ACTIVE radio, if
     /// it has one. Reconciled each step from `native_spectrum_kind(want)`: started when the active
     /// radio gains a native scope, dropped (threads stopped + pan removed) when it loses it or the
@@ -2159,6 +2174,7 @@ impl RadioLoop {
             monitor_reapply: false,
             force_audio_rebuild: false,
             audio_retry_at: None,
+            audio_banner_hold_until: None,
             spectrum_src: None,
             spectrum_src_key: None,
             dax_src: None,
@@ -2984,6 +3000,20 @@ impl RadioLoop {
                 // A REAL device error owns the line, same as the open-failure arm below.
                 self.err_owner = ErrOwner::Device;
                 self.force_audio_rebuild = true;
+                // Hold the banner past the reopen that is about to succeed, so a codec dying
+                // every couple of seconds reads as one steady warning instead of a flicker.
+                self.audio_banner_hold_until = Some(now + AUDIO_BANNER_HOLD_MS);
+            }
+            // The card has now been healthy for the whole hold window — retire the banner. Only
+            // reachable while the last reopen SUCCEEDED: a failed one clears the hold and owns the
+            // line itself, so this can never wipe a banner that is still true.
+            if self.audio_banner_hold_until.is_some_and(|t| now >= t) {
+                self.audio_banner_hold_until = None;
+                if self.err_owner == ErrOwner::Device {
+                    let mut eng = engine_lock(engine);
+                    eng.set_audio_error(None);
+                    self.err_owner = ErrOwner::None;
+                }
             }
             // A dual-radio switch forces the rebuild (a new radio's device must be opened even if the
             // name compares equal — e.g. two "system default"s); else rebuild only on a real change.
@@ -3031,11 +3061,17 @@ impl RadioLoop {
                         if let Some((ring, rate)) = backend.spectrum_tap() {
                             self.rx_tap.publish_card(ring, rate);
                         }
-                        {
-                            let mut eng = engine_lock(engine);
-                            eng.set_audio_error(None);
+                        // Clear the banner UNLESS a recent stream death is still holding it up.
+                        // A flapping codec reopens fine every time, so clearing here on every
+                        // success is exactly what made the warning blink; the hold expiry above
+                        // retires it once the card has actually stayed healthy.
+                        if !self.audio_banner_hold_until.is_some_and(|t| now < t) {
+                            {
+                                let mut eng = engine_lock(engine);
+                                eng.set_audio_error(None);
+                            }
+                            self.err_owner = ErrOwner::None;
                         }
-                        self.err_owner = ErrOwner::None;
                         self.audio_retry_at = None; // it opened — stop retrying
                                                     // The fresh backend has NO mic stream — a stale-true flag
                                                     // here fed the recorder empty audio for the rest of a
@@ -3051,6 +3087,9 @@ impl RadioLoop {
                         // A REAL device error owns the line — monitor/voice-mic
                         // notices may neither overwrite nor clear it.
                         self.err_owner = ErrOwner::Device;
+                        // This banner is CURRENTLY true and stands on its own until the device
+                        // opens; disarm the hold so its expiry can never wipe it out from under.
+                        self.audio_banner_hold_until = None;
                         // Arm the retry. A rig powered on after Nexus, or a codec held for a
                         // moment by another app, now recovers on its own instead of stranding
                         // the operator on the fallback device — see `audio_retry_at`.
@@ -12382,13 +12421,15 @@ mod tests {
 
     /// A stream the OS KILLED must raise the banner and reopen the card, with NO settings change.
     ///
-    /// The 2026-08-13 ON8ST case: a USB codec that dropped off the bus 2.0–2.4 s after every
+    /// The 2026-08-13 ON8ST case: a USB codec that dropped off the bus 2.0-2.4 s after every
     /// open. `device.rs`'s error callback only `eprintln!`ed, which a Finder-launched `.app`
     /// discards, and `audio_differs` cannot see a device vanishing because nothing in the
-    /// transport changed — so Nexus ran on with a blank waterfall, no decodes and no banner, and
-    /// the fault read as "Nexus is broken" rather than "this dongle is". Both halves are asserted
-    /// here: the operator is TOLD, and the card is reopened so it heals itself when the device
-    /// returns.
+    /// transport changed - so Nexus ran on with a blank waterfall, no decodes and no banner, and
+    /// the fault read as "Nexus is broken" rather than "this dongle is".
+    ///
+    /// Walks one monotonic timeline through every state that matters: death, the hold that keeps
+    /// a FLAPPING device from blinking the banner, the retirement once it is genuinely healthy,
+    /// and the death whose reopen also fails.
     #[test]
     fn a_stream_killed_by_the_os_raises_the_banner_and_reopens_the_card() {
         let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
@@ -12398,116 +12439,104 @@ mod tests {
         let sinks = no_sinks();
         let mut station = StationSinks::new();
         let mut rr = |_t: &Transport, _c: bool| (Rig::vox(), None, CatProbe::status(None, "test"));
-
-        // Settle first, so `applied == want` and nothing else can explain a rebuild.
-        let mut ra = mock_reopen_audio();
-        state
-            .step(
-                &engine,
-                &mut backend,
-                &mut rig,
-                &sinks,
-                0.0,
-                &mut ra,
-                &mut rr,
-                &mut station,
+        let dead = || {
+            Some(
+                "capture stream: The requested device is no longer available. For example, it \
+                 has been unplugged."
+                    .to_string(),
             )
-            .unwrap();
+        };
+        let banner =
+            |e: &Arc<Mutex<Engine>>| e.lock().unwrap().snapshot().radio.audio_error.clone();
+
+        // t=0 - settle, so `applied == want` and nothing else can explain a later rebuild.
+        let mut ra = mock_reopen_audio();
+        let mut tick =
+            |st: &mut RadioLoop,
+             b: &mut MockBackend,
+             now: f64,
+             ra: &mut dyn FnMut(&Transport) -> Result<MockBackend, String>| {
+                st.step(&engine, b, &mut rig, &sinks, now, ra, &mut rr, &mut station)
+                    .unwrap();
+            };
+        tick(&mut state, &mut backend, 0.0, &mut ra);
         engine.lock().unwrap().set_audio_error(None);
 
-        // The OS kills the capture stream. Nothing in Settings changes.
-        backend.stream_error = Some(
-            "capture stream: The requested device is no longer \
-                                     available. For example, it has been unplugged."
-                .to_string(),
-        );
+        // t=20 - the OS kills the capture stream. Nothing in Settings changes.
+        backend.stream_error = dead();
         let reopened = std::cell::Cell::new(false);
         let mut ra_counting = |t: &Transport| {
             reopened.set(true);
             mock_reopen_audio()(t)
         };
-        state
-            .step(
-                &engine,
-                &mut backend,
-                &mut rig,
-                &sinks,
-                20.0,
-                &mut ra_counting,
-                &mut rr,
-                &mut station,
-            )
-            .unwrap();
-
+        tick(&mut state, &mut backend, 20.0, &mut ra_counting);
         assert!(
             reopened.get(),
-            "a dead stream must reopen the sound card — `audio_differs` is blind to a device \
+            "a dead stream must reopen the sound card - `audio_differs` is blind to a device \
              vanishing, so without this the card stays dead for the rest of the session"
         );
-        assert_eq!(
-            engine.lock().unwrap().snapshot().radio.audio_error,
-            None,
-            "a reopen that SUCCEEDED means the card is back; the banner must clear itself rather \
-             than leave a stale scare on screen"
+        assert!(
+            banner(&engine).is_some(),
+            "the banner is HELD across the successful reopen - a codec that dies every couple of \
+             seconds reopens fine each time, and clearing on every success is what made the \
+             warning blink instead of stating the problem"
         );
 
-        // Edge-triggered: one death, one reaction. A latched report would rebuild every tick.
+        // t=30 - no new death. The report is drained, not latched, so no second rebuild; and the
+        // banner is still inside its hold window, so it stays put.
         let reopened_again = std::cell::Cell::new(false);
         let mut ra_again = |t: &Transport| {
             reopened_again.set(true);
             mock_reopen_audio()(t)
         };
-        state
-            .step(
-                &engine,
-                &mut backend,
-                &mut rig,
-                &sinks,
-                40.0,
-                &mut ra_again,
-                &mut rr,
-                &mut station,
-            )
-            .unwrap();
+        tick(&mut state, &mut backend, 30.0, &mut ra_again);
         assert!(
             !reopened_again.get(),
-            "the report is drained, not latched — a single death must not rebuild every tick"
+            "the report is drained, not latched - a single death must not rebuild every tick"
+        );
+        assert!(
+            banner(&engine).is_some(),
+            "banner must persist for the whole hold window, not just the tick that raised it"
         );
 
-        // The case that actually strands the operator: the stream died AND the device is still
-        // gone, so the reopen fails too. THAT is when a banner has to be on screen and stay
-        // there — this is the ON8ST dongle's real behaviour, and the state the old code left
-        // completely undiagnosed.
-        backend.stream_error = Some(
-            "capture stream: The requested device is no longer \
-                                     available. For example, it has been unplugged."
-                .to_string(),
+        // t=20+HOLD+1 - healthy right through the hold, so the banner retires itself.
+        tick(
+            &mut state,
+            &mut backend,
+            20.0 + AUDIO_BANNER_HOLD_MS + 1.0,
+            &mut ra,
         );
+        assert_eq!(
+            banner(&engine),
+            None,
+            "once the card has stayed healthy for the hold window the banner must retire itself, \
+             else a one-off glitch leaves a stale scare on screen forever"
+        );
+
+        // Later - the case that actually strands the operator: the stream died AND the device is
+        // still gone, so the reopen fails too. That banner is true, owns the line, and must NOT
+        // be retired by the hold expiry.
+        backend.stream_error = dead();
         let mut ra_failing =
             |_t: &Transport| Err("device \"USB Audio Device\" not available".to_string());
-        state
-            .step(
-                &engine,
-                &mut backend,
-                &mut rig,
-                &sinks,
-                60.0,
-                &mut ra_failing,
-                &mut rr,
-                &mut station,
-            )
-            .unwrap();
-        let banner = engine
-            .lock()
-            .unwrap()
-            .snapshot()
-            .radio
-            .audio_error
-            .clone()
-            .expect("a dead stream whose reopen also fails MUST leave a banner up");
+        let t_fail = 20.0 + AUDIO_BANNER_HOLD_MS + 100.0;
+        tick(&mut state, &mut backend, t_fail, &mut ra_failing);
+        let up =
+            banner(&engine).expect("a dead stream whose reopen also fails MUST leave a banner");
         assert!(
-            banner.contains("USB Audio Device"),
-            "the banner must name the device that failed, got: {banner:?}"
+            up.contains("USB Audio Device"),
+            "the banner must name the device that failed, got: {up:?}"
+        );
+        tick(
+            &mut state,
+            &mut backend,
+            t_fail + AUDIO_BANNER_HOLD_MS + 1.0,
+            &mut ra_failing,
+        );
+        assert!(
+            banner(&engine).is_some(),
+            "a still-failing device keeps its banner past the hold window - the hold may only \
+             retire a banner the card has since recovered from"
         );
     }
 
