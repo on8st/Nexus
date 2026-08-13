@@ -1879,6 +1879,11 @@ export async function getSerialPorts(): Promise<string[]> {
 }
 
 export interface SerialPortInfo {
+  /** Which interface of a multi-interface bridge, when known. Only interface 0 of a CP2105
+   *  carries CAT on Yaesu rigs; interface 1 is silent and looks like a dead radio. */
+  interfaceIndex?: number | null
+  /** An audio device inside the SAME physical radio, when one could be resolved. */
+  pairedAudio?: string | null
   name: string
   /** USB product string, e.g. "USB-Enhanced-SERIAL-B CH342" ("" for non-USB ports). */
   label: string

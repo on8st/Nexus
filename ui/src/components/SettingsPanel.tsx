@@ -36,6 +36,7 @@ import {
   getBandPlan,
   getRigModels,
   getSerialPortsDetailed,
+  type SerialPortInfo,
   getSettings,
   setCloudlogKey,
   setClublogPassword,
@@ -104,6 +105,7 @@ import type { Scale, ScaleMode } from '../useScale'
 import { SCALE_STEPS, fitScale } from '../useScale'
 import type { Density } from '../useDensity'
 import type { FeaturesApi } from '../useFeatures'
+import { blocks, checkRigForm, type RigCheck } from '../rigFormChecks'
 import { FEATURES, featureById, type FeatureCategory, type FeatureDef, type FeatureId } from '../features/registry'
 import { PROFILE_LIST } from '../features/profiles'
 import { checkForUpdateManual } from '../features/updateCheck'
@@ -593,9 +595,13 @@ export function SettingsPanel({
   // Port -> USB product label ("USB-Enhanced-SERIAL-B CH342"), so the picker can tell a
   // dual-serial rig's two interfaces apart (Xiegu CAT is on SERIAL-B).
   const [portLabels, setPortLabels] = useState<Record<string, string>>({})
-  const applyPorts = (infos: { name: string; label: string }[]) => {
+  const applyPorts = (infos: SerialPortInfo[]) => {
     setSerialPorts(infos.map((i) => i.name))
     setPortLabels(Object.fromEntries(infos.map((i) => [i.name, i.label])))
+    // Keep the WHOLE record, not just name+label: the pre-save checks decide from structured
+    // facts (which interface of a bridge, what audio is inside the same radio) precisely so they
+    // never have to pattern-match display text, which changes whenever the label wording does.
+    setPortInfos(infos)
   }
   // Native CI-V bus diagnostic log: null = off, string = the log file path while capturing.
   // Transient (not persisted) — a support tool the operator arms to capture a fault. The
@@ -682,6 +688,7 @@ export function SettingsPanel({
     }
   }, [form?.serialPort])
 
+  const [portInfos, setPortInfos] = useState<SerialPortInfo[]>([])
   const [portsLoading, setPortsLoading] = useState(false)
   const [audioLoading, setAudioLoading] = useState(false)
   const [detected, setDetected] = useState<DetectedRig[]>([])
@@ -689,6 +696,9 @@ export function SettingsPanel({
   const [detecting, setDetecting] = useState(false)
   const [catTesting, setCatTesting] = useState(false)
   const [catResult, setCatResult] = useState<CatTestResult | null>(null)
+  // Pre-save findings about the RIG form. Recomputed on every save attempt; warnings stay
+  // visible after a successful save so a non-blocking oddity is not silently accepted.
+  const [rigChecks, setRigChecks] = useState<RigCheck[]>([])
   // A probe result awaiting the operator's yes. Never applied or saved on its own — see
   // `handleAutoTestPorts` for the incident that made this a question rather than a write.
   const [catProposal, setCatProposal] = useState<CatProbeResult | null>(null)
@@ -1952,6 +1962,18 @@ export function SettingsPanel({
       // silently-greyed Save button with a context-free "required" error.
       setTab('station')
       setError('Enter your callsign on the Station tab before saving.')
+      return
+    }
+    // Check the RADIO before writing it. Until now only the callsign was validated, so every way
+    // of getting the rig wrong saved silently and then behaved like broken hardware — a monitor
+    // chosen as a CAT port, or the silent second interface of a dual bridge. Errors block and name
+    // the fix; warnings are stated and the operator proceeds, because an unusual-but-correct
+    // station must never be locked out of its own configuration by a heuristic.
+    const checks = checkRigForm(form, portInfos, editingRadioId)
+    setRigChecks(checks)
+    if (blocks(checks)) {
+      setTab('radio')
+      setError(checks.find((c) => c.level === 'error')?.message ?? 'Check the radio settings.')
       return
     }
     setStatus('saving')
@@ -8557,6 +8579,16 @@ export function SettingsPanel({
         </div>
 
         <div className="settings-actions">
+          {/* Non-blocking findings stay on screen after a successful save: an oddity that did not
+              stop the write is exactly the kind that gets silently accepted and then debugged as
+              broken hardware weeks later. */}
+          {rigChecks
+            .filter((c) => c.level === 'warning')
+            .map((c, i) => (
+              <span className="settings-warning" role="status" key={i}>
+                ! {c.message}
+              </span>
+            ))}
           {error && <span className="settings-error" role="alert">{error}</span>}
           {status === 'saved' && !error && (
             <span className="settings-ok" role="status">Saved</span>

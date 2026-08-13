@@ -7690,6 +7690,13 @@ async fn get_serial_ports() -> Vec<String> {
 struct SerialPortInfo {
     name: String,
     label: String,
+    /// Which interface of a multi-interface bridge this is, when known. A CP2105 is DUAL and only
+    /// interface 0 carries CAT on the rigs this targets; interface 1 answers nothing and looks
+    /// exactly like a dead radio. `None` when there is one interface, or topology is unavailable.
+    interface_index: Option<u32>,
+    /// An audio device on the SAME physical USB device — i.e. inside the same radio. `None` when
+    /// nothing is paired, which is normal for a plain serial adapter.
+    paired_audio: Option<String>,
 }
 
 /// Serial ports WITH a descriptive USB-product label, for the Settings picker.
@@ -7721,11 +7728,30 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
             &tempo_audio::usbtopo::serial_interfaces(),
             &tempo_audio::usbtopo::audio_locations(true),
         );
+        // The same facts the label is built from, handed over STRUCTURED so the form can
+        // validate against them instead of pattern-matching display text.
+        let ifaces = tempo_audio::usbtopo::serial_interfaces();
+        let locs = tempo_audio::usbtopo::serial_locations();
+        let audio = tempo_audio::usbtopo::audio_locations(true);
         ports
             .into_iter()
-            .map(|d| SerialPortInfo {
-                name: d.name,
-                label: d.label,
+            .map(|d| {
+                let paired_audio = locs.get(&d.name).and_then(|l| {
+                    let hub = tempo_audio::usbtopo::parent_hub(*l);
+                    let mut mates: Vec<&String> = audio
+                        .iter()
+                        .filter(|(_, al)| tempo_audio::usbtopo::parent_hub(**al) == hub)
+                        .map(|(n, _)| n)
+                        .collect();
+                    mates.sort();
+                    mates.first().map(|n| (*n).clone())
+                });
+                SerialPortInfo {
+                    interface_index: ifaces.get(&d.name).copied(),
+                    paired_audio,
+                    name: d.name,
+                    label: d.label,
+                }
             })
             .collect()
     }
