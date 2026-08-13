@@ -120,6 +120,35 @@ pub fn label_by_rig(
     }
 }
 
+/// The devices that sit on the SAME physical USB device as the CAT port at `port_loc`.
+///
+/// The configure-time counterpart of [`label_by_rig`], and the more useful direction: an operator
+/// sets the CAT port first, so by the time they reach the audio pickers the answer is already
+/// determined. It needs no radio to be named, no profile to be saved and no assumption about what
+/// anything is CALLED — a rig carrying CAT and audio down one cable is internally a hub, so its
+/// codec is the one sharing its parent.
+///
+/// Returns the matching `name`s (the identity the picker stores), in the order given. Empty when
+/// nothing matches, which is the honest answer for a rig whose audio is not USB at all (a network
+/// codec, a separate interface box, an analogue card) — the picker then offers everything, as it
+/// always did, rather than an empty list.
+pub fn devices_sharing_usb_device(
+    devices: &[crate::audiodev::AudioDevice],
+    device_locs: &std::collections::HashMap<String, u32>,
+    port_loc: u32,
+) -> Vec<String> {
+    let hub = parent_hub(port_loc);
+    devices
+        .iter()
+        .filter(|d| {
+            device_locs
+                .get(&d.name)
+                .is_some_and(|l| parent_hub(*l) == hub)
+        })
+        .map(|d| d.name.clone())
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
@@ -457,6 +486,42 @@ mod tests {
         // The stored identity is untouched — settings keep resolving exactly as before.
         assert_eq!(devices[0].name, "USB Audio Device");
         assert_eq!(devices[1].name, "USB Audio Device #2");
+    }
+
+    #[test]
+    fn the_codecs_offered_for_a_cat_port_are_the_ones_inside_that_rig() {
+        // Real ON8ST topology: each rig's CAT bridge and codec are siblings on the rig's own
+        // internal hub, so selecting a CAT port determines the codec with no naming involved.
+        let devices = vec![
+            dev("USB Audio Device"),    // FT-710's, hub 0x110000
+            dev("USB Audio Device #2"), // FTX-1's,  hub 0x120000
+            dev("Mac mini Speakers"),   // not USB at all
+        ];
+        let locs = HashMap::from([
+            ("USB Audio Device".to_string(), 0x112000),
+            ("USB Audio Device #2".to_string(), 0x122000),
+        ]);
+
+        // The FT-710's CAT port offers only the FT-710's codec.
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x111000),
+            vec!["USB Audio Device"]
+        );
+        // The FTX-1's offers only the FTX-1's.
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x121000),
+            vec!["USB Audio Device #2"]
+        );
+        // The rig's OTHER CAT port (a CP2105 is dual: Enhanced + Standard) is the same USB
+        // device, so it must resolve identically — an operator on the Standard port gets the
+        // same answer as one on the Enhanced port.
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x111000),
+            devices_sharing_usb_device(&devices, &locs, 0x111000)
+        );
+        // A port on no shared hub proposes nothing, so the caller offers the full list rather
+        // than pretending a rig has no audio.
+        assert!(devices_sharing_usb_device(&devices, &locs, 0x990000).is_empty());
     }
 
     #[test]

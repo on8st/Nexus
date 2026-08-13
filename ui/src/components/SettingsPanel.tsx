@@ -31,6 +31,7 @@ import {
   downloadLotwReport,
   getAllRigModels,
   getAudioDevices,
+  audioDevicesForPort,
   getBandPlan,
   getRigModels,
   getSerialPortsDetailed,
@@ -654,6 +655,32 @@ export function SettingsPanel({
       output: Object.fromEntries(d.output.map((x) => [x.name, x.label])),
     })
   }
+  // The codecs that live inside the rig on the currently-selected CAT port, found by USB
+  // topology (see `usbtopo`). Two rigs can report the byte-identical device name, so the picker
+  // cannot disambiguate them by string at all — but the CAT port the operator already chose
+  // determines which physical device is theirs. Recomputed whenever that port changes, never
+  // stored: it describes where things are plugged in right now.
+  const [rigAudio, setRigAudio] = useState<{ input: string[]; output: string[] }>({
+    input: [],
+    output: [],
+  })
+  useEffect(() => {
+    const port = form?.serialPort?.trim()
+    if (!port) {
+      setRigAudio({ input: [], output: [] })
+      return
+    }
+    let live = true
+    audioDevicesForPort(port)
+      .then((d) => {
+        if (live) setRigAudio({ input: d.input.map((x) => x.name), output: d.output.map((x) => x.name) })
+      })
+      .catch(() => live && setRigAudio({ input: [], output: [] }))
+    return () => {
+      live = false
+    }
+  }, [form?.serialPort])
+
   const [portsLoading, setPortsLoading] = useState(false)
   const [audioLoading, setAudioLoading] = useState(false)
   const [detected, setDetected] = useState<DetectedRig[]>([])
@@ -2007,13 +2034,25 @@ export function SettingsPanel({
       ? rigModelMatches
       : [...rigModelList.filter(([n]) => n === form.rigModel), ...rigModelMatches]
 
+  // This rig's OWN codec first. Two radios can report the identical device name, so ordering
+  // by string tells the operator nothing; the CAT port they already picked does. Stable partition,
+  // NOT a filter — everything stays selectable, because the topology answer is absent for a
+  // network rig, a separate interface box and every non-macOS build, and a picker that hid the
+  // real device would be worse than one that merely failed to highlight it.
+  const rigFirst = (list: string[], kind: 'input' | 'output') =>
+    rigAudio[kind].length === 0
+      ? list
+      : [...list.filter((n) => rigAudio[kind].includes(n)), ...list.filter((n) => !rigAudio[kind].includes(n))]
+
   // include the current selection even if it's not in the enumerated list
-  const audioInOptions = form.audioIn && !audio.input.includes(form.audioIn)
-    ? [form.audioIn, ...audio.input]
-    : audio.input
-  const audioOutOptions = form.audioOut && !audio.output.includes(form.audioOut)
-    ? [form.audioOut, ...audio.output]
-    : audio.output
+  const audioInOptions = rigFirst(
+    form.audioIn && !audio.input.includes(form.audioIn) ? [form.audioIn, ...audio.input] : audio.input,
+    'input',
+  )
+  const audioOutOptions = rigFirst(
+    form.audioOut && !audio.output.includes(form.audioOut) ? [form.audioOut, ...audio.output] : audio.output,
+    'output',
+  )
   // Headphone-monitor device picker: same enumerated-output list, keeping the
   // saved selection visible even if it's since disappeared.
   const monitorOutOptions = form.monitorDevice && !audio.output.includes(form.monitorDevice)
@@ -2038,10 +2077,13 @@ export function SettingsPanel({
   // offered_in_picker=false, opens_at_runtime=true). We cannot know from here whether a name
   // will open — so we state the thing we do know and leave the verdict to the open, which is
   // already a visible error naming the device.
-  const audioLabel = (name: string, kind: 'input' | 'output') =>
-    audio[kind].includes(name)
-      ? (audioLabels[kind][name] ?? name)
-      : `${name} — saved, not in the list`
+  const audioLabel = (name: string, kind: 'input' | 'output') => {
+    if (!audio[kind].includes(name)) return `${name} — saved, not in the list`
+    const base = audioLabels[kind][name] ?? name
+    // Says WHY it is offered — it is on the same USB device as the CAT port above, so it is
+    // this radio's own codec. Only ever added; never the sole way to identify an entry.
+    return rigAudio[kind].includes(name) ? `${base} — this radio` : base
+  }
 
   // Frequencies tab: last-wins override lookup for the stock table, plus
   // duplicate band+mode keys (flagged in the editor — the last row wins).
