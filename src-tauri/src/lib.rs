@@ -8006,7 +8006,7 @@ async fn probe_cat_ports(
     {
         // Read the configured model, then release the lock for the seconds-long probe so
         // the UI's snapshot polling never blocks on it.
-        let (model, exclude) = {
+        let (model, claimed) = {
             let eng = engine_lock(&state);
             let s = eng.settings();
             // The radio being configured owns the fallback model. Fall back to the flat
@@ -8018,13 +8018,41 @@ async fn probe_cat_ports(
             // cannot succeed and burns a full no-answer baud ladder first (the wizard's
             // second-radio probe was the reporter). The radio being configured keeps its
             // own port probeable, so re-testing a misbehaving link still works.
-            let exclude: Vec<String> = s
+            let claimed: Vec<String> = s
                 .radios
                 .iter()
                 .filter(|p| Some(p.id) != radio_id && !p.serial_port.trim().is_empty())
                 .map(|p| p.serial_port.clone())
                 .collect();
-            (model, exclude)
+            (model, claimed)
+        };
+        // Widen "another radio's port" to "any port on another radio's USB DEVICE".
+        //
+        // Excluding the exact string was too narrow by three routes, all of them live on this
+        // station: a dual bridge exposes a SECOND interface on the same chip (a CP2105's
+        // Standard port — silent, and indistinguishable from a dead rig), a dual-claimed port
+        // appears again under another driver's name (`usbserial-*` vs `SLAB_*`), and neither
+        // spelling matches the stored one. A radio is one physical USB device, so exclude by
+        // that: `usbtopo` reduces every port to its parent hub, which is the device. No-ops off
+        // macOS and whenever topology cannot be resolved, falling back to the exact-name list.
+        let exclude = {
+            let locs = tempo_audio::usbtopo::serial_locations();
+            let banned_hubs: Vec<u32> = claimed
+                .iter()
+                .filter_map(|p| locs.get(p.trim()).copied())
+                .map(tempo_audio::usbtopo::parent_hub)
+                .collect();
+            let mut out = claimed;
+            if !banned_hubs.is_empty() {
+                for (port, loc) in locs.iter() {
+                    if banned_hubs.contains(&tempo_audio::usbtopo::parent_hub(*loc))
+                        && !out.iter().any(|p| p == port)
+                    {
+                        out.push(port.clone());
+                    }
+                }
+            }
+            out
         };
         // 4599: a private TCP port for the throwaway rigctld, distinct from the live one.
         let hit = tauri::async_runtime::spawn_blocking(move || {

@@ -162,12 +162,6 @@ beforeEach(() => {
 })
 afterEach(cleanup)
 
-/** Click "Edit" on the non-active radio (the IC-9700) so the flat rig form describes it. */
-async function editTheNonActiveRadio() {
-  fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-  // Only the NON-active radio's card offers Edit — the active one is already loaded in the form.
-  fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
-}
 
 describe('Auto-test proposes; it never applies or saves on its own', () => {
   // THE 2026-08-13 INCIDENT. `handleAutoTestPorts` used to write the probe result into the form
