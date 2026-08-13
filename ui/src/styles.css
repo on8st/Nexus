@@ -9748,8 +9748,8 @@ select.settings-input {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 8px;
-  padding: 10px 12px;
+  margin-top: var(--space-2);
+  padding: 10px var(--space-3);
   border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
   border-left-width: 3px;
   border-radius: 6px;
@@ -9759,7 +9759,7 @@ select.settings-input {
 }
 .cat-proposal code {
   font-size: 12px;
-  padding: 1px 4px;
+  padding: 1px var(--space-1);
   border-radius: 3px;
   background: color-mix(in srgb, var(--text) 10%, transparent);
 }

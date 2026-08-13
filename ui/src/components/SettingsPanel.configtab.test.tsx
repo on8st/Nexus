@@ -163,62 +163,50 @@ beforeEach(() => {
 afterEach(cleanup)
 
 
-describe('Auto-test proposes; it never applies or saves on its own', () => {
-  // THE 2026-08-13 INCIDENT. `handleAutoTestPorts` used to write the probe result into the form
-  // and PERSIST it immediately. A port sweep answers with whichever rig replies first, and
-  // `probe_cat_ports` only excludes ports ALREADY CONFIGURED on another profile — so on a station
-  // with two radios and one profile it reached the other radio, and an FTX-1's profile was saved
-  // pointing at an FT-710's CAT port, with the FT-710's model. Silent, persisted, and it looks
-  // exactly like a dead radio afterwards.
-  //
-  // The probe here reports an IC-9700 on COM7 while the form describes an FTDX10 — i.e. it found
-  // the wrong rig, which is precisely the case that must not be written.
+describe('Config tab: backup, restore and reset', () => {
+  const openTab = async () => fireEvent.click(await screen.findByRole('tab', { name: 'Config' }))
 
-  it('a found port is NOT saved — no settings write of any kind', async () => {
+  it('exists as its own tab — Backup and Restore were unfindable under Radio > Transmit limits', async () => {
     renderPanel()
-    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
-
-    await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalled())
-    // The whole point: nothing reached disk.
-    expect(api.get('setSettings')).not.toHaveBeenCalled()
-    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
+    await openTab()
+    expect(await screen.findByRole('button', { name: 'Back up' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'Restore…' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /reset all settings/i })).toBeTruthy()
   })
 
-  it('it asks, naming the rig that actually answered and the radio it would change', async () => {
+  it('Reset asks first, and does nothing when declined', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPanel()
-    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
-
-    // The operator must be able to see BOTH facts: what answered, and what it would change.
-    await waitFor(() => expect(document.body.textContent).toContain('COM7'))
-    expect(document.body.textContent).toContain('IC-9700')
-    expect(document.body.textContent).toContain('FTDX10') // the radio being configured
-    expect(screen.getByRole('button', { name: 'Apply' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+    await openTab()
+    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
+    expect(api.get('resetSettings')).not.toHaveBeenCalled()
+    confirmSpy.mockRestore()
   })
 
-  it('Apply fills the form but STILL does not save', async () => {
+  it('the confirmation states what survives — the logbook and the keychain', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPanel()
-    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
-
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
-    // Applying is a form edit. Persisting stays the operator's Save — a wrong guess costs a
-    // glance, not a silent rewrite of a working profile.
-    expect(api.get('setSettings')).not.toHaveBeenCalled()
-    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
+    await openTab()
+    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
+    // "Reset" is the word an operator fears for their QSOs. The prompt must answer that before
+    // they have to wonder.
+    const msg = String(confirmSpy.mock.calls[0]?.[0] ?? '')
+    expect(msg).toMatch(/LOGBOOK is not touched/i)
+    expect(msg).toMatch(/keychain/i)
+    expect(msg).toMatch(/cannot be undone/i)
+    confirmSpy.mockRestore()
   })
 
-  it('Dismiss drops it, changing nothing', async () => {
+  it('accepted, it resets through the backend verb', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     renderPanel()
-    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
-
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
-    expect(api.get('setSettings')).not.toHaveBeenCalled()
-    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
+    await openTab()
+    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
+    await waitFor(() => expect(api.get('resetSettings')).toHaveBeenCalled())
+    // Never by deleting the settings file: a running app holds the old config in memory and
+    // writes it straight back, so a file-delete "reset" silently un-resets itself.
+    confirmSpy.mockRestore()
   })
 })
