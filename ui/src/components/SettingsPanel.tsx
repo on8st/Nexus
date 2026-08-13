@@ -658,7 +658,11 @@ export function SettingsPanel({
     input: Record<string, string>
     output: Record<string, string>
   }>({ input: {}, output: {} })
+  // The whole audio records, kept alongside the name/label maps: the pre-save checks compare
+  // which USB device each codec is inside, which no display string can express.
+  const [audioInfos, setAudioInfos] = useState<AudioDevices>({ input: [], output: [] })
   const applyAudio = (d: AudioDevices) => {
+    setAudioInfos(d)
     setAudio({ input: d.input.map((x) => x.name), output: d.output.map((x) => x.name) })
     setAudioLabels({
       input: Object.fromEntries(d.input.map((x) => [x.name, x.label])),
@@ -1997,7 +2001,7 @@ export function SettingsPanel({
     // chosen as a CAT port, or the silent second interface of a dual bridge. Errors block and name
     // the fix; warnings are stated and the operator proceeds, because an unusual-but-correct
     // station must never be locked out of its own configuration by a heuristic.
-    const checks = checkRigForm(form, portInfos, editingRadioId)
+    const checks = checkRigForm(form, portInfos, editingRadioId, audioInfos)
     setRigChecks(checks)
     if (blocks(checks)) {
       setTab('radio')

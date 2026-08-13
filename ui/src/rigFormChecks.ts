@@ -16,12 +16,15 @@
  * configuration by a heuristic, so only things that CANNOT be right block.
  */
 import type { SerialPortInfo } from './api'
+import type { AudioDeviceInfo } from './types'
 
 export type RigCheck = { level: 'error' | 'warning'; message: string }
 
 /** The subset of the settings form these checks read. */
 export interface RigFormFacts {
   serialPort: string
+  audioIn?: string
+  audioOut?: string
   rigConn: string
   pttMethod: string
   rigModel: number
@@ -39,6 +42,7 @@ export function checkRigForm(
   form: RigFormFacts,
   ports: SerialPortInfo[],
   editingRadioId: number | null | undefined,
+  audio?: { input: AudioDeviceInfo[]; output: AudioDeviceInfo[] },
 ): RigCheck[] {
   const out: RigCheck[] = []
   // A network rig has no serial port at all; none of this applies.
@@ -99,7 +103,41 @@ export function checkRigForm(
     })
   }
 
-  // 5. CAT keying with no rig model. `pttMethod: 'cat'` and model 0 (None/VOX) cannot both be
+  // 5. The sound card must be INSIDE the radio on this CAT port.
+  //
+  // This is the check that catches the failure names cannot: audio devices are stored by NAME,
+  // two rigs with the same codec chip both enumerate as "USB Audio Device", and the positional
+  // " #2" that separates them is assigned by enumeration order. Moving a rig to a different USB
+  // port therefore SWAPS which rig each name means — observed on 2026-08-13, where every saved
+  // profile silently began pointing at the other radio and nothing warned.
+  //
+  // Topology does not move when names do: a rig carrying CAT and audio down one cable is
+  // internally a hub, so its codec shares the CAT port's parent. Comparing those two catches the
+  // swap the instant it happens. Only ever a warning — a rig whose audio genuinely is not on its
+  // own CAT device (a separate interface box, an analogue card) is a legitimate setup.
+  const portHub = info?.pairedAudio != null ? info : undefined
+  if (audio && portHub) {
+    const catDevice = ports.find((p) => p.name === port)
+    for (const [field, list] of [
+      ['Input', audio.input],
+      ['Output', audio.output],
+    ] as const) {
+      const chosen = field === 'Input' ? form.audioIn : form.audioOut
+      if (!chosen) continue
+      const dev = list.find((d) => d.name === chosen)
+      // Only speak when BOTH sides are known and they disagree.
+      if (dev?.usbHub == null || catDevice?.pairedAudio == null) continue
+      const expected = list.find((d) => d.name === catDevice.pairedAudio)
+      if (expected?.usbHub != null && dev.usbHub !== expected.usbHub) {
+        out.push({
+          level: 'warning',
+          message: `${field} device “${chosen}” is not inside the radio on ${port} — “${catDevice.pairedAudio}” is. Device names can swap when a rig moves USB port.`,
+        })
+      }
+    }
+  }
+
+  // 6. CAT keying with no rig model. `pttMethod: 'cat'` and model 0 (None/VOX) cannot both be
   //    true — there is nothing to send the keying command to.
   if (form.pttMethod === 'cat' && form.rigModel === 0) {
     out.push({

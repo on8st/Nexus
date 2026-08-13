@@ -831,6 +831,10 @@ export interface BandChannel {
  * share a label, so a label cannot address a device.
  */
 export interface AudioDeviceInfo {
+  /** The USB device (parent hub) this sound card is inside, when resolvable — i.e. WHICH RADIO.
+   *  Display/validation only, never stored: it describes where the hardware is plugged in right
+   *  now, and a rig moved to another port changes it. */
+  usbHub?: number | null
   name: string
   label: string
 }

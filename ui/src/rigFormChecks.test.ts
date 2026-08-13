@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { checkRigForm, blocks, type RigFormFacts } from './rigFormChecks'
 import type { SerialPortInfo } from './api'
+import type { AudioDeviceInfo } from './types'
 
 // The real station this was written for: two Yaesus, each a CP2105 with two interfaces, plus a
 // monitor that also presents a serial device. Interface 0 carries CAT; interface 1 is silent.
@@ -24,10 +25,59 @@ const base: RigFormFacts = {
   ],
 }
 
+// Two rigs, each an internal USB hub: the FT-710 at 0x110000, the FTX-1 at 0x120000. Both
+// codecs report the same name and are told apart only by a positional " #2".
+const AUDIO: { input: AudioDeviceInfo[]; output: AudioDeviceInfo[] } = {
+  input: [
+    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x120000 },
+    { name: 'USB Audio Device #2', label: 'USB Audio Device #2', usbHub: 0x110000 },
+  ],
+  output: [
+    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x120000 },
+    { name: 'USB Audio Device #2', label: 'USB Audio Device #2', usbHub: 0x110000 },
+  ],
+}
+
 describe('rig form pre-save checks', () => {
   it('a correct configuration raises nothing', () => {
     expect(checkRigForm(base, PORTS, 0)).toEqual([])
     expect(blocks(checkRigForm(base, PORTS, 0))).toBe(false)
+  })
+
+  it('warns when the sound card is not inside the radio on this CAT port', () => {
+    // THE swap. `…FED0` is the FT-710, whose codec is "USB Audio Device #2" — but the profile
+    // names "USB Audio Device", which is the FTX-1's. Exactly what a rig moving USB port causes,
+    // silently, to every saved profile.
+    const c = checkRigForm(
+      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
+      PORTS,
+      0,
+      AUDIO,
+    )
+    expect(c.some((x) => /not inside the radio on/.test(x.message))).toBe(true)
+    // A separate interface box is a legitimate setup, so this informs rather than refuses.
+    expect(blocks(c)).toBe(false)
+  })
+
+  it('says nothing when the sound card IS the one inside that radio', () => {
+    const c = checkRigForm(
+      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device #2' },
+      PORTS,
+      0,
+      AUDIO,
+    )
+    expect(c).toEqual([])
+  })
+
+  it('stays silent when topology is unknown (non-macOS, or an unresolvable device)', () => {
+    const noTopo = { input: [{ name: 'USB Audio Device', label: 'x' }], output: [] }
+    const c = checkRigForm(
+      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
+      PORTS,
+      0,
+      noTopo,
+    )
+    expect(c.some((x) => /not inside the radio/.test(x.message))).toBe(false)
   })
 
   it('flags the silent second interface of a dual bridge', () => {

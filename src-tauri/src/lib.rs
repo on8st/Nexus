@@ -7804,6 +7804,11 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioDeviceDto {
+    /// The USB device (parent hub) this sound card belongs to, when resolvable — i.e. which
+    /// radio it is INSIDE. Lets the form check that a chosen codec and a chosen CAT port are
+    /// the same physical rig. Display/validation only: never stored, because it describes where
+    /// the hardware is plugged in at this instant.
+    usb_hub: Option<u32>,
     name: String,
     label: String,
 }
@@ -7829,9 +7834,13 @@ struct AudioDevices {
 async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevices, String> {
     #[cfg(feature = "radio")]
     {
-        fn dto(v: Vec<tempo_audio::audiodev::AudioDevice>) -> Vec<AudioDeviceDto> {
+        fn dto(
+            v: Vec<tempo_audio::audiodev::AudioDevice>,
+            locs: &std::collections::HashMap<String, u32>,
+        ) -> Vec<AudioDeviceDto> {
             v.into_iter()
                 .map(|d| AudioDeviceDto {
+                    usb_hub: locs.get(&d.name).map(|l| tempo_audio::usbtopo::parent_hub(*l)),
                     name: d.name,
                     label: d.label,
                 })
@@ -7866,9 +7875,11 @@ async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevice
                 &rigs,
             );
         }
+        let in_locs = tempo_audio::usbtopo::audio_locations(true);
+        let out_locs = tempo_audio::usbtopo::audio_locations(false);
         Ok(AudioDevices {
-            input: dto(input),
-            output: dto(output),
+            input: dto(input, &in_locs),
+            output: dto(output, &out_locs),
         })
     }
     #[cfg(not(feature = "radio"))]
@@ -7913,6 +7924,7 @@ async fn audio_devices_for_port(port: String) -> AudioDevices {
                 .into_iter()
                 .filter(|d| keep.contains(&d.name))
                 .map(|d| AudioDeviceDto {
+                    usb_hub: locs.get(&d.name).map(|l| tempo_audio::usbtopo::parent_hub(*l)),
                     name: d.name,
                     label: d.label,
                 })
