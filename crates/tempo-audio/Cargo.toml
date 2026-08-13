@@ -54,6 +54,20 @@ serde_json = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = { version = "0.9", optional = true }
 
+# macOS-only: read USB port paths so the device picker can say WHICH RIG a sound card belongs
+# to. Two identical rig codecs report the identical CoreAudio name (a pair of C-Media dongles
+# both enumerate as "USB Audio Device"), so the picker could only offer them as a bare name and
+# a " #2" — the operator had no way to tell which was which. `usbtopo` matches each codec to a
+# radio by USB topology instead (see that module). All three crates are ALREADY in Cargo.lock at
+# these requirements as dependencies of cpal (`coreaudio-sys`, `core-foundation-sys`) and
+# serialport (`io-kit-sys`), exactly like the `alsa` entry above — so this adds no new code to
+# the tree and is a direct dependency only so we can call the registry/property lookups.
+# MIT OR Apache-2.0 — GPL-3.0-only compatible; NOTICE entries filed.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-sys = "0.2"
+core-foundation-sys = "0.8"
+io-kit-sys = "0.4"
+
 # Windows-only: assign the launched rigctld to a Job Object so the OS kills it
 # (freeing the serial/COM port) whenever Tempo exits — even on a crash.
 [target.'cfg(windows)'.dependencies]

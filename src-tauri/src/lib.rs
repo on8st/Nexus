@@ -7740,8 +7740,15 @@ struct AudioDevices {
 
 /// Enumerate sound-card devices for the Settings audio-device pickers. Empty
 /// lists when built without the `radio` feature (mirrors `get_serial_ports`).
+///
+/// Takes the engine so each device can be labelled with the RADIO it belongs to: two rigs whose
+/// codecs report the same name (a pair of C-Media dongles both called "USB Audio Device") are
+/// otherwise offered as a bare name and a meaningless " #2", and picking wrong sends TX audio to
+/// the other rig. `usbtopo` resolves it from USB topology — see that module. Labels only; the
+/// `name` each entry is stored under is untouched, so this changes nothing about how a saved
+/// setting resolves.
 #[tauri::command]
-async fn get_audio_devices() -> AudioDevices {
+async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevices, String> {
     #[cfg(feature = "radio")]
     {
         fn dto(v: Vec<tempo_audio::audiodev::AudioDevice>) -> Vec<AudioDeviceDto> {
@@ -7752,18 +7759,47 @@ async fn get_audio_devices() -> AudioDevices {
                 })
                 .collect()
         }
-        let (input, output) = tempo_audio::device::available_devices();
-        AudioDevices {
+        let (mut input, mut output) = tempo_audio::device::available_devices();
+        // Each radio paired with the USB location of the CAT port it is configured on. Radios
+        // with no port (VOX-only) or a port that is not present contribute nothing, so an
+        // unplugged rig simply stops naming its codec rather than naming it wrongly.
+        let serial_locs = tempo_audio::usbtopo::serial_locations();
+        let rigs: Vec<(String, u32)> = {
+            let eng = state.lock().unwrap_or_else(|e| e.into_inner());
+            eng.settings()
+                .radios
+                .iter()
+                .filter_map(|r| {
+                    serial_locs
+                        .get(r.serial_port.trim())
+                        .map(|loc| (r.name.clone(), *loc))
+                })
+                .collect()
+        };
+        if !rigs.is_empty() {
+            tempo_audio::usbtopo::label_by_rig(
+                &mut input,
+                &tempo_audio::usbtopo::audio_locations(true),
+                &rigs,
+            );
+            tempo_audio::usbtopo::label_by_rig(
+                &mut output,
+                &tempo_audio::usbtopo::audio_locations(false),
+                &rigs,
+            );
+        }
+        Ok(AudioDevices {
             input: dto(input),
             output: dto(output),
-        }
+        })
     }
     #[cfg(not(feature = "radio"))]
     {
-        AudioDevices {
+        let _ = state;
+        Ok(AudioDevices {
             input: Vec::new(),
             output: Vec::new(),
-        }
+        })
     }
 }
 
