@@ -166,12 +166,25 @@ this file and the `macos` release job are that separate decision, made.
 
 ## Notes / troubleshooting
 
-- If CMake can't find `fftw3f` or Boost, confirm `pkg-config --exists fftw3f` succeeds and
-  that Homebrew's prefix (`brew --prefix`) is on `PKG_CONFIG_PATH` — this is usually automatic
-  from a Homebrew-managed shell, but custom shells or a non-default Homebrew prefix (Intel's
-  `/usr/local` vs Apple Silicon's `/opt/homebrew`) can need it set explicitly.
-- Link errors about `gfortran`/`quadmath`/`fftw3f` mean the Homebrew packages above aren't
-  where `pkg-config`/CMake expect them — re-check `brew list gfortran fftw boost`.
+- `build-macos.sh` puts `$(brew --prefix)/lib/pkgconfig` on `PKG_CONFIG_PATH` itself, so the
+  FFTW/Boost lookup works from any shell — including one that never ran `brew shellenv`, and one
+  where a different `pkg-config` (MacPorts' `/opt/local`, say) comes first on `PATH`. If you
+  invoke CMake by hand instead of through the script and it can't find `fftw3f` or Boost, that
+  export is what you're missing; `pkg-config --exists fftw3f` is the check.
+- Link errors about `gfortran`/`quadmath`/`fftw3f` are a *search-path* problem, not a missing
+  package: macOS ships no system Fortran and Apple's `ld` does not look inside Homebrew's prefix,
+  so `-lgfortran` resolves on Linux (`/usr/lib`) and fails here with
+  `ld: library 'gfortran' not found`. `crates/tempo-fast-sys/build.rs` handles this on macOS by
+  asking the toolchain where its own libraries live — `gfortran -print-file-name=libgfortran.dylib`
+  for the GCC runtime, `pkg-config --libs-only-L fftw3f` for FFTW — rather than hardcoding a
+  prefix, so it is correct on both Apple Silicon (`/opt/homebrew`) and Intel (`/usr/local`). If
+  you still hit this, check `brew list gcc fftw boost` and that `gfortran` is on `PATH`.
+- `cargo tauri build` invoked directly will succeed at building the `.app`/`.dmg` and then fail
+  with *"A public key has been found, but no private key"* — `createUpdaterArtifacts` is on and
+  the updater's public key is in `tauri.conf.json`, so Tauri tries to sign a self-update payload
+  it has no key for. Only official release builds have `TAURI_SIGNING_PRIVATE_KEY` (a CI secret).
+  `build-macos.sh` turns the updater payload off when that variable is unset, which is why the
+  script exits clean where a bare `cargo tauri build` does not.
 - No universal binary yet (§3) — an Intel-built `.dmg` will not run on Apple Silicon without
   Rosetta, and vice versa is not applicable (Apple Silicon binaries never run on Intel).
 - Time sync matters for decoding: keep the Mac's clock accurate (it defaults to network time;

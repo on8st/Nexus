@@ -52,7 +52,21 @@ command -v ninja >/dev/null || command -v make >/dev/null || miss+=("ninja-or-ma
 [ "${#miss[@]}" -eq 0 ] || die "missing tools: ${miss[*]}
   Homebrew: brew install cmake ninja gcc node   (gcc provides gfortran)"
 command -v cargo >/dev/null || die "Rust not found — install from https://rustup.rs"
-pkg-config --exists fftw3f 2>/dev/null || die "fftw3f missing — brew install fftw"
+
+# Homebrew's prefix is arch-dependent (/opt/homebrew on Apple Silicon, /usr/local on Intel), and
+# whichever pkg-config comes first on PATH may know about neither — MacPorts' /opt/local one
+# doesn't, and a shell that never ran `brew shellenv` leaves PKG_CONFIG_PATH unset entirely.
+# Point pkg-config and CMake at the brew prefix explicitly instead of trusting the environment;
+# an unset PKG_CONFIG_PATH is what MACOS.md's "can't find fftw3f/Boost" note is really about, and
+# without this the check below reports "fftw3f missing" at a machine where fftw is installed.
+if command -v brew >/dev/null 2>&1; then
+  BREW_PREFIX="$(brew --prefix)"
+  export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/fftw/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export CMAKE_PREFIX_PATH="$BREW_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+fi
+pkg-config --exists fftw3f 2>/dev/null || die "fftw3f not found by pkg-config ($(command -v pkg-config))
+  Install it with 'brew install fftw'. If it IS installed, pkg-config is looking in the wrong
+  place — check 'brew --prefix'/lib/pkgconfig is on PKG_CONFIG_PATH (currently: ${PKG_CONFIG_PATH:-<unset>})."
 GEN=Ninja; command -v ninja >/dev/null || GEN="Unix Makefiles"
 ok "cc/gfortran/cmake ($GEN)/node, system FFTW3f ($ARCH)"
 
@@ -101,7 +115,18 @@ if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   continue. Those are the LGPL license texts Hamlib requires us to distribute; restore with
   'git checkout -- src-tauri/resources/hamlib/'."
 fi
-( cd "$REPO/src-tauri" && cargo tauri build --features radio,custom-protocol --bundles app,dmg )
+# `createUpdaterArtifacts` is on and tauri.conf.json carries the updater PUBLIC key, so Tauri
+# emits a .app.tar.gz self-update payload and then fails the whole build signing it unless
+# TAURI_SIGNING_PRIVATE_KEY is set — which it is in CI (a secret) and is not for anyone building
+# from source. Without this the .app and .dmg both build fine and the script still exits 1 on
+# the very last step. A local build has no use for an updater payload it cannot sign, so drop
+# it when there's no key; a real build failure still fails.
+updater_cfg=()
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  updater_cfg=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+  warn "no TAURI_SIGNING_PRIVATE_KEY — skipping the unsignable updater payload (.app/.dmg unaffected)"
+fi
+( cd "$REPO/src-tauri" && cargo tauri build --features radio,custom-protocol --bundles app,dmg "${updater_cfg[@]}" )
 ok "Nexus .app + .dmg ($ARCH)"
 
 bold "Done ✓  macOS artifacts ($ARCH):"
