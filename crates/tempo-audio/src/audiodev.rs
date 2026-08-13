@@ -361,7 +361,7 @@ pub fn devices_from_cpal_names(names: Vec<String>) -> Vec<AudioDevice> {
 ///
 /// Windows/macOS only in practice — ALSA PCM names are unique, so the Linux path
 /// disambiguates LABELS instead ([`disambiguate_labels`]) and leaves names alone.
-pub(crate) fn disambiguate_names(names: Vec<String>) -> Vec<String> {
+fn disambiguate_names(names: Vec<String>) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     names
         .into_iter()
