@@ -149,6 +149,83 @@ pub fn devices_sharing_usb_device(
         .collect()
 }
 
+/// Enrich a serial port's picker label with what makes it identifiable: which of the device's
+/// interfaces it is, and which sound card is on the same rig.
+///
+/// The port picker had the same defect the audio picker had, and worse. Two radios with the same
+/// bridge chip produce EIGHT identically-labelled entries — every one reading
+/// `CP2105 Dual USB to UART Bridge Controller` — because the label is the USB product string and
+/// the chip is the product. Add to that a `tty.*` twin of every node and a second set from a
+/// redundant vendor driver, and an operator picks their rig out of sixteen indistinguishable
+/// lines. On the ON8ST station that is exactly what went wrong: the FTX-1's profile was saved
+/// pointing at the FT-710's CAT port, which is an entirely reasonable mistake to make from that
+/// list.
+///
+/// Two facts fix it, both from USB topology:
+///
+/// * **Which interface** — a CP2105 is a DUAL bridge and only interface 0 does CAT; interface 1
+///   answers nothing. `bInterfaceNumber` is the honest source. (The vendor driver publishes
+///   "Enhanced Port"/"Standard Port" strings, but only inside its own matched personality, so
+///   they vanish with the driver — the number does not.)
+/// * **Which rig** — the sound card sharing this port's parent hub, i.e. the codec inside the
+///   same radio. That is what actually tells the two rigs apart.
+///
+/// Labels are only ever ADDED to and nothing is removed from the list: a port whose topology is
+/// unknown keeps exactly the label it had. Same reasoning as [`label_by_rig`] — a picker that hid
+/// or renamed the operator's real port would be worse than one that failed to annotate it.
+pub fn label_serial_ports(
+    ports: &mut [crate::audiodev::AudioDevice],
+    port_locs: &std::collections::HashMap<String, u32>,
+    port_ifaces: &std::collections::HashMap<String, u32>,
+    audio_locs: &std::collections::HashMap<String, u32>,
+) {
+    // "port N" is only informative on a bridge that HAS more than one — saying it about a
+    // single-port device is noise that reads like a fourth radio. Count the DISTINCT interface
+    // numbers per USB device, not the entries: a dual-claimed port appears twice (`usbserial-*`
+    // and `SLAB_*`) with the same number and must not be counted as two ports.
+    let mut ifaces_per_hub: std::collections::HashMap<u32, std::collections::BTreeSet<u32>> =
+        std::collections::HashMap::new();
+    for (name, loc) in port_locs.iter() {
+        if let Some(iface) = port_ifaces.get(name) {
+            ifaces_per_hub
+                .entry(parent_hub(*loc))
+                .or_default()
+                .insert(*iface);
+        }
+    }
+
+    for p in ports.iter_mut() {
+        let mut extra: Vec<String> = Vec::new();
+        let multiport = port_locs
+            .get(&p.name)
+            .map(|l| parent_hub(*l))
+            .and_then(|h| ifaces_per_hub.get(&h))
+            .is_some_and(|set| set.len() > 1);
+        if let Some(iface) = port_ifaces.get(&p.name).filter(|_| multiport) {
+            extra.push(format!("port {}", iface + 1));
+        }
+        if let Some(hub) = port_locs.get(&p.name).map(|l| parent_hub(*l)) {
+            let mut mates: Vec<&String> = audio_locs
+                .iter()
+                .filter(|(_, l)| parent_hub(**l) == hub)
+                .map(|(n, _)| n)
+                .collect();
+            mates.sort();
+            if let Some(first) = mates.first() {
+                extra.push(format!("with “{first}”"));
+            }
+        }
+        if !extra.is_empty() {
+            let base = if p.label.is_empty() {
+                p.name.clone()
+            } else {
+                p.label.clone()
+            };
+            p.label = format!("{base} — {}", extra.join(" · "));
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
@@ -214,7 +291,18 @@ mod imp {
     /// itself. The walk is necessary because a serial port's `IOSerialBSDClient` node carries the
     /// tty name but no location — the location belongs to the USB device several levels up.
     unsafe fn ancestor_location(entry: io_object_t) -> Option<u32> {
-        let k = cfstr("locationID")?;
+        ancestor_u32(entry, "locationID")
+    }
+
+    /// A `u32`-valued property from `entry` or the nearest ancestor that has it.
+    ///
+    /// One call rather than a hand-rolled parent loop: `IORegistryEntrySearchCFProperty` with
+    /// `kIORegistryIterateParents | kIORegistryIterateRecursively` climbs the IOService plane
+    /// itself. The walk is necessary because a serial port's `IOSerialBSDClient` node carries the
+    /// tty name but neither the location nor the interface number — those belong to the USB
+    /// interface and device several levels up.
+    unsafe fn ancestor_u32(entry: io_object_t, key: &str) -> Option<u32> {
+        let k = cfstr(key)?;
         let v = IORegistryEntrySearchCFProperty(
             entry,
             kIOServicePlane as *const std::os::raw::c_char,
@@ -266,6 +354,39 @@ mod imp {
                 if let Some(tty) = registry_string(entry, "IOCalloutDevice") {
                     if let Some(loc) = ancestor_location(entry) {
                         out.insert(tty, loc);
+                    }
+                }
+                IOObjectRelease(entry);
+            }
+            IOObjectRelease(it);
+        }
+        out
+    }
+
+    /// Each USB serial port's `/dev/cu.*` path mapped to its `bInterfaceNumber`.
+    ///
+    /// Distinguishes the halves of a multi-interface bridge: a CP2105 exposes two, and only
+    /// interface 0 carries CAT on a Yaesu. Same registry walk as [`serial_locations`] — the
+    /// number lives on the `IOUSBHostInterface` several levels above the tty node.
+    pub fn serial_interfaces() -> HashMap<String, u32> {
+        let mut out = HashMap::new();
+        unsafe {
+            let matching = IOServiceMatching(c"IOSerialBSDClient".as_ptr());
+            if matching.is_null() {
+                return out;
+            }
+            let mut it: io_iterator_t = 0;
+            if IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut it) != 0 {
+                return out;
+            }
+            loop {
+                let entry = IOIteratorNext(it);
+                if entry == 0 {
+                    break;
+                }
+                if let Some(tty) = registry_string(entry, "IOCalloutDevice") {
+                    if let Some(n) = ancestor_u32(entry, "bInterfaceNumber") {
+                        out.insert(tty, n);
                     }
                 }
                 IOObjectRelease(entry);
@@ -401,7 +522,7 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{audio_locations, serial_locations};
+pub use imp::{audio_locations, serial_interfaces, serial_locations};
 
 /// Non-macOS: no USB topology source, so nothing is known and every label is left alone.
 ///
@@ -415,6 +536,12 @@ pub fn serial_locations() -> std::collections::HashMap<String, u32> {
 /// Non-macOS counterpart of [`audio_locations`] — always empty. See [`serial_locations`].
 #[cfg(not(target_os = "macos"))]
 pub fn audio_locations(_input: bool) -> std::collections::HashMap<String, u32> {
+    std::collections::HashMap::new()
+}
+
+/// Non-macOS counterpart of [`serial_interfaces`] — always empty. See [`serial_locations`].
+#[cfg(not(target_os = "macos"))]
+pub fn serial_interfaces() -> std::collections::HashMap<String, u32> {
     std::collections::HashMap::new()
 }
 
@@ -522,6 +649,120 @@ mod tests {
         // A port on no shared hub proposes nothing, so the caller offers the full list rather
         // than pretending a rig has no audio.
         assert!(devices_sharing_usb_device(&devices, &locs, 0x990000).is_empty());
+    }
+
+    #[test]
+    fn serial_ports_say_which_rig_and_which_half_of_the_bridge() {
+        // The ON8ST list: two CP2105s, byte-identical product strings, plus each port's twin from
+        // the redundant vendor driver, plus a monitor's single-port device.
+        let cp = "CP2105 Dual USB to UART Bridge Controller";
+        let mut ports = vec![
+            AudioDevice {
+                name: "/dev/cu.usbserial-01AF7FED0".into(),
+                label: cp.into(),
+            },
+            AudioDevice {
+                name: "/dev/cu.usbserial-01AF7FED1".into(),
+                label: cp.into(),
+            },
+            AudioDevice {
+                name: "/dev/cu.SLAB_USBtoUART11".into(),
+                label: cp.into(),
+            },
+            AudioDevice {
+                name: "/dev/cu.usbserial-01A98F800".into(),
+                label: cp.into(),
+            },
+            AudioDevice {
+                name: "/dev/cu.usbmodem-LG".into(),
+                label: "LG Monitor Controls".into(),
+            },
+        ];
+        let locs = HashMap::from([
+            ("/dev/cu.usbserial-01AF7FED0".to_string(), 0x111000),
+            ("/dev/cu.usbserial-01AF7FED1".to_string(), 0x111000),
+            ("/dev/cu.SLAB_USBtoUART11".to_string(), 0x111000),
+            ("/dev/cu.usbserial-01A98F800".to_string(), 0x121000),
+            ("/dev/cu.usbmodem-LG".to_string(), 0x131000),
+        ]);
+        let ifaces = HashMap::from([
+            ("/dev/cu.usbserial-01AF7FED0".to_string(), 0),
+            ("/dev/cu.usbserial-01AF7FED1".to_string(), 1),
+            ("/dev/cu.SLAB_USBtoUART11".to_string(), 0),
+            ("/dev/cu.usbserial-01A98F800".to_string(), 0),
+            ("/dev/cu.usbmodem-LG".to_string(), 2),
+        ]);
+        let audio = HashMap::from([
+            ("USB Audio Device".to_string(), 0x112000),
+            ("USB Audio Device #2".to_string(), 0x122000),
+        ]);
+        label_serial_ports(&mut ports, &locs, &ifaces, &audio);
+
+        // THE bug this fixes: these two were indistinguishable, and the FTX-1's profile was saved
+        // pointing at the FT-710's port.
+        assert!(
+            ports[0].label.contains("USB Audio Device")
+                && !ports[0].label.contains("USB Audio Device #2"),
+            "the FT-710's port must name the FT-710's codec, got {:?}",
+            ports[0].label
+        );
+        assert!(
+            ports[3].label.contains("USB Audio Device #2"),
+            "the FTX-1's port must name the FTX-1's codec, got {:?}",
+            ports[3].label
+        );
+        assert_ne!(
+            ports[0].label, ports[3].label,
+            "the whole point is telling them apart"
+        );
+
+        // A dual bridge says which half; only interface 0 does CAT on these rigs.
+        assert!(
+            ports[0].label.contains("port 1"),
+            "got {:?}",
+            ports[0].label
+        );
+        assert!(
+            ports[1].label.contains("port 2"),
+            "got {:?}",
+            ports[1].label
+        );
+        // The vendor driver's twin of port 0 is the SAME interface — it must not read as a third
+        // port, and it must still name the right rig.
+        assert!(
+            ports[2].label.contains("port 1"),
+            "got {:?}",
+            ports[2].label
+        );
+
+        // A single-port device gets NO port number: "port 3" on a monitor reads like a fourth
+        // radio. It also names no rig, having no codec on its hub.
+        assert_eq!(
+            ports[4].label, "LG Monitor Controls",
+            "a single-interface device must not be annotated at all"
+        );
+    }
+
+    #[test]
+    fn a_serial_port_with_no_topology_keeps_its_label() {
+        let mut ports = vec![
+            AudioDevice {
+                name: "/dev/cu.Bluetooth-Incoming-Port".into(),
+                label: String::new(),
+            },
+            AudioDevice {
+                name: "/dev/cu.legacy".into(),
+                label: "Some Adapter".into(),
+            },
+        ];
+        label_serial_ports(
+            &mut ports,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(ports[0].label, "");
+        assert_eq!(ports[1].label, "Some Adapter");
     }
 
     #[test]

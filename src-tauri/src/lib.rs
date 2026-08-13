@@ -7698,15 +7698,34 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
     #[cfg(feature = "radio")]
     {
         let usb = tempo_audio::ports::available_usb_ports();
-        tempo_audio::ports::available_ports()
+        // The product string alone is NOT an identity: two radios with the same bridge chip give
+        // every one of their ports the byte-identical label ("CP2105 Dual USB to UART Bridge
+        // Controller" ×8 on the ON8ST station), and an operator picking their rig out of that list
+        // saved the FTX-1's profile pointing at the FT-710. Annotate each port with which of the
+        // device's interfaces it is and which sound card is inside the same radio — see `usbtopo`.
+        let mut ports: Vec<tempo_audio::audiodev::AudioDevice> =
+            tempo_audio::ports::available_ports()
+                .into_iter()
+                .map(|name| {
+                    let label = usb
+                        .iter()
+                        .find(|u| u.port_name == name)
+                        .map(|u| u.product.clone())
+                        .unwrap_or_default();
+                    tempo_audio::audiodev::AudioDevice { name, label }
+                })
+                .collect();
+        tempo_audio::usbtopo::label_serial_ports(
+            &mut ports,
+            &tempo_audio::usbtopo::serial_locations(),
+            &tempo_audio::usbtopo::serial_interfaces(),
+            &tempo_audio::usbtopo::audio_locations(true),
+        );
+        ports
             .into_iter()
-            .map(|name| {
-                let label = usb
-                    .iter()
-                    .find(|u| u.port_name == name)
-                    .map(|u| u.product.clone())
-                    .unwrap_or_default();
-                SerialPortInfo { name, label }
+            .map(|d| SerialPortInfo {
+                name: d.name,
+                label: d.label,
             })
             .collect()
     }
