@@ -35,6 +35,20 @@ pub trait AudioBackend {
     /// parallel with the soundcard, WITHOUT changing the TX schedule. Default no-op; the real sound
     /// card overrides it.
     fn set_tx_tee(&mut self, _tee: Option<TxTee>) {}
+    /// Take the report of a decode-path stream the OS has KILLED since the last call, if any.
+    ///
+    /// A stream can die without any setting changing — the device unplugged, a CoreAudio
+    /// reconfiguration when a Bluetooth headset connects, a codec dropping off the USB bus. The
+    /// loop reopens the sound card only on a settings change, so without this a dead stream is
+    /// permanent silence with no banner: blank waterfall, no decodes, nothing on screen saying
+    /// why. Draining (rather than peeking) makes this edge-triggered — the caller reacts once per
+    /// death and re-arms for the next.
+    ///
+    /// `None` for backends with no real streams (mocks, DAX-only paths); the real sound card
+    /// overrides it.
+    fn take_stream_error(&mut self) -> Option<String> {
+        None
+    }
     /// Set the RX capture gain (a multiplier ≥ 1.0 applied to the captured samples
     /// before decode). Headroom for a low-output interface — e.g. a rig codec whose
     /// line-out reads quiet in Nexus. No-op default; the real sound card overrides it.
@@ -96,6 +110,9 @@ pub struct MockBackend {
     pub voice_mic_open: bool,
     /// When true, `set_voice_mic(Some(_))` returns `Err` (simulates an open failure).
     pub voice_mic_fail: bool,
+    /// Scripted stream death: the next `take_stream_error()` returns this and clears it,
+    /// standing in for the OS killing a capture/playback stream out from under the loop.
+    pub stream_error: Option<String>,
 }
 
 impl MockBackend {
@@ -115,6 +132,9 @@ impl MockBackend {
 impl AudioBackend for MockBackend {
     fn capture(&mut self) -> Vec<f32> {
         self.to_capture.pop_front().unwrap_or_default()
+    }
+    fn take_stream_error(&mut self) -> Option<String> {
+        self.stream_error.take()
     }
     fn play(&mut self, samples: &[f32]) {
         self.played.extend_from_slice(samples);
