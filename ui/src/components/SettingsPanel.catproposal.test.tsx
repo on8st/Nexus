@@ -15,26 +15,32 @@ import defaultSettings from './__fixtures__/defaultSettings.json'
 const api = vi.hoisted(() => {
   // SettingsPanel pulls ~50 verbs from ../api. They all resolve null, which is enough for a
   // mount — the assertions here are about WHICH save verb gets called, not what it returns.
+  const VERBS = [
+    'clearCloudlogKey', 'clearClublogPassword', 'clearEqslPassword', 'clearHamqthPassword',
+    'clearHrdlogCode', 'clearLotwPassword', 'clearQrzLogbookKey', 'clearQrzPassword', 'detectRigs',
+    'downloadEqslReport', 'downloadLotwReport', 'getAllRigModels', 'getAudioDevices', 'audioDevicesForPort', 'getBandPlan',
+    'getRigModels', 'getSerialPortsDetailed', 'getSettings', 'setCloudlogKey', 'setClublogPassword',
+    'setEqslPassword', 'setHamqthPassword', 'setHrdlogCode', 'setLotwPassword', 'setQrzLogbookKey',
+    'setQrzPassword', 'setRepeaterbookToken', 'setRxGain', 'setSettings', 'setTxLevel', 'addRadio',
+    'removeRadio', 'renameRadio', 'setActiveRadio', 'setRadioBands', 'updateRadioProfile', 'testCat',
+    'probeCatPorts', 'qrzTestConnection', 'syncQrz', 'n3fjpTestConnection', 'getConnectionLog',
+    'getCredentialsStatus', 'fetchLotwUsers', 'getLotwUsersStatus', 'fetchFccStates',
+    'getFccStatesStatus', 'getTleStatus', 'fetchTlesNow', 'importTles', 'discoverFlex', 'civDiagnosticLog', 'civDiagnosticStatus',
+    'allTxtLocation', 'revealAllTxt', 'recordingsLocation', 'revealRecordings', 'appVersion', 'getSpectrumRow', 'setFrequency',
+    'getWatchlist', 'setWatchlist', 'openPanelWindow', 'getAssistanceJournal',
+    'setUnassistedMode',
+  ]
   const spies: Record<string, ReturnType<typeof vi.fn>> = {}
   const get = (name: string) => {
     if (!spies[name]) spies[name] = vi.fn(() => Promise.resolve(null))
     return spies[name]
   }
-  return { spies, get }
+  return { spies, get, VERBS }
 })
 
-// Mock EVERY export of `../api`, derived from the real module rather than a hand-kept list.
-//
-// The list was the problem: a verb missing from it made the panel THROW ON MOUNT ("No export is
-// defined on the mock"), which presents as a behaviour regression in whichever test happened to
-// run -- not as the out-of-date mock it actually is. Reading the real module's export names makes
-// that failure impossible by construction.
-vi.mock('../api', async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>()
+vi.mock('../api', () => {
   const mod: Record<string, unknown> = {}
-  for (const name of Object.keys(actual)) {
-    mod[name] = typeof actual[name] === 'function' ? api.get(name) : actual[name]
-  }
+  for (const v of api.VERBS) mod[v] = api.get(v)
   return mod
 })
 vi.mock('../toast', () => ({
@@ -163,59 +169,62 @@ async function editTheNonActiveRadio() {
   fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
 }
 
-describe('rig form writes go to the radio they describe', () => {
-  it('Test CAT while editing a non-active radio patches THAT radio, never the active one', async () => {
+describe('Auto-test proposes; it never applies or saves on its own', () => {
+  // THE 2026-08-13 INCIDENT. `handleAutoTestPorts` used to write the probe result into the form
+  // and PERSIST it immediately. A port sweep answers with whichever rig replies first, and
+  // `probe_cat_ports` only excludes ports ALREADY CONFIGURED on another profile — so on a station
+  // with two radios and one profile it reached the other radio, and an FTX-1's profile was saved
+  // pointing at an FT-710's CAT port, with the FT-710's model. Silent, persisted, and it looks
+  // exactly like a dead radio afterwards.
+  //
+  // The probe here reports an IC-9700 on COM7 while the form describes an FTDX10 — i.e. it found
+  // the wrong rig, which is precisely the case that must not be written.
+
+  it('a found port is NOT saved — no settings write of any kind', async () => {
     renderPanel()
-    await editTheNonActiveRadio()
-
-    fireEvent.click(await screen.findByRole('button', { name: /test cat/i }))
-
-    await waitFor(() => expect(api.get('updateRadioProfile')).toHaveBeenCalled())
-    const [id, patch] = api.get('updateRadioProfile').mock.calls[0] as [number, { serialPort: string }]
-    expect(id).toBe(1)
-    expect(patch.serialPort).toBe('COM7')
-    // A whole-settings save is exactly what clobbered radio 0.
-    expect(api.get('setSettings')).not.toHaveBeenCalled()
-  })
-
-  it('Test CAT does not report a green tick earned by the OTHER radio', async () => {
-    renderPanel()
-    await editTheNonActiveRadio()
-    fireEvent.click(await screen.findByRole('button', { name: /test cat/i }))
-
-    await waitFor(() => expect(api.get('updateRadioProfile')).toHaveBeenCalled())
-    // test_cat has no radio argument — it reports the ACTIVE radio. Running it here would hand
-    // back a pass earned by the FTDX10 for an IC-9700 config that was never tested.
-    expect(api.get('testCat')).not.toHaveBeenCalled()
-    expect(await screen.findByText(/make .* active to test it/i)).toBeTruthy()
-  })
-
-  it('Auto-test probes on behalf of the radio being configured, and routes its write there', async () => {
-    renderPanel()
-    await editTheNonActiveRadio()
-
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
     fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
 
-    // Radio-blind probing seeded every port with the ACTIVE radio's Hamlib model, and an Icom
-    // answers only at its own CI-V address — so radio 2's port could never answer.
-    await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalledWith(1))
-
-    // The probe now PROPOSES rather than persisting (see SettingsPanel.catproposal.test.tsx for
-    // why: a sweep can answer with the wrong rig, and this used to be written straight to disk).
-    // Accepting it is a form edit; Save is what writes — and it must still route to the radio
-    // being configured, never the active one, which is what this test has always been about.
-    await waitFor(() => expect(api.get('setSettings')).not.toHaveBeenCalled())
-    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
-    // The form's submit button specifically — several controls match /save/.
-    const submit = document.querySelector('button.settings-save[type="submit"]') as HTMLButtonElement
-    expect(submit).toBeTruthy()
-    fireEvent.click(submit)
-
-    await waitFor(() => expect(api.get('updateRadioProfile')).toHaveBeenCalled())
-    const [id] = api.get('updateRadioProfile').mock.calls[0] as [number, unknown]
-    expect(id).toBe(1)
+    await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalled())
+    // The whole point: nothing reached disk.
     expect(api.get('setSettings')).not.toHaveBeenCalled()
+    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
+  })
+
+  it('it asks, naming the rig that actually answered and the radio it would change', async () => {
+    renderPanel()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+
+    // The operator must be able to see BOTH facts: what answered, and what it would change.
+    await waitFor(() => expect(document.body.textContent).toContain('COM7'))
+    expect(document.body.textContent).toContain('IC-9700')
+    expect(document.body.textContent).toContain('FTDX10') // the radio being configured
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+  })
+
+  it('Apply fills the form but STILL does not save', async () => {
+    renderPanel()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
+    // Applying is a form edit. Persisting stays the operator's Save — a wrong guess costs a
+    // glance, not a silent rewrite of a working profile.
+    expect(api.get('setSettings')).not.toHaveBeenCalled()
+    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
+  })
+
+  it('Dismiss drops it, changing nothing', async () => {
+    renderPanel()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
+    expect(api.get('setSettings')).not.toHaveBeenCalled()
+    expect(api.get('updateRadioProfile')).not.toHaveBeenCalled()
   })
 })

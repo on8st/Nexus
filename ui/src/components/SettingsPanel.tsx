@@ -11,6 +11,7 @@ import type {
   AudioDevices,
   BandChannel,
   CatTestResult,
+  CatProbeResult,
   DetectedRig,
   RadioStatus,
   RouteMode,
@@ -688,6 +689,9 @@ export function SettingsPanel({
   const [detecting, setDetecting] = useState(false)
   const [catTesting, setCatTesting] = useState(false)
   const [catResult, setCatResult] = useState<CatTestResult | null>(null)
+  // A probe result awaiting the operator's yes. Never applied or saved on its own — see
+  // `handleAutoTestPorts` for the incident that made this a question rather than a write.
+  const [catProposal, setCatProposal] = useState<CatProbeResult | null>(null)
   // Connections visibility: stored-credential status + the rolling event log —
   // the answer to "I hit save and couldn't tell anything happened".
   const [creds, setCreds] = useState<CredStatus[]>([])
@@ -1567,36 +1571,31 @@ export function SettingsPanel({
     }
   }
 
-  // Auto-test ports: probe each USB port (read-only) for the one that actually drives
-  // the rig, then auto-fill + save the winning port/baud/model so CAT just works — no
-  // guessing which COM port among a rig's several is the control port.
+  // Auto-test ports: probe each USB port (read-only) for the one that actually drives the rig.
+  //
+  // ⚠️ IT PROPOSES. IT DOES NOT APPLY, AND IT DOES NOT SAVE. It used to do both, and that is how
+  // an FTX-1's profile came to be saved pointing at an FT-710's CAT port with the FT-710's model
+  // (ON8ST, 2026-08-13): the sweep answers with whatever rig replies first, and on a station with
+  // more radios than configured profiles it can be the wrong one. `probe_cat_ports` does exclude
+  // other radios' ports, but only those ALREADY CONFIGURED on another profile — precisely the set
+  // you are not at risk of confusing. Writing that straight to disk gave the operator no moment to
+  // notice, and the wrong port then looks exactly like a dead radio.
+  //
+  // So the result lands in `catProposal` and is rendered as a question naming the rig that
+  // ACTUALLY ANSWERED. Applying is one click, saving is still the operator's Save.
   const handleAutoTestPorts = async (base?: typeof form) => {
     const f = base ?? form
     if (!f) return
     setCatTesting(true)
     setCatResult(null)
+    setCatProposal(null)
     setError(null)
     try {
       // Probe on behalf of the radio being CONFIGURED, not the one being operated — its Hamlib
       // model is what seeds a bridge-chip port, and an Icom answers only at its own CI-V address.
       const r = await probeCatPorts(editingRadioId ?? f.activeRadio)
       if (r.found) {
-        // Apply port + baud (confirmed working). Only trust the MODEL when it wasn't a guess — a
-        // seeded common-rig probe can be answered by a same-family sibling (FT-991A on the FTDX10
-        // probe), so keep the operator's Rig Model rather than persisting a wrong one.
-        const next = {
-          ...f,
-          serialPort: r.portName,
-          baud: r.baud,
-          pttMethod: 'cat',
-          ...(r.modelSeeded
-            ? {}
-            : { rigModel: r.model, rigModelName: r.modelName }),
-        }
-        setForm(next)
-        await persistRadioForm(next)
-        onSaved?.()
-        setCatResult({ ok: true, detail: `✓ ${r.detail}` })
+        setCatProposal(r)
       } else {
         setCatResult({ ok: false, detail: r.detail })
       }
@@ -1605,6 +1604,25 @@ export function SettingsPanel({
     } finally {
       setCatTesting(false)
     }
+  }
+
+  /// Apply a proposal the operator accepted. Fills the FORM only — Save still persists it, so a
+  /// wrong guess costs a glance rather than a silent rewrite of a working profile.
+  const applyCatProposal = (r: CatProbeResult) => {
+    if (!form) return
+    markDirty()
+    // Only trust the MODEL when it wasn't a guess — a seeded common-rig probe can be answered by
+    // a same-family sibling (an FT-991A on the FTDX10 probe, an FT-710 on an FTX-1 probe), so
+    // keep the operator's Rig Model rather than overwriting it with a coincidence.
+    setForm({
+      ...form,
+      serialPort: r.portName,
+      baud: r.baud,
+      pttMethod: 'cat',
+      ...(r.modelSeeded ? {} : { rigModel: r.model, rigModelName: r.modelName }),
+    })
+    setCatProposal(null)
+    setCatResult({ ok: true, detail: `Applied ${r.portName} @ ${r.baud} — review, then Save.` })
   }
 
   // Config profiles: snapshot the current settings under a name, then switch the whole
@@ -3238,6 +3256,49 @@ export function SettingsPanel({
                     {catTesting ? '…' : 'Auto-test'}
                   </button>
                 </div>
+                {/* The probe's answer, as a QUESTION. It names the rig that actually replied and
+                    the radio it would be applied to, because those differing is the whole failure
+                    mode: a sweep answers with whichever rig responds first, and this used to be
+                    written and saved with no chance to notice. */}
+                {catProposal && (
+                  <div className="cat-proposal" role="status">
+                    <div>
+                      Found <strong>{catProposal.modelName || 'a radio'}</strong> on{' '}
+                      <code>{catProposal.portName}</code> @ {catProposal.baud} baud
+                      {catProposal.freqMhz > 0 && <> — reads {catProposal.freqMhz.toFixed(3)} MHz</>}
+                      {catProposal.modelSeeded && (
+                        <>
+                          {' '}
+                          <em>(the model is a guess — your Rig Model will be kept)</em>
+                        </>
+                      )}
+                    </div>
+                    <div className="cat-proposal-target">
+                      Apply to{' '}
+                      <strong>
+                        {form.radios?.find((r) => r.id === (editingRadioId ?? form.activeRadio))
+                          ?.name ?? 'this radio'}
+                      </strong>
+                      ? Nothing is saved until you press Save.
+                    </div>
+                    <div className="rig-share-row">
+                      <button
+                        type="button"
+                        className="settings-refresh"
+                        onClick={() => applyCatProposal(catProposal)}
+                      >
+                        Apply
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-linkbtn"
+                        onClick={() => setCatProposal(null)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <span className="settings-hint">
                   COM / tty device for rig control — or Auto-test to find it.
                   {[3088, 3087, 3091, 3089, 3076].includes(form.rigModel) && (

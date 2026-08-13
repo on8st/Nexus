@@ -9740,6 +9740,32 @@ select.settings-input {
 .cat-result.na {
   color: var(--text-dim);
 }
+
+/* A probe result awaiting the operator's yes. Deliberately looks like a prompt, not a status
+   line: it used to be applied and SAVED with no interaction, which is how a profile came to
+   point at the wrong radio. It has to read as something that wants an answer. */
+.cat-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-elev));
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.cat-proposal code {
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.cat-proposal-target {
+  color: var(--text-dim);
+}
 .settings-freq {
   display: flex;
   flex-direction: column;
