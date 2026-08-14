@@ -36,5 +36,55 @@ fn main() {
         println!("cargo:warning=AI CW model missing — this build has no AI CW decoder");
     }
 
+    // Fork/branch/commit stamp. Nothing in the tree identified WHICH build an
+    // artifact came from: a .app carries tauri.conf.json's product version and
+    // nothing else, so two builds of different branches at the same version are
+    // indistinguishable on disk. Identifying a running binary on 2026-08-13 took
+    // a hunt for a string literal one commit had added and its parent had not —
+    // this is so the build can name itself instead.
+    //
+    // A source tarball has no git and that is NOT a build failure; the stamp
+    // degrades to "unknown".
+    println!("cargo:rustc-env=NEXUS_BUILD_ID={}", build_stamp());
+
     tauri_build::build();
+}
+
+/// `owner/repo branch@sha[-dirty]`, or `unknown` where git cannot answer.
+fn build_stamp() -> String {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+
+    // Cargo does not re-run a build script when HEAD moves, so declare it as an
+    // input. `--git-path` resolves correctly inside a git WORKTREE, where .git
+    // is a FILE rather than a directory and a naive "../.git/HEAD" is wrong.
+    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        println!("cargo:rerun-if-changed={head}");
+    }
+
+    let Some(sha) = git(&["rev-parse", "--short", "HEAD"]) else {
+        return "unknown".to_string();
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "detached".into());
+    // Name the fork too: "macos-support" alone does not say WHOSE macos-support,
+    // and the whole point is telling a fork build apart from an upstream one.
+    let fork = git(&["remote", "get-url", "origin"])
+        .and_then(|u| {
+            let u = u.trim_end_matches(".git").trim_end_matches('/');
+            let tail: Vec<&str> = u.rsplit(['/', ':']).take(2).collect();
+            (tail.len() == 2).then(|| format!("{}/{}", tail[1], tail[0]))
+        })
+        .unwrap_or_else(|| "local".into());
+    let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+
+    format!(
+        "{fork} {branch}@{sha}{}",
+        if dirty { "-dirty" } else { "" }
+    )
 }

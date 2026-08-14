@@ -6,7 +6,7 @@ import { FrequencyControl } from './FrequencyControl'
 import { StatusLane } from './StatusLane'
 import { LiveLevelMeter } from './LiveMeters'
 import { RadioSwitcher } from './RadioSwitcher'
-import { appVersion } from '../api'
+import { appVersion, buildId } from '../api'
 
 /** The tier pills in the top bar. FT8/FT4 transmit; the six WSJT-X modes below
  *  them are DECODE-ONLY (modes::tx_mode refuses them in the engine) and carry a
@@ -220,8 +220,14 @@ export function TopBar({
 }: Props) {
   const countdown = (radio.nextSlotMs / 1000).toFixed(1)
   const [version, setVersion] = useState('')
+  // Which fork/branch/commit this binary came from. Display-only, and deliberately a
+  // tooltip: it matters when reporting a bug or telling two builds apart, never while
+  // operating. An older backend has no `build_id` command, so a failure leaves it
+  // empty and the chip renders exactly as it did before.
+  const [build, setBuild] = useState('')
   useEffect(() => {
     appVersion().then(setVersion).catch(() => {})
+    buildId().then(setBuild).catch(() => {})
   }, [])
   // The readout above prints `radio.sideband` — what Nexus BELIEVES the rig is on. The rig can
   // legitimately be somewhere else (it powered up in FM, or the operator turned the mode knob):
@@ -305,7 +311,11 @@ export function TopBar({
       <div className="topbar-group brand">
         <span className="logo-wrap">
           <span className="logo">Nexus</span>
-          {version && <span className="app-version">v{version}</span>}
+          {version && (
+            <span className="app-version" title={build ? `v${version} — built from ${build}` : undefined}>
+              v{version}
+            </span>
+          )}
         </span>
         <span className="mycall">
           {mycall}

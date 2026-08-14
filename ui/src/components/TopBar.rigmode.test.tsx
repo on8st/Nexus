@@ -6,6 +6,10 @@ import type { RadioStatus } from '../types'
 
 vi.mock('../api', () => ({
   appVersion: vi.fn(() => Promise.resolve('0.17.12')),
+  // A literal mock must answer EVERY verb the component calls — a missing one is
+  // `undefined()` at mount, which reads as a behaviour failure rather than the
+  // mock-completeness failure it is.
+  buildId: vi.fn(() => Promise.resolve('on8st/Nexus macos-support@abc1234')),
 }))
 
 function radio(over: Partial<RadioStatus>): RadioStatus {

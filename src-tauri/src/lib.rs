@@ -15085,6 +15085,16 @@ fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// The fork, branch and commit this binary was built from — e.g.
+/// `on8st/Nexus macos-support@316f8763-dirty`, or `unknown` when the build tree had
+/// no git (a source tarball). Stamped at COMPILE time by build.rs, so it describes
+/// the tree that produced this binary and not whatever is checked out when asked.
+/// The product version cannot distinguish two builds of different branches; this can.
+#[tauri::command]
+fn build_id() -> String {
+    env!("NEXUS_BUILD_ID").to_string()
+}
+
 /// A callsign's QRZ.com profile URL. The call is sanitized to callsign characters
 /// so a crafted string can never smuggle a different URL through; a portable suffix
 /// ("PJ4/K1ABC") keeps only its base call, which is what QRZ's db pages key on.
@@ -16099,6 +16109,7 @@ pub fn run() {
             open_qrz_page,
             open_dxped_page,
             app_version,
+            build_id,
             radio_launch_info,
             choose_radio,
             use_single_radio,

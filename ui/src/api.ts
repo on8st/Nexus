@@ -826,6 +826,14 @@ export async function appVersion(): Promise<string> {
   return invoke<string>('app_version')
 }
 
+/** The fork/branch/commit this binary was built from, e.g.
+ * `on8st/Nexus macos-support@316f8763`. Stamped at compile time, so it names the tree
+ * that produced the binary rather than whatever is checked out now. Shown as the
+ * version chip's tooltip — the product version alone cannot tell two branch builds apart. */
+export async function buildId(): Promise<string> {
+  return invoke<string>('build_id')
+}
+
 /** Why installing a downloaded update is refused right now, or null when it is allowed.
  * Asked at the moment of the press, never cached — the radio can go busy between a poll and a
  * click, and installing restarts the app. */
