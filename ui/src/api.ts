@@ -2168,6 +2168,6 @@ export async function resetSettings(): Promise<AppSnapshot> {
 
 /** Restore a bundle written by `exportSettingsBundle`. Refuses anything that is not one, by
  *  name and schema — a partial restore is worse than a refusal. */
-export async function importSettingsBundle(text: string): Promise<void> {
-  return invoke<void>('import_settings_bundle', { text })
+export async function importSettingsBundle(text: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('import_settings_bundle', { text })
 }
