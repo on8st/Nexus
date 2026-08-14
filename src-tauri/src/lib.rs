@@ -9354,7 +9354,31 @@ fn add_radio(state: State<'_, SharedEngine>) -> Result<AppSnapshot, String> {
 #[tauri::command(async)]
 fn remove_radio(state: State<'_, SharedEngine>, id: u32) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
-    eng.remove_radio(id);
+    // remove_radio_profile REFUSES two cases and says so by returning false. Discarding that and
+    // returning Ok is why the button looked broken (operator report, 2026-08-14): deleting the
+    // radio you are operating reported success, changed nothing, and gave no reason. A refusal
+    // the operator cannot see is indistinguishable from a bug.
+    if !eng.remove_radio(id) {
+        let s = eng.settings();
+        return Err(if !s.radios.iter().any(|p| p.id == id) {
+            "That radio is no longer in the list.".to_string()
+        } else if s.radios.len() <= 1 {
+            "This is your only radio, and Nexus needs at least one. Add another first, then \
+             remove this one."
+                .to_string()
+        } else {
+            let name = s
+                .radios
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            format!(
+                "{name} is the radio you are operating. Switch to another radio first, then \
+                 remove it."
+            )
+        });
+    }
     if let Err(e) = eng.settings().save(&settings_path()) {
         eprintln!("tempo: remove_radio save failed: {e}");
     }
