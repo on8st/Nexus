@@ -160,7 +160,10 @@ afterEach(cleanup)
 /** Click "Edit" on the non-active radio (the IC-9700) so the flat rig form describes it. */
 describe('backing up the station', () => {
   async function backupRow() {
-    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    // Backup/Restore moved to their own Config tab. They previously sat under
+    // Radio -> "Transmit limits & sharing", which is why no operator ever found them: backing
+    // up a whole station has nothing to do with transmit limits.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Config' }))
     const label = await screen.findByText('Back up your setup')
     return label.closest('.settings-field') as HTMLElement
   }
