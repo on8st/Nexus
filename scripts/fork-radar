@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# fork-radar — which upstream commits touch files that MY branches touch?
+#
+# FORK-LOCAL TOOLING. Not upstream material; lives on the fork only.
+#
+# Reading upstream's log is not sustainable: upstream moved 21 commits in a day
+# on 2026-08-14. Reading the two that touch YOUR files is. This turns the log
+# into that shortlist, per branch, and says nothing when there is nothing to say.
+#
+# Usage:
+#   scripts/fork-radar                     # every local branch, vs upstream/main
+#   scripts/fork-radar --branch macos-support
+#   scripts/fork-radar --upstream upstream/main
+#   scripts/fork-radar --no-fetch          # offline; refs may be stale, and it says so
+#   scripts/fork-radar --repo /path/to/checkout
+#
+# --repo exists so this can be aimed at a sandbox rather than the live tree, and
+# the resolved path is ALWAYS printed: a check whose target you did not verify is
+# not a check. Exit status is 0 whenever the report ran; it is a report, not a gate.
+set -uo pipefail
+
+REPO=""
+UPSTREAM="upstream/main"
+ONLY_BRANCH=""
+FETCH=1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)     REPO="${2:-}"; shift 2 ;;
+    --upstream) UPSTREAM="${2:-}"; shift 2 ;;
+    --branch)   ONLY_BRANCH="${2:-}"; shift 2 ;;
+    --no-fetch) FETCH=0; shift ;;
+    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "fork-radar: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$REPO" ]; then
+  REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+fi
+g() { git -C "$REPO" "$@"; }
+
+g rev-parse --git-dir >/dev/null 2>&1 || { echo "fork-radar: not a git repo: $REPO" >&2; exit 2; }
+
+echo "repo:     $REPO"
+echo "upstream: $UPSTREAM"
+
+if [ "$FETCH" -eq 1 ]; then
+  remote="${UPSTREAM%%/*}"
+  # A FAILED fetch leaves a stale remote ref that looks exactly as authoritative
+  # as a current one. Never let that pass silently.
+  if g fetch --quiet "$remote" 2>/dev/null; then
+    echo "fetch:    ok ($remote)"
+  else
+    echo "fetch:    *** FAILED *** — everything below may be STALE"
+  fi
+else
+  echo "fetch:    skipped (--no-fetch) — refs may be stale"
+fi
+
+g rev-parse --verify --quiet "$UPSTREAM" >/dev/null \
+  || { echo "fork-radar: no such ref: $UPSTREAM" >&2; exit 2; }
+
+echo "tip:      $(g log -1 --format='%h %ad  %s' --date=short "$UPSTREAM")"
+echo
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+if [ -n "$ONLY_BRANCH" ]; then
+  echo "$ONLY_BRANCH" > "$TMP/branches"
+else
+  # `main` is the pristine upstream mirror by convention — nothing of ours is on
+  # it, so it can only ever report zero and would be noise.
+  g for-each-ref --format='%(refname:short)' refs/heads | grep -vx 'main' > "$TMP/branches"
+fi
+
+quiet_count=0
+
+while read -r br; do
+  [ -n "$br" ] || continue
+  g rev-parse --verify --quiet "$br" >/dev/null || { echo "?? $br — no such branch"; continue; }
+  base="$(g merge-base "$UPSTREAM" "$br" 2>/dev/null)" || { echo "?? $br — no merge base"; continue; }
+
+  ahead="$(g rev-list --count "$UPSTREAM..$br")"
+  behind="$(g rev-list --count "$br..$UPSTREAM")"
+
+  g diff --name-only "$base" "$br" > "$TMP/ours" 2>/dev/null
+  nours="$(wc -l < "$TMP/ours" | tr -d ' ')"
+
+  # Nothing of ours on this branch -> nothing can collide.
+  if [ "$nours" -eq 0 ]; then
+    quiet_count=$((quiet_count + 1))
+    continue
+  fi
+
+  : > "$TMP/hits"
+  collided=0
+  clean=0
+  for c in $(g rev-list "$base..$UPSTREAM"); do
+    files="$(g show --name-only --format='' "$c" | grep -Fxf "$TMP/ours" 2>/dev/null | tr '\n' ' ')"
+    if [ -n "$files" ]; then
+      printf '   %s  %-44s -> %s\n' \
+        "$(g log -1 --format=%h "$c")" \
+        "$(g log -1 --format=%s "$c" | cut -c1-44)" \
+        "$(echo "$files" | tr ' ' '\n' | sed 's|^crates/||; s|^src-tauri/||; s|^ui/src/|ui/|' | tr '\n' ' ')" >> "$TMP/hits"
+      collided=$((collided + 1))
+    else
+      clean=$((clean + 1))
+    fi
+  done
+
+  if [ "$collided" -eq 0 ]; then
+    printf '  OK  %-24s %s ahead, %s behind — %s files, none touched upstream\n' \
+      "$br" "$ahead" "$behind" "$nours"
+  else
+    printf '  !!  %-24s %s ahead, %s behind — %s files, %s upstream commits COLLIDE\n' \
+      "$br" "$ahead" "$behind" "$nours" "$collided"
+    cat "$TMP/hits"
+    [ "$clean" -gt 0 ] && printf '   (%s other upstream commits touch nothing of yours)\n' "$clean"
+  fi
+done < "$TMP/branches"
+
+[ "$quiet_count" -gt 0 ] && echo "  -- $quiet_count branch(es) with no changes of their own, skipped"
+echo
+echo "!! = read those commits before merging upstream forward."
+exit 0
