@@ -709,6 +709,10 @@ export function SettingsPanel({
   // A probe result awaiting the operator's yes. Never applied or saved on its own — see
   // `handleAutoTestPorts` for the incident that made this a question rather than a write.
   const [catProposal, setCatProposal] = useState<CatProbeResult | null>(null)
+  // What ENUMERATION found, held until the CAT probe either confirms or contradicts it.
+  // Never applied on its own: enumeration proves a serial device exists, never that a RADIO
+  // is on the other end -- which is how a monitor's usbmodem was accepted as a CAT port twice.
+  const [pendingDetected, setPendingDetected] = useState<DetectedRig | null>(null)
   // Connections visibility: stored-credential status + the rolling event log —
   // the answer to "I hit save and couldn't tell anything happened".
   const [creds, setCreds] = useState<CredStatus[]>([])
@@ -1410,12 +1414,20 @@ export function SettingsPanel({
     }
   }
 
-  // Zero-config: scan connected USB radios.
-  const onDetectRigs = async () => {
+  // Zero-config: ONE button. Enumerate what is plugged in, then PROVE it by talking CAT to
+  // it, and present a single question at the end.
+  //
+  // It used to be two buttons, and the split was the wrong seam. "Detect my radio" trusted the
+  // USB descriptors whenever they named a model and never asked the rig anything; "Auto-test"
+  // did the asking but had to be found and pressed separately. So the fast path was also the
+  // unverified one. Enumeration answers "what is plugged in"; only the probe answers "which port
+  // actually drives a radio", and that is the question an operator is really asking.
+  const onAutoDetect = async () => {
     setDetecting(true)
-    // ONE detect for every radio kind (operator request: the USB-only scan
-    // could never see a Flex): USB enumeration + LAN discovery in parallel;
-    // either probe may fail without killing the other's results.
+    setCatProposal(null)
+    setCatResult(null)
+    setPendingDetected(null)
+    // USB enumeration + LAN discovery in parallel; either may fail without killing the other.
     const [rigs, flexes] = await Promise.all([
       withErrorToast(() => detectRigs(), 'USB radio detection failed'),
       discoverFlex().catch((e) => {
@@ -1423,63 +1435,39 @@ export function SettingsPanel({
         return []
       }),
     ])
-    setDetectedFlex(flexes)
+    const list = rigs ?? []
+    const flexList = flexes ?? []
+    setDetectedFlex(flexList)
+    setDetected(list)
     setDetecting(false)
-    if (rigs) {
-      setDetected(rigs)
-      if (rigs.length === 0 && flexes.length === 0)
-        pushToast('No radios found — USB: plug in + power on; Flex: must be on this network.', 'info')
+    // MORE than one candidate: which radio this profile is, is the operator's answer to give.
+    // Guessing it is precisely the failure that saved an FTX-1 profile pointing at an FT-710.
+    if (list.length > 1 || flexList.length > 0) return
+    // Exactly one: nothing to choose, so carry straight on and prove it.
+    if (list.length === 1) {
+      await stageAndVerify(list[0])
+      return
+    }
+    // NOTHING RECOGNISED -- and that is not the same as nothing answering. Enumeration reads USB
+    // descriptors; a rig behind a bridge chip it does not know looks like no radio at all. The
+    // probe is the authority, so still ask the ports directly before reporting failure.
+    const answered = await handleAutoTestPorts()
+    if (!answered) {
+      pushToast('No radios found — USB: plug in + power on; Flex: must be on this network.', 'info')
     }
   }
 
-  // One-click apply a detected rig: fill model (if identified) + port + paired audio.
-  const applyDetectedRig = (r: DetectedRig) => {
+  // Stage one enumerated rig and prove it over CAT. Deliberately does NOT touch the form: the
+  // proposal is where anything gets applied, and only when the operator accepts it.
+  const stageAndVerify = async (r: DetectedRig) => {
     if (!form) return
-    markDirty()
-    const baud = r.suggestedModel != null ? baudForRig(r.suggestedModel, form.baud) : null
-    const applied = {
-      ...form,
-      ...(r.suggestedModel != null
-        ? { rigModel: r.suggestedModel, rigModelName: r.suggestedModelName ?? '' }
-        : {}),
-      serialPort: r.portName,
-      // Pair RX from the capture list, TX from the OUTPUT list — the rig's CODEC enumerates under
-      // different names per direction on Windows, so reusing the input name for audioOut sent TX
-      // audio to the PC speakers. Fall back to the input name only if no output paired.
-      ...(r.suggestedAudio ? { audioIn: r.suggestedAudio } : {}),
-      ...(r.suggestedAudioOut || r.suggestedAudio
-        ? { audioOut: r.suggestedAudioOut ?? r.suggestedAudio ?? '' }
-        : {}),
-      ...(baud ? { baud } : {}),
-      // A recognised interface cable keys a serial line, so pre-fill that much. The PTT PORT is
-      // only filled when we actually know the answer: `interfaceSharesCatPort === true` means
-      // one cable, so blank is correct. `null` means it varies by model — leave whatever the
-      // operator already had rather than guessing, because a wrong keying port keys the wrong
-      // radio, which is a TX-path error, not a cosmetic one.
-      ...(r.interfacePttMethod ? { pttMethod: r.interfacePttMethod } : {}),
-      ...(r.interfaceSharesCatPort === true ? { pttSerialPort: '' } : {}),
-    }
-    setForm(applied)
+    setPendingDetected(r)
     if (r.interfaceName) {
-      // Do NOT chain into Auto-test the way an unidentified rig does. We know exactly what this
-      // device is — a cable — and the sweep would be looking for a radio that this port may not
-      // even have a CAT link to yet. Tell the operator the one thing still missing.
-      pushToast(
-        `Applied ${r.interfaceName} on ${r.portName} — now pick your Rig Model, then Save`,
-        'success',
-      )
-    } else if (r.suggestedModel == null) {
-      // Unidentified rig (bridge chip only, no model) — instead of making the operator pick a model
-      // and Test CAT by hand, chain straight into the port Auto-test, which sweeps COMMON_CAT_MODELS
-      // + bauds to find the one that actually answers. Pass the freshly-applied form (state is async).
-      pushToast(`Applied ${r.product || 'radio'} on ${r.portName} — identifying via Auto-test…`, 'info')
-      void handleAutoTestPorts(applied)
-    } else {
-      pushToast(
-        `Applied ${r.suggestedModelName ?? (r.product || 'radio')} on ${r.portName} — review + Save settings`,
-        'success',
-      )
+      // A recognised INTERFACE CABLE is not a radio. Probe anyway -- the rig behind it may well
+      // answer -- but say what is still the operator's to choose if nothing does.
+      pushToast(`${r.interfaceName} on ${r.portName} — checking what answers…`, 'info')
     }
+    await handleAutoTestPorts()
   }
 
   // One-click apply a discovered Flex: network conn via SmartSDR CAT's default
@@ -1600,9 +1588,9 @@ export function SettingsPanel({
   //
   // So the result lands in `catProposal` and is rendered as a question naming the rig that
   // ACTUALLY ANSWERED. Applying is one click, saving is still the operator's Save.
-  const handleAutoTestPorts = async (base?: typeof form) => {
+  const handleAutoTestPorts = async (base?: typeof form): Promise<boolean> => {
     const f = base ?? form
-    if (!f) return
+    if (!f) return false
     setCatTesting(true)
     setCatResult(null)
     setCatProposal(null)
@@ -1613,11 +1601,13 @@ export function SettingsPanel({
       const r = await probeCatPorts(editingRadioId ?? f.activeRadio)
       if (r.found) {
         setCatProposal(r)
-      } else {
-        setCatResult({ ok: false, detail: r.detail })
+        return true
       }
+      setCatResult({ ok: false, detail: r.detail })
+      return false
     } catch {
       setCatResult({ ok: false, detail: 'Could not run the port auto-test.' })
+      return false
     } finally {
       setCatTesting(false)
     }
@@ -1631,13 +1621,27 @@ export function SettingsPanel({
     // Only trust the MODEL when it wasn't a guess — a seeded common-rig probe can be answered by
     // a same-family sibling (an FT-991A on the FTDX10 probe, an FT-710 on an FTX-1 probe), so
     // keep the operator's Rig Model rather than overwriting it with a coincidence.
+    // Audio pairing can only come from ENUMERATION -- the probe speaks CAT and knows nothing
+    // about sound cards. Apply it ONLY when the rig answered on the very port enumeration paired
+    // that codec with: if they disagree, the two are describing different radios, and pairing
+    // them anyway would be the original bug wearing a confirmation dialog.
+    const d = pendingDetected && pendingDetected.portName === r.portName ? pendingDetected : null
     setForm({
       ...form,
       serialPort: r.portName,
       baud: r.baud,
       pttMethod: 'cat',
       ...(r.modelSeeded ? {} : { rigModel: r.model, rigModelName: r.modelName }),
+      ...(d?.suggestedAudio ? { audioIn: d.suggestedAudio } : {}),
+      ...(d && (d.suggestedAudioOut || d.suggestedAudio)
+        ? { audioOut: d.suggestedAudioOut ?? d.suggestedAudio ?? '' }
+        : {}),
+      // A wrong keying port keys the wrong radio -- a TX-path error, not a cosmetic one -- so
+      // only ever set this from a KNOWN answer, never a guess.
+      ...(d?.interfacePttMethod ? { pttMethod: d.interfacePttMethod } : {}),
+      ...(d?.interfaceSharesCatPort === true ? { pttSerialPort: '' } : {}),
     })
+    setPendingDetected(null)
     setCatProposal(null)
     setCatResult({ ok: true, detail: `Applied ${r.portName} @ ${r.baud} — review, then Save.` })
   }
@@ -3076,10 +3080,11 @@ export function SettingsPanel({
                   <button
                     type="button"
                     className="settings-refresh"
-                    onClick={onDetectRigs}
-                    disabled={detecting}
+                    onClick={onAutoDetect}
+                    disabled={detecting || catTesting}
+                    title="Find what is plugged in, then talk CAT to it to prove which port drives the radio — read-only, never transmits. Nothing is saved until you accept the result."
                   >
-                    {detecting ? 'Scanning…' : 'Detect my radio'}
+                    {detecting ? 'Scanning…' : catTesting ? 'Probing…' : 'Auto-detect'}
                   </button>
                 </div>
                 {(detected.length > 0 || detectedFlex.length > 0) && (
@@ -3157,8 +3162,13 @@ export function SettingsPanel({
                             </span>
                           )}
                         </div>
-                        <button type="button" className="settings-save" onClick={() => applyDetectedRig(r)}>
-                          Use this
+                        <button
+                          type="button"
+                          className="settings-save"
+                          onClick={() => void stageAndVerify(r)}
+                          disabled={catTesting}
+                        >
+                          {catTesting ? 'Probing…' : 'Use this'}
                         </button>
                       </li>
                     ))}
@@ -3376,15 +3386,6 @@ export function SettingsPanel({
                     title="Re-scan serial ports"
                   >
                     {portsLoading ? '…' : 'Refresh'}
-                  </button>
-                  <button
-                    type="button"
-                    className="settings-refresh"
-                    onClick={() => handleAutoTestPorts()}
-                    disabled={catTesting}
-                    title="Probe each USB port (read-only — never transmits) and auto-select the one that drives your rig"
-                  >
-                    {catTesting ? '…' : 'Auto-test'}
                   </button>
                 </div>
                 {/* The probe's answer, as a QUESTION. It names the rig that actually replied and

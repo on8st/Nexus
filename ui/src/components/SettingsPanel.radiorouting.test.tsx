@@ -190,11 +190,11 @@ describe('rig form writes go to the radio they describe', () => {
     expect(await screen.findByText(/make .* active to test it/i)).toBeTruthy()
   })
 
-  it('Auto-test probes on behalf of the radio being configured, and routes its write there', async () => {
+  it('Auto-detect probes on behalf of the radio being configured, and routes its write there', async () => {
     renderPanel()
     await editTheNonActiveRadio()
 
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
 
     // Radio-blind probing seeded every port with the ACTIVE radio's Hamlib model, and an Icom
     // answers only at its own CI-V address — so radio 2's port could never answer.

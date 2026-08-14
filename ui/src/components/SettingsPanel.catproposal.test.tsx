@@ -154,7 +154,7 @@ beforeEach(() => {
 afterEach(cleanup)
 
 
-describe('Auto-test proposes; it never applies or saves on its own', () => {
+describe('Auto-detect proposes; it never applies or saves on its own', () => {
   // THE 2026-08-13 INCIDENT. `handleAutoTestPorts` used to write the probe result into the form
   // and PERSIST it immediately. A port sweep answers with whichever rig replies first, and
   // `probe_cat_ports` only excludes ports ALREADY CONFIGURED on another profile — so on a station
@@ -165,10 +165,44 @@ describe('Auto-test proposes; it never applies or saves on its own', () => {
   // The probe here reports an IC-9700 on COM7 while the form describes an FTDX10 — i.e. it found
   // the wrong rig, which is precisely the case that must not be written.
 
+  // ONE BUTTON, BOTH STAGES. It used to take two presses in two places: "Detect my radio"
+  // (USB descriptors, trusted whenever they named a model) and "Auto-test" (the CAT probe that
+  // actually proves it). The fast path was therefore also the unverified one — enumeration
+  // proves a serial device exists, never that a RADIO is on the other end, which is how a
+  // monitor's usbmodem was accepted as a CAT port. These pin that one press now does both, and
+  // that the probe runs EVEN WHEN enumeration recognises nothing: not recognising a device is
+  // not the same as no radio answering.
+  it('one press enumerates AND probes — no second button to find', async () => {
+    api.get('detectRigs').mockResolvedValueOnce([
+      { portName: 'COM7', chip: 'CP2105', product: 'CP2105 Dual USB to UART Bridge Controller' },
+    ])
+    renderPanel()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
+
+    await waitFor(() => expect(api.get('detectRigs')).toHaveBeenCalled())
+    // The probe follows on its own — nothing else was clicked.
+    await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalled())
+    await waitFor(() => expect(document.body.textContent).toContain('COM7'))
+    // And still nothing on disk.
+    expect(api.get('setSettings')).not.toHaveBeenCalled()
+  })
+
+  it('probes even when enumeration recognises nothing', async () => {
+    api.get('detectRigs').mockResolvedValueOnce([])
+    renderPanel()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
+
+    // An empty enumeration must NOT short-circuit to "no radios found": a rig behind an
+    // unrecognised bridge chip enumerates as nothing and still answers CAT.
+    await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalled())
+  })
+
   it('a found port is NOT saved — no settings write of any kind', async () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
 
     await waitFor(() => expect(api.get('probeCatPorts')).toHaveBeenCalled())
     // The whole point: nothing reached disk.
@@ -179,7 +213,7 @@ describe('Auto-test proposes; it never applies or saves on its own', () => {
   it('it asks, naming the rig that actually answered and the radio it would change', async () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
 
     // The operator must be able to see BOTH facts: what answered, and what it would change.
     await waitFor(() => expect(document.body.textContent).toContain('COM7'))
@@ -192,7 +226,7 @@ describe('Auto-test proposes; it never applies or saves on its own', () => {
   it('Apply fills the form but STILL does not save', async () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
@@ -205,7 +239,7 @@ describe('Auto-test proposes; it never applies or saves on its own', () => {
   it('Dismiss drops it, changing nothing', async () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
-    fireEvent.click(await screen.findByRole('button', { name: /auto-test/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /auto-detect/i }))
     fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
