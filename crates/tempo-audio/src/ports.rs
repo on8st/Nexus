@@ -125,7 +125,7 @@ pub struct UsbPort {
 #[cfg(feature = "serial")]
 pub fn available_usb_ports() -> Vec<UsbPort> {
     use serialport::SerialPortType;
-    match serialport::available_ports() {
+    let ports = match serialport::available_ports() {
         Ok(ports) => ports
             .into_iter()
             .filter_map(|p| match p.port_type {
@@ -140,7 +140,88 @@ pub fn available_usb_ports() -> Vec<UsbPort> {
             })
             .collect(),
         Err(_) => Vec::new(),
+    };
+    #[cfg(target_os = "macos")]
+    let ports = collapse_macos_duplicates(ports);
+    ports
+}
+
+/// macOS lists every serial port two to four times, and the operator pays for it: a station with
+/// TWO radios offered 22 rows, all but four of them the same four ports wearing different names.
+///
+/// Two independent duplications stack up:
+///  * `/dev/tty.X` and `/dev/cu.X` are the SAME port. `tty.*` blocks on carrier detect, so `cu.*`
+///    is the one a rig should ever be opened on — the twin is never the right answer, only noise.
+///  * A Silicon Labs bridge appears BOTH as `cu.usbserial-<serial><iface>` (Apple's driver) and as
+///    `cu.SLAB_USBtoUART<n>` (the vendor extension). Same silicon, same port, different name — so
+///    name matching cannot see it and only USB topology can.
+///
+/// Collapse both, keeping the most identifiable node. NOTHING IS DROPPED THAT CANNOT BE PROVED A
+/// DUPLICATE: a port with no topology, or with no better twin, always survives. Losing a real port
+/// here would look exactly like a rig that stopped existing.
+#[cfg(all(feature = "serial", target_os = "macos"))]
+fn collapse_macos_duplicates(ports: Vec<UsbPort>) -> Vec<UsbPort> {
+    use std::collections::HashMap;
+
+    // Lower is better. `usbserial-` encodes the adapter's own serial number and its interface, so
+    // it survives a reboot and names which half of a dual bridge it is; `SLAB_` is positional.
+    fn rank(name: &str) -> u8 {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        if base.starts_with("tty.") {
+            return 3;
+        }
+        if base.starts_with("cu.usbserial-") {
+            return 0;
+        }
+        if base.starts_with("cu.SLAB_") {
+            return 1;
+        }
+        2
     }
+
+    // 1. Name-based: /dev/tty.X vs /dev/cu.X. Needs no IOKit, so it still works if topology
+    //    lookup fails entirely.
+    let cu: std::collections::HashSet<String> = ports
+        .iter()
+        .filter_map(|p| p.port_name.strip_prefix("/dev/cu.").map(str::to_string))
+        .collect();
+    let ports: Vec<UsbPort> = ports
+        .into_iter()
+        .filter(|p| match p.port_name.strip_prefix("/dev/tty.") {
+            Some(rest) => !cu.contains(rest),
+            None => true,
+        })
+        .collect();
+
+    // 2. Topology-based: same USB device AND same interface number is the same physical port,
+    //    whatever it is called. An empty map (IOKit unavailable) leaves the list untouched.
+    let locs = crate::usbtopo::serial_locations();
+    let ifaces = crate::usbtopo::serial_interfaces();
+    if locs.is_empty() {
+        return ports;
+    }
+    let mut best: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut keep = vec![true; ports.len()];
+    for (i, p) in ports.iter().enumerate() {
+        let (Some(&loc), Some(&iface)) = (locs.get(&p.port_name), ifaces.get(&p.port_name)) else {
+            continue; // unkeyable -> always kept
+        };
+        match best.get(&(loc, iface)) {
+            Some(&j) if rank(&ports[j].port_name) <= rank(&p.port_name) => keep[i] = false,
+            Some(&j) => {
+                keep[j] = false;
+                best.insert((loc, iface), i);
+            }
+            None => {
+                best.insert((loc, iface), i);
+            }
+        }
+    }
+    ports
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(p, k)| k.then_some(p))
+        .collect()
 }
 
 /// USB serial ports — empty without the `serial` feature (no enumeration backend).
@@ -152,6 +233,40 @@ pub fn available_usb_ports() -> Vec<UsbPort> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name-based half of the macOS collapse, which must work even when IOKit gives nothing.
+    /// A station with two radios offered 22 rows; half of them were `tty.*` twins of a `cu.*` that
+    /// was already listed. `tty.*` blocks on carrier detect, so it is never the right node to open.
+    #[cfg(all(feature = "serial", target_os = "macos"))]
+    #[test]
+    fn tty_twins_collapse_but_a_lone_tty_survives() {
+        let mk = |n: &str| UsbPort {
+            port_name: n.to_string(),
+            vid: 0x10c4,
+            pid: 0xea70,
+            product: "CP2105".into(),
+            manufacturer: "Silicon Labs".into(),
+        };
+        // Same port twice, plus a tty with NO cu twin — dropping that one would be losing a port.
+        let got = collapse_macos_duplicates(vec![
+            mk("/dev/cu.usbserial-01AF7FED0"),
+            mk("/dev/tty.usbserial-01AF7FED0"),
+            mk("/dev/tty.lonelyport"),
+        ]);
+        let names: Vec<&str> = got.iter().map(|p| p.port_name.as_str()).collect();
+        assert!(
+            names.contains(&"/dev/cu.usbserial-01AF7FED0"),
+            "the cu node must survive: {names:?}"
+        );
+        assert!(
+            !names.contains(&"/dev/tty.usbserial-01AF7FED0"),
+            "the tty twin must be collapsed: {names:?}"
+        );
+        assert!(
+            names.contains(&"/dev/tty.lonelyport"),
+            "a tty with no twin is the only node there is, and must be KEPT: {names:?}"
+        );
+    }
 
     #[cfg(all(feature = "serial", target_os = "linux"))]
     #[test]

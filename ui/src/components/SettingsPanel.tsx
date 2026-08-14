@@ -3144,8 +3144,8 @@ export function SettingsPanel({
                               ⚠ Found the port but not the exact model — normal when the rig sits
                               behind a generic USB bridge chip that reports only its own name (common
                               on Icom, Yaesu, Kenwood, Elecraft, and Xiegu). Pick your rig in{' '}
-                              <em>Rig Model</em> below, or click <em>Auto-test</em> (it tries the
-                              common rigs to find the right port + baud for you).
+                              <em>Rig Model</em> below — or just press <em>Use this</em>, which
+                              tries the common rigs to find the right port + baud for you.
                             </span>
                           )}
                           {r.driverNote && !r.driverBundled && (
@@ -3432,7 +3432,7 @@ export function SettingsPanel({
                   </div>
                 )}
                 <span className="settings-hint">
-                  COM / tty device for rig control — or Auto-test to find it.
+                  COM / tty device for rig control — or Auto-detect to find it.
                   {[3088, 3087, 3091, 3089, 3076].includes(form.rigModel) && (
                     <>
                       {' '}
