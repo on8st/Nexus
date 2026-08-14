@@ -1204,6 +1204,14 @@ export async function getDxccEntityNames(): Promise<string[]> {
   return invoke<string[]>('dxcc_entity_names')
 }
 
+/** Every entity's cty.dat representative location as `[name, lat, lon]` — the azimuth
+ *  fallback for a station that never sent a grid. Keyed by the same `country`/`entity`
+ *  string a decode/spot row carries. WAE/CQ-only entities are included: `resolve()`
+ *  returns those as a country too. */
+export async function getDxccEntityLocations(): Promise<[string, number, number][]> {
+  return invoke<[string, number, number][]>('dxcc_entity_locations')
+}
+
 // --- QSO recording (audio bridge) ---
 /** Start streaming the live RX audio to a timestamped WAV on disk. */
 export async function startQsoRecording(): Promise<AppSnapshot> {
@@ -1670,6 +1678,20 @@ export async function getRttyState(): Promise<RttyState> {
  * TX-enable / privileges / RTTY-section ownership and rejects with the reason). */
 export async function rttySend(text: string): Promise<RttyState> {
   return invoke<RttyState>('rtty_send', { text })
+}
+
+/** Continuous TX on/off (the MMTTY "TX" latch): stay keyed and type into a live
+ * transmission instead of one keyed over per Enter. ON runs the same gate a send
+ * runs; OFF lets what was already typed finish keying, then unkeys — it is a mode
+ * toggle, not the emergency stop (Stop TX and the TX-enable latch are). */
+export async function rttySetLatched(on: boolean): Promise<RttyState> {
+  return invoke<RttyState>('rtty_set_latched', { on })
+}
+
+/** Feed typed characters into the live latched transmission. One insertion at a
+ * time — RTTY has no un-send, so what reaches here has already gone on the air. */
+export async function rttyType(text: string): Promise<RttyState> {
+  return invoke<RttyState>('rtty_type', { text })
 }
 
 /** Stop RTTY now: abort the over in progress, drop the queue, unkey. */

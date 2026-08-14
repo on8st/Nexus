@@ -1491,6 +1491,20 @@ pub struct Engine {
     /// Holds the BAND, not a span: off that band the park says nothing and the knob is an
     /// ordinary QSY (which then clears it). Session-only, like the memory it guards.
     machinery_park: Option<String>,
+    /// The named band the knob left when it took the dial OFF the bands — the one thing the
+    /// blanked `settings.band` cannot say. `None` = the dial is on a band, or we do not know
+    /// which band an unlabeled dial came from (a boot seed).
+    ///
+    /// WHY IT EXISTS: leaving the bands is not a QSY, and neither is coming back. Off the
+    /// bands the label must be absent (see the arm in [`Engine::observe_rig_freq`] that sets
+    /// this), so without a memory the return would read `"" -> "40m"` as a band CHANGE and
+    /// throw away the 40 m context on the way in — the same wipe the excursion itself used to
+    /// do, one knob turn later. With it, a WWV check is a round trip and a 20 m → gap → 40 m
+    /// excursion is still the cross-band QSY it really is.
+    ///
+    /// Read in ONE place, and only while `settings.band` is empty; spent (`take`) by the
+    /// first return to any named band. Session-only, like the dial memory it sits beside.
+    off_band_from: Option<String>,
     /// Has the CAT link told us where the rig is yet, THIS session? Set by the boot seed
     /// ([`Engine::seed_rig_dial`]) and by the first [`Engine::observe_rig_freq`], never
     /// cleared.
@@ -1722,6 +1736,29 @@ pub struct Engine {
     /// One-shot: abort the RTTY transmission in progress (the loop stops the FSK
     /// keying thread / flushes the AFSK audio ring and unkeys PTT).
     rtty_abort: bool,
+    /// CONTINUOUS-TX LATCH (the MMTTY "TX" button): the operator has asked to
+    /// stay keyed and type into a live transmission, instead of one keyed over
+    /// per Enter. Set ONLY by [`Engine::set_rtty_latched`] — never on arm, never
+    /// on launch, never by a decode.
+    ///
+    /// ⚠️ THIS FLAG IS NOT PERMISSION TO KEY, and nothing may treat it as such.
+    /// It is the operator's INTENT; the permission is re-derived from every gate
+    /// on EVERY radio-loop tick in [`Engine::poll_rtty_stream`], which drops the
+    /// latch outright the moment any of them goes down. A latched transmitter
+    /// that outlived a gate check would be the stuck-carrier incident this whole
+    /// design is arranged to prevent — so the rule is: the latch is a per-tick
+    /// PREDICATE, never a stored authorisation.
+    rtty_latched: bool,
+    /// Characters the operator has typed that have not yet been keyed, in order.
+    /// Filled by [`Engine::rtty_type`] (one insertion at a time from the compose
+    /// field — RTTY has no un-send, so nothing here can be edited or withdrawn)
+    /// and drained a chunk at a time by [`Engine::poll_rtty_stream`]. Empty means
+    /// the latched stream idles on DIDDLE (LTRS), not silence and not an unkey.
+    rtty_type_buf: VecDeque<char>,
+    /// Unix-ms when the current latch went up — the anchor for
+    /// [`RTTY_MAX_LATCH_MS`], the HARD ceiling on one continuous over. `None`
+    /// when not latched.
+    rtty_latch_start_ms: Option<u64>,
     /// True while the radio loop is keying an RTTY over (stamped by the loop each
     /// tick; the cockpit's sending indicator).
     rtty_sending: bool,
@@ -2540,6 +2577,13 @@ pub struct RttyRxState {
     pub shift_hz: u32,
     pub backend: String,
     pub sending: bool,
+    /// Continuous TX is latched (the cockpit's TX button) — the operator is keyed
+    /// and typing into a live transmission. Reported SEPARATELY from `sending`
+    /// and never folded into it: `sending` is "an over is on the air", which the
+    /// radio loop stamps from the audio actually in flight, and the cockpit needs
+    /// to know the latch is up even in the tick before the first chunk is keyed
+    /// (that is when its Stop control must already be live).
+    pub latched: bool,
     pub keyer_error: Option<String>,
     // --- Auto-sequencer surface (meaningful only while `auto` is true) ---
     /// The RTTY auto-sequencer is active (the operator's Auto toggle is on).
@@ -2569,6 +2613,41 @@ enum RttyOp {
     Tick,
     /// The engine finished keying the last over (restarts the reply timer).
     TxComplete,
+}
+
+/// Uppercase + drop anything with no ITA2 mapping — the ONE filter every RTTY TX
+/// path runs, so what is queued (or typed into a latched stream) is exactly what
+/// keys, and the two paths can never disagree about which characters exist.
+fn rtty_filter(text: &str) -> String {
+    text.chars()
+        .map(|c| c.to_ascii_uppercase())
+        .filter(|&c| tempo_core::rtty::encodable(c))
+        .collect()
+}
+
+/// What the radio loop should key this tick on behalf of the continuous-TX latch
+/// ([`Engine::poll_rtty_stream`]).
+///
+/// Three explicit answers rather than an empty-string sentinel: "nothing typed"
+/// and "not transmitting" are opposite instructions to a keyed transmitter, and a
+/// consumer that had to infer the difference from an empty buffer would sooner or
+/// later infer it wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RttyStreamTick {
+    /// Not streaming. The loop must not key on the latch's behalf — and if it was,
+    /// the latch has just been dropped and the abort armed, so it unkeys.
+    Idle,
+    /// Streaming and every gate is up, but the loop asked for no characters this
+    /// tick because its audio look-ahead is already full. Stay keyed, key nothing.
+    /// This exists so the loop can run the gate re-check on EVERY tick without
+    /// having to feed on every tick — the predicate is the safety, the feeding is
+    /// only the feature.
+    Ahead,
+    /// Key these typed characters (never empty).
+    Text(String),
+    /// Latched with nothing typed: key the RTTY IDLE (a LTRS diddle) to hold the
+    /// carrier and the far end's sync. Never silence under a held PTT.
+    Diddle,
 }
 
 /// The `rtty_state` seq-state string the UI switches on.
@@ -3011,6 +3090,7 @@ impl Engine {
             // themselves tunes this session opens the first residency.
             dial_residency: None,
             machinery_park: None,
+            off_band_from: None,
             rig_dial_seen: false,
             cw_queue: VecDeque::new(),
             cw_sent: VecDeque::new(),
@@ -3079,6 +3159,9 @@ impl Engine {
             rtty_center: None,
             rtty_queue: VecDeque::new(),
             rtty_abort: false,
+            rtty_latched: false,
+            rtty_type_buf: VecDeque::new(),
+            rtty_latch_start_ms: None,
             rtty_sending: false,
             rtty_keyer_error: None,
             rtty_seq: None,
@@ -3892,9 +3975,20 @@ impl Engine {
         // resolver, so a recompute would re-route a satellite QSY on the mode rules.
         let route_target = self.route_target.take();
         if !self.settings.radio_pegged {
-            if let Some(id) =
-                route_target.unwrap_or_else(|| self.settings.route_radio(band, route_mode))
-            {
+            if let Some(id) = route_target.unwrap_or_else(|| {
+                // NO BAND TO ROUTE ON — ask only the tiers that never read one, exactly as
+                // the satellite bandless path does (see `sat_tune_nominal`). Routing on `""`
+                // is not merely useless, it actively misroutes: `radio_for_band` ranks a
+                // catch-all coverage list (1) ABOVE an explicit list that does not contain
+                // the band (0), and no explicit list contains the empty string — so an
+                // operator tuning to WWV would be walked off their configured HF rig onto
+                // whichever rig has no band list, purely for having left the band plan.
+                if band.is_empty() {
+                    self.settings.route_radio_bandless(route_mode)
+                } else {
+                    self.settings.route_radio(band, route_mode)
+                }
+            }) {
                 self.set_active_radio(id);
             }
         }
@@ -3916,7 +4010,26 @@ impl Engine {
         // activity, and before band canonicalisation the differing channel
         // labels tripped this block. The stored band no longer distinguishes
         // channels, so the FM/SSB family line carries that signal.
-        let band_changed = !self.settings.band.eq_ignore_ascii_case(band);
+        //
+        // ⚠️ AN EMPTY `band` REACHES HERE WITH TWO DIFFERENT MEANINGS, and they must not be
+        // answered the same way:
+        // * the OPERATOR asked for a dial off the ham bands — WWV, a shortwave broadcaster,
+        //   the gap between two edges. That is a listen, not a QSY (operator ruling
+        //   2026-08-13), and the context belongs to the band being come back to. Answered by
+        //   `context_band_changed`, which also makes the way back a return rather than a
+        //   fresh band change — the knob path's semantics, shared rather than copied, because
+        //   typing 5.000 and spinning the VFO to 5.000 must not differ.
+        // * MACHINERY reached a dial we cannot name — a QO-100 transponder pick at
+        //   10.489 GHz. That IS a cross-band move and its context must still clear, so it
+        //   keeps the plain comparison it has always had.
+        let band_changed = match origin {
+            DialOrigin::Operator | DialOrigin::OperatorKnob => self.context_band_changed(band),
+            DialOrigin::Machinery => !self.settings.band.eq_ignore_ascii_case(band),
+        };
+        // Leaving the bands cuts transmit even though it is not a band change, for the reason
+        // spelled out in `observe_rig_freq`: the dial gate does not fail closed for
+        // `LicenseClass::Open`, so this halt is the only thing that stops an over in flight.
+        let leaving_the_bands = band.is_empty() && !self.settings.band.is_empty();
         // A channel-CLASS hop on ONE band is a context change too: 2 m USB
         // weak-signal → 2 m FM simplex is a 1.3 MHz move into different
         // activity. Before band canonicalisation the differing channel labels
@@ -3950,18 +4063,20 @@ impl Engine {
             // they were already holding (see `halt_tx_for_context_change`) — Digital
             // is untouched, which is what the paragraph above is about.
             self.halt_tx_for_context_change();
+        } else if leaving_the_bands {
+            self.halt_tx_for_context_change();
         }
         // A band change drops the transient mode override, so a QSY re-asserts the auto sideband
         // (LSB <10 MHz / USB above) — "manual mode, but don't impede band auto-select".
-        if !self.settings.band.eq_ignore_ascii_case(band) {
+        // Reads the SAME verdict as the clears above rather than recomputing it: an off-band
+        // listen keeps the operator's mode pick, exactly as it does on the knob path.
+        if band_changed {
             self.sideband_override = None;
         }
         // A QSY — band change OR a same-band dial move (band picker, MHz entry, or
         // working a needed spot, which funnels through here) — lands on a different
         // signal, so the CW copy from the old frequency is stale. Clear it.
-        if !self.settings.band.eq_ignore_ascii_case(band)
-            || (self.settings.dial_mhz - dial_mhz).abs() > 1e-9
-        {
+        if band_changed || (self.settings.dial_mhz - dial_mhz).abs() > 1e-9 {
             self.clear_cw_decode();
         }
         // ANY QSY — band change or in-band dial move — invalidates an over planned
@@ -3984,6 +4099,40 @@ impl Engine {
             self.split_dirty = true;
         }
         self.sync_fd_band();
+    }
+
+    /// Is `band` a DIFFERENT band from the one the decode context belongs to — and keep the
+    /// off-the-bands memory ([`Engine::off_band_from`]) straight as the dial crosses in or out.
+    ///
+    /// THE ONE PLACE that question is answered, because the knob (`observe_rig_freq`) and the
+    /// app-commanded tune (`tune_dial`) must not grow two ideas of what "changed band" means —
+    /// the operator can type a frequency or turn the VFO to reach the same dial, and the
+    /// context has to survive both identically.
+    ///
+    /// Three cases, and the middle one is the whole point:
+    /// * **onto a named band** — changed if it differs from the context's band, which is the
+    ///   live label normally and the band we LEFT while the dial is off the bands. So
+    ///   40 m → WWV → 40 m is a return (false) and 20 m → WWV → 40 m is a QSY (true).
+    /// * **off the bands** (`band` empty) — never a change. Leaving the bands is a listen, not
+    ///   a QSY: the roster and decode history still describe the band being come back to.
+    ///   The band left is banked here so the return above can recognise itself.
+    /// * **nothing known** (empty context and no memory — a boot seed off the bands) — reads
+    ///   as changed, which clears. The safe direction: nothing is claimed to still be valid.
+    fn context_band_changed(&mut self, band: &str) -> bool {
+        // Spent on every crossing: from here on the context belongs to wherever we land.
+        let left = self.off_band_from.take();
+        let prev = if self.settings.band.is_empty() {
+            left.unwrap_or_default()
+        } else {
+            self.settings.band.clone()
+        };
+        if band.is_empty() {
+            // Off the bands (or still off them — a second off-band move must not forget the
+            // band the FIRST one left, or the way home stops being a way home).
+            self.off_band_from = (!prev.is_empty()).then_some(prev);
+            return false;
+        }
+        !prev.eq_ignore_ascii_case(band)
     }
 
     /// The rig reported a dial frequency we did NOT set — the operator turned the VFO knob
@@ -4053,11 +4202,16 @@ impl Engine {
             }
         }
         self.settings.dial_mhz = mhz;
-        if let Some(band) = crate::bandplan::band_for_dial(mhz) {
+        // `None` = the knob left the ham bands entirely; `context_band_changed` reads that as
+        // a listen rather than a QSY, and remembers the band being left.
+        let named = crate::bandplan::band_for_dial(mhz);
+        let leaving_the_bands = named.is_none() && !self.settings.band.is_empty();
+        let band_changed = self.context_band_changed(named.unwrap_or_default());
+        if let Some(band) = named {
             // Knob QSY across bands invalidates the decode context + roster too —
             // and halts TX for the same reason as set_frequency: the sequencer
             // must never keep calling across a band switch, however it happened.
-            if !self.settings.band.eq_ignore_ascii_case(band) {
+            if band_changed {
                 self.clear_decode_context();
                 self.app.clear_stations();
                 // The a7 cross-cycle AP table holds the OLD band's decodes — replaying
@@ -4073,20 +4227,43 @@ impl Engine {
                 self.sideband_override = None;
             }
             self.settings.band = band.to_string();
-        } else if !self.settings.band.is_empty() {
-            // OFF THE TABLE (47 GHz+): the knob left every named band, and keeping the
-            // OLD label would poison everything keyed on it — the per-(band, mode) dial
-            // memory would bank a 47 GHz dial under "3cm", the log would claim a band
-            // the RF was not on, and the roster would keep an unrelated band's stations.
-            // Absent, not guessed — the sat path's `""` convention (Batch 3; the same
-            // context-change clears as a named cross-band QSY, because it IS one).
-            self.clear_decode_context();
-            self.app.clear_stations();
-            modes::reset_ft8_a7();
-            self.halt_tx_for_context_change();
-            self.clear_cw_decode();
-            self.sideband_override = None;
+        } else if leaving_the_bands {
+            // OFF THE BANDS — and that is ORDINARY, which is what this arm originally got
+            // wrong. `band_for_dial` names the ham bands and nothing else, so WWV at 5/10/15
+            // MHz, a shortwave broadcast, CB, a marine channel and the gap between two band
+            // edges ALL land here — not just the microwave dials above the top of the table
+            // the "47 GHz+" wording was written for. On a general-coverage rig this is a
+            // routine listen (tester report, 1.2.2, FTdx10; an IC-9700 never sees it because
+            // every dial it can reach is named).
+            //
+            // Two things follow, and they are NOT the same thing:
+            //
+            // THE LABEL GOES. Keeping the old one poisons everything keyed on it — the
+            // per-(band, mode) dial memory would bank a 5 MHz dial in the "40m" cell, and the
+            // log/ADIF would claim a band the RF was not on. Absent, not guessed: the sat
+            // path's `""` convention. The band we LEFT is remembered in `off_band_from`
+            // instead, where only the return arm above reads it, so tuning back is a return
+            // rather than a QSY onto a band whose context was just thrown away.
+            //
+            // THE CONTEXT STAYS. Leaving the bands to listen is not a cross-band QSY — the
+            // roster, the decode history, the a7 AP table and the CW copy all still describe
+            // the band the operator is coming back to, usually within a minute. Clearing them
+            // here (and again on the way back) is what wiped a populated 40 m roster because
+            // the operator checked propagation on WWV.
+            //
+            // ⚠️ THE TX HALT STAYS, and it is NOT redundant with the dial-based TX gate:
+            // `Engine::tx_allowed` judges the dial, but `privileges::tx_allowed`
+            // short-circuits `LicenseClass::Open` — the DEFAULT, and the class of every
+            // operator who never declared a US one — to `true` at any frequency. Off the
+            // bands that gate therefore permits, so this halt is the only thing that cuts an
+            // over in flight and drops a latched key when the knob leaves the bands. It is
+            // load-bearing for exactly the operators least likely to notice. Do not simplify
+            // it away on the strength of the gate — see
+            // `a_knob_qsy_off_the_bands_still_cuts_transmit`, which states the premise as a
+            // paired check. (`context_band_changed` above has already banked the band being
+            // left; all that remains here is to blank the label and cut transmit.)
             self.settings.band = String::new();
+            self.halt_tx_for_context_change();
         }
         // Declare the knob's provenance after the band write, so whichever answer it is
         // names the cell the dial landed in. The hand on the knob is always the operator's,
@@ -4141,11 +4318,17 @@ impl Engine {
         let mhz = hz as f64 / 1_000_000.0;
         self.rig_dial_seen = true;
         self.settings.dial_mhz = mhz;
+        // A seed says where the rig IS and never where it came from, so it can leave no
+        // band behind: whatever earlier excursion this field described, it does not describe
+        // the dial being seeded now (and only a seed can blank the label without going
+        // through the knob arm, which is why this is the one other line that touches it).
+        self.off_band_from = None;
         if let Some(band) = crate::bandplan::band_for_dial(mhz) {
             self.settings.band = band.to_string();
         } else {
-            // A rig that boots off the table (47 GHz transverter IF setups) must not
-            // inherit the settings file's stale band label — absent, not guessed.
+            // A rig that boots OFF THE BANDS — parked on a shortwave broadcast or WWV from
+            // last night, or a transverter IF — must not inherit the settings file's stale
+            // band label. Absent, not guessed.
             self.settings.band = String::new();
         }
         self.app.set_radio(
@@ -4364,8 +4547,9 @@ impl Engine {
     /// stays out of the memory whatever the hold flags say at the time.
     fn bank_dial_memory(&mut self) {
         if let Some(r) = self.dial_residency.take() {
-            // A residency with no band label (an off-table dial, 47 GHz+) has no cell to
-            // bank into — a ("", mode) key would be recalled by nothing and merely leak.
+            // A residency with no band label (any dial off the bands — WWV, shortwave, a
+            // gap between two band edges, a microwave IF) has no cell to bank into: a
+            // ("", mode) key would be recalled by nothing and merely leak.
             if r.band.is_empty() {
                 return;
             }
@@ -4533,6 +4717,13 @@ impl Engine {
         };
         // A mode change invalidates any planned over (commit_tx checks the generation).
         self.tx_gate_gen = self.tx_gate_gen.wrapping_add(1);
+        // …and it ends RTTY's continuous-TX latch. Leaving the section is what
+        // stops RTTY today — `poll_rtty_one` simply stops being called, so the
+        // queue is held and nothing keys. A LATCHED transmitter is already keyed,
+        // so "stop being polled" is not enough: it has to be dropped and unkeyed.
+        // The per-tick predicate in `poll_rtty_stream` catches this too; this is
+        // the explicit half, so the kill does not depend on a tick arriving.
+        self.drop_rtty_latch();
         self.settings.operating_mode = om;
         // SAFETY re-clamp: entering a mode with a lower power ceiling (SSB → FT8) must bring the
         // rig DOWN to the cap now, not wait for the operator to touch the power slider. If a cap
@@ -4846,6 +5037,68 @@ impl Engine {
         self.sat_mode.filter(|c| !c.is_fm())
     }
 
+    /// Is an SSTV image QUEUED or on the air? While it is, every mode commanded has to be a
+    /// DATA submode: the picture is SOUNDCARD audio, and a plain (mic-routed) mode keys with
+    /// zero RF on a normally-wired rig.
+    fn sstv_in_flight(&self) -> bool {
+        self.sstv_tx.is_some() || self.sstv_sending
+    }
+
+    /// The FM-class word to command right now: the FM **data** submode `PKTFM` (Hamlib's
+    /// `RIG_MODE_PKTFM` → Yaesu FM-D, Icom FM-D) while an SSTV image is queued or in flight,
+    /// plain `FM` otherwise.
+    ///
+    /// ⭐ THE ON-AIR BUG THIS EXISTS FOR (FTDX10 + IC-9700 owner, 2026-08-12): *"when I select
+    /// preset frequency 144.500 for SSTV it switches to FM, but as soon as I start TXing it
+    /// switches to USB-D."* FM is a CLASS, not a side — but the SSTV arm below asked only WHICH
+    /// SIDE the image was on, so an FM channel keyed PKTUSB: an SSB emission on an FM repeater
+    /// input. Every FM answer in [`Self::rig_mode_effective`] goes through here, so the class
+    /// survives the send and only the DATA half is added.
+    ///
+    /// ⚠️ NEEDS-BENCH — a CLASS-WIDE CAT change: `PKTFM` reaches EVERY rig on the SSTV path.
+    /// The degradation is the whole safety story, and it has two rungs, in this order:
+    /// 1. a `set_mode` that FAILS never advances `last_mode` (service.rs), and the same FM
+    ///    authority commanded plain `FM` while idle — so a rig that refuses or ignores the word
+    ///    keys in FM, the mode it was already in. Never USB.
+    /// 2. if the ladder runs out of tries, `fallback_sideband` maps `PKTFM` → `FM` and the FM
+    ///    family takes that rung UNCONDITIONALLY (not only on an explicit `RPRT -1`), so a rig
+    ///    that answers a bad mode word with silence still lands on plain FM.
+    ///
+    /// `plain_ssb_if_configured` keeps the per-radio mic-jack opt-out working: it maps `PKTFM`
+    /// back to plain `FM` exactly as it maps `PKTUSB` to `USB`.
+    fn fm_mode_word(&self) -> String {
+        if self.sstv_in_flight() {
+            self.settings.plain_ssb_if_configured("PKTFM")
+        } else {
+            "FM".to_string()
+        }
+    }
+
+    /// Is the PHONE section's mode class FM at `band` / `dial_mhz`? THE one predicate both
+    /// [`Self::rig_mode_effective`] and [`Self::route_mode`] ask, so the mode a rig is
+    /// COMMANDED and the class a QSY ROUTES on cannot be derived from two copies that drift.
+    /// (They did not disagree in the field — `route_mode` is asked only from `tune_dial`, where
+    /// no image is ever in flight — but the SSTV arm below had grown its own idea of what FM
+    /// means, and one predicate is what stops the next arm doing the same.)
+    ///
+    /// The two terms are gated DIFFERENTLY and both gates are load-bearing:
+    /// * the cockpit's explicit pick (`sideband_override`) has no dial gate — it is the
+    ///   operator's own current word, and `set_frequency` drops it on a band change. The band
+    ///   filter is what makes that true for the routing caller, which asks about a band the
+    ///   radio is not on yet.
+    /// * the station-wide `phone_mode` policy carries [`Settings::rig_mode`]'s 29 MHz floor
+    ///   (`fm_does_not_follow_the_operator_down_to_hf`): nothing resets that field on a band
+    ///   change, so without the floor an evening on an FM repeater commands FM onto 20 m phone.
+    fn phone_fm_in_force(&self, band: &str, dial_mhz: f64) -> bool {
+        let override_fm = self
+            .sideband_override
+            .as_deref()
+            .filter(|_| self.settings.band.eq_ignore_ascii_case(band))
+            .is_some_and(|m| m.eq_ignore_ascii_case("fm"));
+        let policy_fm = self.settings.phone_mode.eq_ignore_ascii_case("fm") && dial_mhz >= 29.0;
+        override_fm || policy_fm
+    }
+
     /// The mode the radio loop should COMMAND: the operator's transient Phone override when set,
     /// else the band-derived policy (`settings.rig_mode`). Write-side canon for the rig `M` verb.
     pub fn rig_mode_effective(&self) -> String {
@@ -4856,14 +5109,20 @@ impl Engine {
         // never leave FM forced on another band (the `fm_does_not_follow_the_operator_down_to_hf`
         // invariant). The flag is also cleared by every QSY / section change / radio switch.
         if self.aprs_fm && self.settings.band.eq_ignore_ascii_case("2m") {
-            return "FM".to_string();
+            return self.fm_mode_word();
         }
         // A repeater/FM-simplex channel parks the rig in FM the same way, from whatever section the
         // operator tuned it out of. Dial-gated (not band-gated like APRS) because an FM channel can
         // be on 10 m through 23 cm, and 29 MHz is the line below which FM isn't used — the same
         // threshold `Settings::rig_mode` applies to Phone-FM, so the two can't disagree.
+        //
+        // ⚠️ AND IT ANSWERS FOR AN SSTV SEND TOO, via `fm_mode_word` — this arm sits ABOVE the
+        // Phone/SSTV arm below, so on a 144.500 preset it is the arm that speaks while an image
+        // is in flight. Answering a bare "FM" here would key the picture through the MIC jack
+        // (no RF); answering PKTUSB — what the SSTV arm below used to do once the hold had been
+        // cleared — puts an SSB emission on an FM channel. Neither is the operator's intent.
         if self.fm_channel && self.settings.dial_mhz >= 29.0 {
-            return "FM".to_string();
+            return self.fm_mode_word();
         }
         if self.settings.operating_mode == crate::settings::OperatingMode::Phone {
             // SSTV rides the Phone segment but transmits SOUNDCARD audio, so — exactly like
@@ -4873,7 +5132,17 @@ impl Engine {
             // signal"). Only while an image is queued or in flight, so live voice PTT keeps
             // plain SSB. Driving it through the continuous mode-apply commands DATA BEFORE the
             // SSTV PTT and restores plain SSB when the image ends — no Icom-only set_data_mode.
-            if self.sstv_tx.is_some() || self.sstv_sending {
+            if self.sstv_in_flight() {
+                // ⭐ FM IS A CLASS, NOT A SIDE — and asking only "which side?" here is what put
+                // an SSB emission on an FM channel (see `fm_mode_word`). The Phone section's
+                // own two FM authorities both sit BELOW this arm — the cockpit's explicit pick
+                // in the `sideband_override` return just after it, and the station-wide
+                // `phone_mode = "fm"` policy inside the `settings.rig_mode()` on the last line
+                // of this function — so an unconditional sideband answer here short-circuited
+                // both. Ask the shared predicate first and the class survives the send.
+                if self.phone_fm_in_force(&self.settings.band, self.settings.dial_mhz) {
+                    return self.fm_mode_word();
+                }
                 let lsb = self
                     .sideband_override
                     .as_deref()
@@ -4934,7 +5203,9 @@ impl Engine {
             // and the 145.825 packet digipeaters are FM channels, and a packet
             // or FM-voice downlink demodulated as USB is garbled audio.
             if self.sat_fm() {
-                return "FM".to_string();
+                // …and an image sent through an FM bird is the same class question as one sent
+                // through an FM repeater, so this arm answers with `fm_mode_word` too.
+                return self.fm_mode_word();
             }
             if let Some(class) = self.sat_linear_mode() {
                 return self
@@ -4981,20 +5252,12 @@ impl Engine {
             OperatingMode::Digital => RouteMode::Digital,
             // SSTV rides the Phone section, so it routes as SSB — see `RouteMode`'s note on why it
             // is not its own class.
+            // The cockpit's explicit mode pick (no dial gate, same-band only) and the
+            // station-wide `phone_mode` policy (29 MHz floor) — both from the ONE predicate
+            // `rig_mode_effective` asks, so the two answers cannot drift apart. See
+            // [`Self::phone_fm_in_force`] for why the two terms are gated differently.
             OperatingMode::Phone => {
-                // The cockpit's explicit mode pick wins with NO band gate, matching
-                // `rig_mode_effective` (which returns the override verbatim) — but only for a
-                // SAME-BAND move, because `set_frequency` DROPS the override on a band change, so
-                // on a cross-band QSY the override describes where we're leaving, not arriving.
-                let override_fm = self
-                    .sideband_override
-                    .as_deref()
-                    .filter(|_| self.settings.band.eq_ignore_ascii_case(band))
-                    .is_some_and(|m| m.eq_ignore_ascii_case("fm"));
-                // Otherwise the station-wide `phone_mode`, under `rig_mode`'s 29 MHz FM gate.
-                let policy_fm =
-                    self.settings.phone_mode.eq_ignore_ascii_case("fm") && dial_mhz >= 29.0;
-                if override_fm || policy_fm {
+                if self.phone_fm_in_force(band, dial_mhz) {
                     RouteMode::Fm
                 } else {
                     RouteMode::Ssb
@@ -7519,9 +7782,11 @@ impl Engine {
         self.cw_abort = true;
         // Cut any in-progress RTTY the same way: drop every queued message and arm
         // the one-shot abort so the radio loop stops the FSK keying thread / flushes
-        // the AFSK audio ring and unkeys on its next tick.
+        // the AFSK audio ring and unkeys on its next tick. `drop_rtty_latch` adds
+        // continuous TX — a halt that left the latch up would unkey and re-key.
         self.rtty_queue.clear();
         self.rtty_abort = true;
+        self.drop_rtty_latch();
         self.aprs_tx_queue.clear(); // drop any queued APRS beacon so Stop TX cancels it
         self.voice_tx = None; // drop any queued voice-keyer audio too
                               // Cut any in-progress SSTV image the same way: drop the queued job and arm the
@@ -7791,9 +8056,13 @@ impl Engine {
             self.cw_queue.clear();
             self.cw_abort = true;
             // Same for RTTY: a disarm must abort the over in flight AND drop the
-            // queue, so nothing keys on a later re-enable.
+            // queue, so nothing keys on a later re-enable. Continuous TX goes with
+            // it — the TX-enable latch is one of RTTY's stop controls precisely
+            // because it arms `rtty_abort`, and a latch that survived it would be
+            // keyed with the arm switch off.
             self.rtty_queue.clear();
             self.rtty_abort = true;
+            self.drop_rtty_latch();
             // Same for SSTV: a disarm aborts the image in flight and drops the job.
             self.sstv_tx = None;
             self.sstv_abort = true;
@@ -9886,7 +10155,11 @@ impl Engine {
             Some(TxOwner::Voice)
         } else if !self.cw_queue.is_empty() {
             Some(TxOwner::Cw)
-        } else if self.rtty_sending || !self.rtty_queue.is_empty() {
+        } else if self.rtty_sending || !self.rtty_queue.is_empty() || self.rtty_streaming() {
+            // `rtty_streaming` is the continuous-TX latch: it owns the
+            // transmitter from the instant the operator presses TX, before the
+            // first chunk has been keyed and `rtty_sending` stamped — otherwise a
+            // tune, a beacon or a voice message could grab the rig in that gap.
             Some(TxOwner::Rtty)
         } else if self.sstv_tx.is_some() || self.sstv_sending {
             Some(TxOwner::Sstv)
@@ -9956,7 +10229,8 @@ impl Engine {
             backend: if self.rtty_fsk() { "fsk" } else { "afsk" }.to_string(),
             // Sending = an over on the air (stamped by the loop) OR messages still
             // queued behind it — the cockpit's TX indicator.
-            sending: self.rtty_sending || !self.rtty_queue.is_empty(),
+            sending: self.rtty_sending || !self.rtty_queue.is_empty() || self.rtty_streaming(),
+            latched: self.rtty_latched,
             keyer_error: self.rtty_keyer_error.clone(),
             text,
             auto,
@@ -10022,7 +10296,37 @@ impl Engine {
     /// Stop TX / halt drops the whole queue.
     pub fn rtty_send_text(&mut self, text: &str) -> Result<(), String> {
         self.rtty_tx_gate()?;
+        // Continuous TX up: a macro TYPES INTO the live transmission instead of
+        // queueing a separate over behind it (MMTTY's F-keys work exactly this
+        // way). Not a convenience — the latched stream holds the message queue,
+        // so an enqueue here would be a silent hold: the operator would press F1
+        // and hear nothing until they unlatched.
+        if self.rtty_latched {
+            let up = rtty_filter(text);
+            if up.trim().is_empty() {
+                return Err(
+                    "Nothing to send — RTTY carries A–Z, 0–9 and basic punctuation".to_string(),
+                );
+            }
+            return self.rtty_type(&up);
+        }
         self.rtty_enqueue(text, true)
+    }
+
+    /// The auto-sequencer's extra gate: it may not start a QSO while continuous
+    /// TX is latched. The two own the transmitter in incompatible ways — the
+    /// sequencer keys whole overs through the message queue and needs the
+    /// transmitter to DROP between them (that drop is the edge `rtty_auto_service`
+    /// turns into `on_tx_complete`), which is exactly what a latch prevents. The
+    /// mirror of the refusal in [`Self::set_rtty_latched`], so neither can be
+    /// entered from the other's state.
+    fn rtty_no_latch_gate(&self) -> Result<(), String> {
+        if self.rtty_latched {
+            return Err(
+                "Continuous TX is on — click TX off before starting an auto QSO".to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// The up-front RTTY TX gate: every reason a send would be refused, checked
@@ -10082,11 +10386,7 @@ impl Engine {
     /// an auto-over that merely repeats, so an unanswered auto-CQ still trips the
     /// watchdog ceiling. Assumes [`Engine::rtty_tx_gate`] has already passed.
     fn rtty_enqueue(&mut self, text: &str, reset_watchdog: bool) -> Result<(), String> {
-        let up: String = text
-            .chars()
-            .map(|c| c.to_ascii_uppercase())
-            .filter(|&c| tempo_core::rtty::encodable(c))
-            .collect();
+        let up = rtty_filter(text);
         if up.trim().is_empty() {
             return Err(
                 "Nothing to send — RTTY carries A–Z, 0–9 and basic punctuation".to_string(),
@@ -10117,7 +10417,12 @@ impl Engine {
     pub fn rtty_stop(&mut self) {
         self.rtty_queue.clear();
         self.rtty_abort = true;
-        self.slot_tx_abort = true; // and the PTT tail past rtty_busy_until (see stop_cw)
+        // …and the PTT tail past rtty_busy_until (see stop_cw).
+        self.slot_tx_abort = true;
+        // …and continuous TX, which is the one RTTY transmission with no
+        // precomputed end: without this, Stop TX would drop the queue and the
+        // over in flight and the latch would key straight back up next tick.
+        self.drop_rtty_latch();
     }
 
     /// Pop the next queued RTTY MESSAGE for the radio loop to key, or `None` while
@@ -10166,6 +10471,234 @@ impl Engine {
         std::mem::take(&mut self.rtty_abort)
     }
 
+    // ----- RTTY continuous TX (the MMTTY "TX" latch) — stay keyed and type into
+    // a live transmission, instead of one keyed over per Enter. -----
+    //
+    // THE SAFETY MODEL, because a latched transmitter is the one thing in this
+    // app that keys with no precomputed end:
+    //
+    // 1. The latch is a PER-TICK PREDICATE, not a stored authorisation.
+    //    `poll_rtty_stream` re-checks every gate `rtty_send_text` checks — TX
+    //    armed, inside privileges, RTTY owns the section, no tune carrier — on
+    //    EVERY tick, and drops the latch (not merely the feed) when any goes
+    //    down. The radio loop adds the one gate the engine cannot see
+    //    (`may_key`: not onto a radio the loop doesn't own) and calls
+    //    `drop_rtty_latch` for it. Leaving a section or losing privileges on a
+    //    QSY therefore UNKEYS within one tick — neither is an explicit "stop
+    //    RTTY" call, and before the latch neither needed to be, because
+    //    `poll_rtty_one` simply stopped being called and the queue just waited.
+    //    A keyed transmitter cannot wait, which is the whole difference.
+    // 2. Every explicit stop drops it: `rtty_stop` (Stop TX + the dock's Esc/Stop
+    //    macro), `halt_tx`, `set_tx_enabled(false)` (the TX-enable latch),
+    //    `set_operating_mode` and the auto-sequencer's Abort. A radio switch and
+    //    a Test-CAT port hold reach `halt_tx` through
+    //    `halt_tx_for_context_change`, so those are covered here rather than by
+    //    the loop's `may_key` drop, which is belt-and-braces on both (the tests
+    //    say which is which — see `a_cat_port_hold_drops_a_latched_rtty_over`).
+    // 3. TWO independent wall clocks bound it, and neither may be weakened. The
+    //    ordinary TX watchdog runs here exactly as it does in `poll_rtty_one`
+    //    (a walk-away trips it: no typing, no reset, TX disarms). Above it sits
+    //    [`RTTY_MAX_LATCH_MS`], a hard per-over ceiling that no amount of typing
+    //    can extend — the [`MAX_TUNE_MS`] pattern, and for the same reason: a
+    //    stuck key or a wedged UI must not buy an unattended carrier.
+    // 4. The loop only ever renders a bounded LOOK-AHEAD (see
+    //    `RTTY_STREAM_AHEAD_CHARS` in tempo-audio), so `tx_until_ms` is never
+    //    extended more than a fraction of a second past now: a loop that wedges
+    //    expires into an unkey by default rather than holding PTT.
+
+    /// HARD CEILING on one continuous latched over (ms), whatever the operator
+    /// types. 10 minutes is far past any human keyboard-RTTY over and well past
+    /// the 6-minute default watchdog, so in normal operating it is never the
+    /// thing that ends an over — it exists for the abnormal case the watchdog
+    /// cannot see, because typing resets the watchdog (see `rtty_type`): a stuck
+    /// key, an autorepeat, a wedged compose field. Mirrors [`MAX_TUNE_MS`]: a
+    /// latched carrier gets a ceiling that no setting and no input can raise.
+    pub const RTTY_MAX_LATCH_MS: u64 = 10 * 60 * 1000;
+
+    /// Cap on the un-keyed type-ahead buffer. A human types far slower than
+    /// 45.45 baud drains (6.6 char/s), so this only bites a runaway producer —
+    /// and it bounds how long a latch-off takes to drain.
+    const RTTY_TYPE_BUF_CAP: usize = 1000;
+
+    /// Turn continuous TX on/off — the cockpit's TX button.
+    ///
+    /// ON runs the SAME up-front gate as a send ([`Self::rtty_tx_gate`]), so the
+    /// latch can never key anywhere a send could not, and the operator is told
+    /// why it was refused instead of watching a button that does nothing. It is
+    /// additionally refused while the auto-sequencer is running a QSO: the
+    /// sequencer keys whole overs through the message queue and expects the
+    /// transmitter to drop between them (that drop is the edge `rtty_auto_service`
+    /// turns into `on_tx_complete`), so the two ways of owning the transmitter
+    /// are deliberately exclusive rather than subtly interleaved.
+    ///
+    /// OFF is the MMTTY semantic: stop accepting characters and let what the
+    /// operator already typed finish keying, then unkey (`poll_rtty_stream`
+    /// returns [`RttyStreamTick::Idle`] once the buffer drains, and the loop's
+    /// `tx_until_ms` unkeys as it does for any over). It is NOT the emergency
+    /// stop and does not pretend to be — Stop TX, the Esc/Stop macro and the
+    /// TX-enable latch all cut instantly, and every one of them also drops this.
+    pub fn set_rtty_latched(&mut self, on: bool) -> Result<(), String> {
+        if !on {
+            // Intent down; the typed buffer drains on the air. Every gate is
+            // still re-checked per tick while it does.
+            //
+            // `rtty_latch_start_ms` is deliberately LEFT SET: the drain is still a
+            // keyed transmission (up to the buffer cap, ~2.75 min at 45.45 baud),
+            // so the hard ceiling has to bound the whole keyed period and not just
+            // the part with the operator's intent still up. `drop_rtty_latch` is
+            // what clears it, together with everything else.
+            self.rtty_latched = false;
+            return Ok(());
+        }
+        if self.rtty_latched {
+            return Ok(()); // idempotent — re-latching must not restart the ceiling
+        }
+        self.rtty_tx_gate()?;
+        if self
+            .rtty_seq
+            .as_ref()
+            .is_some_and(|s| s.state() != tempo_core::rtty::SeqState::Idle)
+        {
+            return Err(
+                "The auto-sequencer is running this QSO — abort it first, or turn Auto off, \
+                 to type continuously"
+                    .to_string(),
+            );
+        }
+        self.rtty_latched = true;
+        self.rtty_latch_start_ms = Some(now_unix_millis());
+        // Keying up is an operator action, exactly like a send: restart the
+        // watchdog clock so the ceiling is measured from here.
+        self.reset_tx_watchdog();
+        Ok(())
+    }
+
+    /// Whether continuous TX is latched (the cockpit's TX button state).
+    pub fn rtty_latched(&self) -> bool {
+        self.rtty_latched
+    }
+
+    /// The latched stream is running: the operator is latched, or the latch is
+    /// down but what they typed is still going out.
+    fn rtty_streaming(&self) -> bool {
+        self.rtty_latched || !self.rtty_type_buf.is_empty()
+    }
+
+    /// Feed typed characters into the live transmission. Uppercased and filtered
+    /// to the ITA2 charset exactly as [`Self::rtty_enqueue`] does, so what the
+    /// operator sees is what goes on the air.
+    ///
+    /// Refused unless the latch is up — there is no path from a keystroke to the
+    /// transmitter that does not go through the operator having pressed TX.
+    ///
+    /// A typed character RESTARTS THE TX WATCHDOG, for the same reason pressing
+    /// Enter does (`rtty_enqueue`): the watchdog's job is catching an UNATTENDED
+    /// transmitter, and a keystroke is the same evidence of attendance that a
+    /// send is. What stops that from being a hole is [`Self::RTTY_MAX_LATCH_MS`]
+    /// above it, which no keystroke can extend.
+    pub fn rtty_type(&mut self, text: &str) -> Result<(), String> {
+        if !self.rtty_latched {
+            return Err("Continuous TX is off — click TX first".to_string());
+        }
+        let mut typed = 0usize;
+        for c in rtty_filter(text).chars() {
+            if self.rtty_type_buf.len() >= Self::RTTY_TYPE_BUF_CAP {
+                break;
+            }
+            self.rtty_type_buf.push_back(c);
+            typed += 1;
+        }
+        if typed > 0 {
+            self.reset_tx_watchdog();
+        }
+        Ok(())
+    }
+
+    /// Drop the latch NOW: clear the operator's intent AND the un-keyed
+    /// type-ahead, and arm the aborts that make the radio loop flush the audio
+    /// ring / stop the FSK keyer and unkey on its next tick.
+    ///
+    /// This is what every kill path calls. It is deliberately unconditional
+    /// about the intent and conditional only about the abort (arming a one-shot
+    /// abort when nothing was streaming would cut an unrelated over riding the
+    /// same PTT — the same care `set_tx_enabled(false)`'s RTTY arm takes).
+    pub fn drop_rtty_latch(&mut self) {
+        let was_streaming = self.rtty_streaming();
+        self.rtty_latched = false;
+        self.rtty_latch_start_ms = None;
+        self.rtty_type_buf.clear();
+        if was_streaming {
+            self.rtty_abort = true;
+            self.slot_tx_abort = true; // and the PTT tail (see rtty_stop)
+        }
+    }
+
+    /// One radio-loop tick of the latched character stream — the ONLY path from
+    /// the latch to the transmitter, and the per-tick gate re-check described
+    /// above. `max_chars` is the loop's look-ahead budget for this tick.
+    ///
+    /// Returns what to key: nothing at all, the operator's characters, or the
+    /// RTTY IDLE. Idle is [`RttyStreamTick::Diddle`] and not silence — between
+    /// keystrokes a latched RTTY signal carries LTRS fill, which is what holds
+    /// the far end's decoder in sync and what an MMTTY operator hears. Silence
+    /// under a held PTT would read as a dropout and lose the far end's clock.
+    pub fn poll_rtty_stream(&mut self, max_chars: usize) -> RttyStreamTick {
+        use crate::settings::OperatingMode;
+        if !self.rtty_streaming() {
+            return RttyStreamTick::Idle;
+        }
+        // ⚠️ THE PER-TICK PREDICATE. Every gate `rtty_tx_gate` checks before a
+        // send is re-checked here before every chunk, because a latch outlives
+        // the moment it was granted and the gates do not. `poll_rtty_one`'s
+        // equivalent gate merely HOLDS the queue; holding is not an option for a
+        // keyed transmitter, so each of these DROPS THE LATCH and unkeys.
+        if !self.tx_enabled
+            || !self.tx_allowed()
+            || self.tuning
+            || self.settings.operating_mode != OperatingMode::Rtty
+        {
+            self.drop_rtty_latch();
+            return RttyStreamTick::Idle;
+        }
+        let now = now_unix_millis();
+        // Ceiling 1 — the hard per-over cap no typing can extend.
+        if let Some(start) = self.rtty_latch_start_ms {
+            if now.saturating_sub(start) >= Self::RTTY_MAX_LATCH_MS {
+                self.drop_rtty_latch();
+                self.rtty_keyer_error = Some(format!(
+                    "Continuous TX unkeyed at its {}-minute ceiling — click TX again to carry on",
+                    Self::RTTY_MAX_LATCH_MS / 60_000
+                ));
+                return RttyStreamTick::Idle;
+            }
+        }
+        // Ceiling 2 — the ordinary wall-clock TX watchdog, identical to
+        // `poll_rtty_one`'s (a trip disarms TX, so it stays stopped). Typing
+        // restarts its clock; walking away does not.
+        let limit_secs = self.settings.tx_watchdog_min as u64 * 60;
+        if limit_secs > 0 {
+            let now_s = now_unix_secs();
+            let start = *self.tx_watchdog_start.get_or_insert(now_s);
+            if now_s.saturating_sub(start) >= limit_secs {
+                self.tx_watchdog = true;
+                self.tx_enabled = false;
+                self.rtty_queue.clear();
+                self.drop_rtty_latch();
+                return RttyStreamTick::Idle;
+            }
+        }
+        // Every gate above has been re-checked; from here it is only about what
+        // to key. A zero budget means the loop is already fed far enough ahead.
+        if max_chars == 0 {
+            return RttyStreamTick::Ahead;
+        }
+        if self.rtty_type_buf.is_empty() {
+            return RttyStreamTick::Diddle;
+        }
+        let n = max_chars.min(self.rtty_type_buf.len());
+        RttyStreamTick::Text(self.rtty_type_buf.drain(..n).collect())
+    }
+
     // ----- RTTY auto-sequencer — the pure `tempo_core::rtty::RttySeq` state
     // machine wired to the live TX path + logbook, gated behind the operator's
     // Auto toggle and a human CQ/Answer initiate. It NEVER transmits on launch or
@@ -10210,6 +10743,7 @@ impl Engine {
         if self.rtty_seq.is_none() {
             return Err("Turn on Auto first".to_string());
         }
+        self.rtty_no_latch_gate()?;
         self.rtty_tx_gate()?;
         self.rtty_drive(RttyOp::StartCq);
         Ok(())
@@ -10221,6 +10755,7 @@ impl Engine {
         if self.rtty_seq.is_none() {
             return Err("Turn on Auto first".to_string());
         }
+        self.rtty_no_latch_gate()?;
         self.rtty_tx_gate()?;
         self.rtty_drive(RttyOp::Answer(call.to_string()));
         Ok(())
@@ -11491,10 +12026,28 @@ impl Engine {
 
         // Project this slot's decodes into the live feed (alerts + coloring).
         let mycall = &self.settings.mycall;
-        // The band these decodes arrived on — new-grid / new-DXCC are per-band
-        // questions, and this chain's dial is the only honest answer to "on what
+        // The band these decodes arrived on — new-grid / new-band / confirmed-on-band are
+        // per-band questions, and this chain's dial is the only honest answer to "on what
         // band did I just hear this?".
-        let cur_band = self.settings.band.as_str();
+        //
+        // `None` OFF THE BANDS, and the Option is the whole point (operator ruling
+        // 2026-08-13: listening off the ham bands is first-class). `settings.band` is `""`
+        // there, and `""` is not a band — it is the ABSENCE of a band claim. Passing it down
+        // as if it were a band name is what made the decode feed lie: `station::band_key("")`
+        // matches nothing in the worked index, so every gridded decode came back NEW GRID and
+        // every already-worked entity came back a new BAND slot, on the whole roster at once.
+        //
+        // ⚠️ THE GUARD BELONGS HERE, NOT IN THE LOOKUPS. The three `station` methods answer
+        // "is it worked?", and the consumers want opposite polarities of that answer —
+        // `new_grid` is `!worked`, `confirmed_band` is `confirmed`. A blanket `false` inside
+        // the lookup would therefore SUPPRESS the hide-confirmed filter (right) and FABRICATE
+        // a new-grid badge (wrong) from the same line. Asking the question only when there is
+        // a band to ask about is the version that cannot be half-right.
+        //
+        // The ALL-TIME axis (`entity_worked_ever`, which drives `new_dxcc`) is deliberately
+        // NOT gated: "have I ever worked this entity, on any band" needs no band label, and an
+        // ATNO heard while tuning past on 5 MHz is still an ATNO.
+        let cur_band = (!self.settings.band.is_empty()).then_some(self.settings.band.as_str());
         s.recent_decodes = self
             .last_decodes
             .iter()
@@ -11554,9 +12107,11 @@ impl Engine {
                         _ => None,
                     },
                 };
-                let new_grid = grid
-                    .map(|g| !g.is_empty() && !self.station.grid_worked_on(g, cur_band))
-                    .unwrap_or(false);
+                let new_grid = match (cur_band, grid) {
+                    (Some(b), Some(g)) => !g.is_empty() && !self.station.grid_worked_on(g, b),
+                    // No band claimed (off the bands), or the frame carried no grid.
+                    _ => false,
+                };
                 // Country + New-DXCC (B3): resolve the sender's DXCC entity once.
                 // `country` rides every decode (DX chasers scan by country); the
                 // entity also drives new-DXCC. Needs the injected resolver; both
@@ -11574,16 +12129,25 @@ impl Engine {
                 let (new_dxcc, new_band) = match &entity {
                     Some(e) => {
                         let ever = self.station.entity_worked_ever(e);
-                        (!ever, ever && !self.station.entity_worked_on(e, cur_band))
+                        // ATNO is all-time and stays answerable off the bands; the band slot
+                        // is not — with no band there is no slot for it to be new in.
+                        (
+                            !ever,
+                            ever && cur_band.is_some_and(|b| !self.station.entity_worked_on(e, b)),
+                        )
                     }
                     None => (false, false),
                 };
                 // Confirmed (award-grade) on THIS band — for the hide-confirmed filter.
                 // A still-new-on-band station is never marked confirmed (mutually exclusive
                 // by construction), so the filter can never hide a slot that's still open.
-                let confirmed_band = entity
-                    .as_deref()
-                    .is_some_and(|e| self.station.entity_confirmed_on(e, cur_band));
+                // Off the bands this stays false, which is the safe direction for a FILTER:
+                // "hide what is confirmed here" hides nothing rather than hiding rows on the
+                // strength of a band that does not exist.
+                let confirmed_band = match (cur_band, entity.as_deref()) {
+                    (Some(b), Some(e)) => self.station.entity_confirmed_on(e, b),
+                    _ => false,
+                };
                 // Rarity: prefer the grid on THIS frame, but on report/R/RR73/73
                 // frames (which carry no grid) fall back to the sender's grid
                 // remembered in the roster — so an ULTRA-rare station keeps its
@@ -14290,6 +14854,338 @@ mod tests {
         assert_eq!(e.poll_rtty_one(), None, "halt dropped the queued messages");
     }
 
+    // ----- Continuous TX (the MMTTY "TX" latch). A latched transmitter is the
+    // only thing in this app that keys with no precomputed end, so these tests
+    // are about the STOPS, not the feature. -----
+
+    /// A latched engine, keyed and ready to stream.
+    fn rtty_latched_engine() -> Engine {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_operating_mode("rtty", false);
+        e.set_rtty_latched(true).unwrap();
+        assert!(e.rtty_latched());
+        // The first tick of a latch with nothing typed is the RTTY idle.
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Diddle);
+        e
+    }
+
+    #[test]
+    fn rtty_latch_never_comes_up_on_its_own() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        // Launch: no latch, nothing to key, no abort pending.
+        assert!(!e.rtty_latched());
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        assert!(!e.take_rtty_abort());
+        // Arming the RX decoder is RX-only — it cannot key.
+        e.set_rtty_armed(true);
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        // Entering the section arms TX (a manual mode) but does NOT latch.
+        e.set_operating_mode("rtty", false);
+        assert!(e.tx_enabled());
+        assert!(!e.rtty_latched());
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        // And typing without the latch is refused outright: there is no path
+        // from a keystroke to the transmitter that skips the TX button.
+        assert!(e.rtty_type("CQ").is_err());
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+    }
+
+    #[test]
+    fn rtty_latch_inherits_every_gate_a_send_passes() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        // Not in the RTTY section → refused, same reason a send is refused.
+        assert!(e.set_rtty_latched(true).is_err());
+        e.set_operating_mode("rtty", false);
+        // TX disarmed → refused.
+        e.set_tx_enabled(false);
+        assert!(e.set_rtty_latched(true).unwrap_err().contains("TX is off"));
+        e.set_tx_enabled(true);
+        // Tune carrier up → refused (the tune owns the transmitter).
+        e.set_tune(true);
+        assert!(e.set_rtty_latched(true).unwrap_err().contains("Tune"));
+        e.set_tune(false);
+        // Outside license privileges → refused.
+        e.set_license_class("technician");
+        e.set_frequency(14.083, "20m", "LSB");
+        assert!(!e.tx_allowed());
+        assert!(e.set_rtty_latched(true).unwrap_err().contains("license"));
+        // Every refusal left the transmitter alone.
+        assert!(!e.rtty_latched());
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        // …and where a send would be allowed, so is the latch.
+        e.set_frequency(28.083, "10m", "LSB");
+        assert!(e.tx_allowed());
+        e.set_rtty_latched(true).unwrap();
+        assert!(e.rtty_latched());
+    }
+
+    #[test]
+    fn a_latched_stream_idles_on_diddle_and_keys_what_is_typed() {
+        let mut e = rtty_latched_engine();
+        // Nothing typed: the air carries the RTTY idle, NOT silence and NOT an
+        // unkey. This is the whole difference from send-and-done.
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Diddle);
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Diddle);
+        // Typed characters key in order, uppercased and ITA2-filtered exactly as
+        // a send filters them ('%' has no mapping).
+        e.rtty_type("de w9xyz 100%").unwrap();
+        let mut out = String::new();
+        loop {
+            match e.poll_rtty_stream(3) {
+                RttyStreamTick::Text(t) => out.push_str(&t),
+                RttyStreamTick::Diddle => break, // buffer drained → back to idle
+                RttyStreamTick::Idle => panic!("the latch dropped while streaming"),
+                // Only a ZERO budget means "fed far enough ahead"; we asked for 3.
+                RttyStreamTick::Ahead => panic!("asked for characters, told to wait"),
+            }
+        }
+        assert_eq!(out, "DE W9XYZ 100");
+        // The chunk budget is honoured (the loop's look-ahead bound).
+        e.rtty_type("ABCDEFG").unwrap();
+        assert_eq!(e.poll_rtty_stream(3), RttyStreamTick::Text("ABC".into()));
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Text("DE".into()));
+        // And the buffer is bounded, so a runaway producer cannot grow it.
+        e.rtty_type(&"A".repeat(5000)).unwrap();
+        let mut n = 2; // "FG" still pending
+        while let RttyStreamTick::Text(t) = e.poll_rtty_stream(100) {
+            n += t.len();
+        }
+        assert_eq!(n, Engine::RTTY_TYPE_BUF_CAP + 2);
+    }
+
+    /// EVERY KILL PATH, one assertion each. A latched transmitter that survived
+    /// any of these is the stuck-carrier incident the design exists to prevent —
+    /// so each case checks all three things that make the stop real: the intent
+    /// is gone, the un-keyed type-ahead is gone, and the abort the radio loop
+    /// turns into flush + unkey is armed.
+    #[test]
+    fn rtty_latch_drops_on_every_kill_path() {
+        // The kill under test is applied to a latched engine with characters
+        // still buffered, so a path that dropped only the intent would be caught.
+        fn killed(kill: impl FnOnce(&mut Engine)) -> Engine {
+            let mut e = rtty_latched_engine();
+            e.rtty_type("STILL TYPING").unwrap();
+            kill(&mut e);
+            assert!(!e.rtty_latched(), "the latch survived");
+            assert!(
+                e.take_rtty_abort(),
+                "no abort armed — the loop would keep keying to the end of the ring"
+            );
+            assert_eq!(
+                e.poll_rtty_stream(2),
+                RttyStreamTick::Idle,
+                "the stream kept feeding after the kill"
+            );
+            e
+        }
+
+        // 1. Stop TX / the dock's Esc-Stop macro (both route to rtty_stop).
+        killed(|e| e.rtty_stop());
+        // 2. halt_tx — the universal stop (header Stop TX, the UDP HaltTx).
+        let e = killed(|e| e.halt_tx());
+        assert!(!e.tx_enabled(), "halt disarms TX — stopped stays stopped");
+        // 3. The TX-enable latch, which is one of RTTY's census stop controls.
+        killed(|e| e.set_tx_enabled(false));
+        // 4. Leaving the section. This is the one the old design got for free —
+        //    poll_rtty_one simply stopped being called and the queue was HELD.
+        //    A keyed transmitter cannot be "held", so it must be dropped.
+        killed(|e| e.set_operating_mode("phone", false));
+        // 5. The auto-sequencer's Abort (rtty_auto_abort → rtty_stop).
+        killed(|e| e.rtty_auto_abort());
+        // 6. A tune carrier taking the transmitter — caught by the PER-TICK
+        //    predicate, with no explicit RTTY call anywhere in set_tune.
+        killed(|e| {
+            e.set_tune(true);
+            assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        });
+        // 7. A QSY out of privileges — likewise per-tick only. The dial can move
+        //    under a latched transmitter from a spot click, a memory recall or a
+        //    rotator-follow, none of which knows RTTY exists.
+        killed(|e| {
+            e.set_license_class("technician");
+            e.set_frequency(14.083, "20m", "LSB");
+            assert!(!e.tx_allowed());
+            assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        });
+        // 8. The loop's own gate: not onto a radio it doesn't own (may_key is
+        //    the radio loop's state, so the loop calls this directly).
+        killed(|e| e.drop_rtty_latch());
+    }
+
+    /// The per-tick predicate is a GUARD, so it has to be shown not firing too —
+    /// otherwise "everything drops the latch" would pass with a predicate that
+    /// simply always drops it, and continuous TX would not exist.
+    #[test]
+    fn the_latch_predicate_holds_while_every_gate_is_up() {
+        let mut e = rtty_latched_engine();
+        for _ in 0..50 {
+            assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Diddle);
+        }
+        assert!(e.rtty_latched(), "the latch dropped with every gate up");
+        assert!(
+            !e.take_rtty_abort(),
+            "an abort was armed with nothing wrong"
+        );
+    }
+
+    #[test]
+    fn a_latched_over_is_bounded_by_the_wall_clock_watchdog() {
+        let mut e = rtty_latched_engine();
+        let mut s = e.settings().clone();
+        s.tx_watchdog_min = 1;
+        e.apply_settings(s);
+        // Typing restarts the clock, exactly as pressing Enter does — a keystroke
+        // is the same evidence of an attended transmitter that a send is.
+        e.tx_watchdog_start = Some(now_unix_secs().saturating_sub(61));
+        e.rtty_type("STILL HERE").unwrap();
+        assert!(
+            e.tx_watchdog_start.is_none(),
+            "a typed character must restart the watchdog clock"
+        );
+        // Walking away does not: the clock runs out and the watchdog trips
+        // BEFORE the next chunk, disarming TX and dropping the latch.
+        while let RttyStreamTick::Text(_) = e.poll_rtty_stream(100) {}
+        e.tx_watchdog_start = Some(now_unix_secs().saturating_sub(61));
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        assert!(e.tx_watchdog, "the watchdog did not trip on a latched over");
+        assert!(!e.tx_enabled(), "a trip disarms TX");
+        assert!(!e.rtty_latched(), "a trip must drop the latch");
+        assert!(e.take_rtty_abort(), "a trip must unkey");
+    }
+
+    #[test]
+    fn a_latched_over_is_bounded_by_its_own_ceiling_that_typing_cannot_extend() {
+        let mut e = rtty_latched_engine();
+        // No ordinary watchdog at all — this ceiling stands on its own, which is
+        // the point: it covers what the watchdog cannot see, because typing
+        // restarts the watchdog and a stuck key types forever.
+        let mut s = e.settings().clone();
+        s.tx_watchdog_min = 0;
+        e.apply_settings(s);
+        e.rtty_latch_start_ms =
+            Some(now_unix_millis().saturating_sub(Engine::RTTY_MAX_LATCH_MS + 1));
+        // Type at the moment of the check — the ceiling must not care.
+        e.rtty_type("AAAA").unwrap();
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        assert!(!e.rtty_latched(), "the hard ceiling did not unkey");
+        assert!(e.take_rtty_abort());
+        assert!(
+            e.rtty_state()
+                .keyer_error
+                .is_some_and(|m| m.contains("ceiling")),
+            "an unexplained unkey reads as a fault — say why"
+        );
+        // The ceiling bounds the whole KEYED period, not just the part with the
+        // operator's intent up: clicking TX off leaves a buffer draining on the
+        // air, which is still a transmission and still has to end.
+        e.set_tx_enabled(true);
+        e.set_rtty_latched(true).unwrap();
+        e.rtty_type("A LONG TAIL").unwrap();
+        e.set_rtty_latched(false).unwrap(); // draining, intent already down
+        e.rtty_latch_start_ms =
+            Some(now_unix_millis().saturating_sub(Engine::RTTY_MAX_LATCH_MS + 1));
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Idle);
+        assert!(
+            e.take_rtty_abort(),
+            "the drain outran the ceiling unbounded"
+        );
+        // …and the ceiling is not restarted by re-latching within the same over:
+        // it is restarted by the operator deliberately keying up again.
+        e.set_tx_enabled(true);
+        e.set_rtty_latched(true).unwrap();
+        assert_eq!(e.poll_rtty_stream(2), RttyStreamTick::Diddle);
+    }
+
+    #[test]
+    fn the_latch_and_the_auto_sequencer_never_own_the_transmitter_together() {
+        // The sequencer's ONLY on_tx_complete edge is `rtty_auto_over &&
+        // !rtty_sending && rtty_queue.is_empty()` — a transmitter that never
+        // drops between overs would hang it mid-QSO with the rig keyed. The two
+        // are therefore exclusive, refused from BOTH directions.
+        let mut e = rtty_auto_engine();
+        e.rtty_auto_cq().unwrap();
+        assert_ne!(e.rtty_state().seq_state, "idle", "a QSO is running");
+        assert!(
+            e.set_rtty_latched(true)
+                .unwrap_err()
+                .contains("auto-sequencer"),
+            "the latch must not come up under a running sequencer"
+        );
+        assert!(!e.rtty_latched());
+        // The other direction: no auto QSO may start under a latch.
+        e.rtty_auto_abort();
+        e.set_rtty_latched(true).unwrap();
+        assert!(e.rtty_auto_cq().unwrap_err().contains("Continuous TX"));
+        assert!(e
+            .rtty_auto_answer("W1AW")
+            .unwrap_err()
+            .contains("Continuous TX"));
+        // REGRESSION GUARD for the way this feature was nearly built: the fix
+        // that reached for `rtty_sending` to keep the Stop macro enabled would
+        // have pinned that flag true for the whole latched period and killed the
+        // edge above. The latch does not touch it, so the sequencer still runs.
+        e.rtty_stop(); // drops the latch
+        assert!(!e.rtty_latched());
+        e.rtty_auto_cq().unwrap();
+        e.set_rtty_sending(true);
+        assert!(e.poll_rtty_one().is_some(), "the CQ over keys");
+        e.set_rtty_sending(false); // the over played out — the edge fires here
+        let before = e.rtty_state().seq_state;
+        e.rtty_auto_service();
+        assert_eq!(before, "calling_cq");
+        assert!(
+            e.rtty_state().auto,
+            "the sequencer survived the latch feature"
+        );
+    }
+
+    #[test]
+    fn latching_off_finishes_what_was_typed_then_stops_feeding() {
+        let mut e = rtty_latched_engine();
+        e.rtty_type("73 SK").unwrap();
+        // Click TX again: intent down, but what the operator already typed still
+        // goes out — it is a mode toggle, not the emergency stop, and RTTY has
+        // no un-send. Nothing is aborted here.
+        e.set_rtty_latched(false).unwrap();
+        assert!(!e.rtty_latched());
+        assert!(!e.take_rtty_abort(), "a clean latch-off is not an abort");
+        assert_eq!(e.poll_rtty_stream(9), RttyStreamTick::Text("73 SK".into()));
+        // Drained → the stream ends and the loop's tx_until_ms unkeys.
+        assert_eq!(e.poll_rtty_stream(9), RttyStreamTick::Idle);
+        // …and a stop DURING the drain still cuts it, so the drain is never a
+        // window where the operator cannot stop.
+        e.set_rtty_latched(true).unwrap();
+        e.rtty_type("A LONG MESSAGE").unwrap();
+        e.set_rtty_latched(false).unwrap();
+        e.rtty_stop();
+        assert!(e.take_rtty_abort());
+        assert_eq!(e.poll_rtty_stream(9), RttyStreamTick::Idle);
+    }
+
+    #[test]
+    fn a_macro_fired_while_latched_types_into_the_live_transmission() {
+        let mut e = rtty_latched_engine();
+        // The message queue is HELD while the latch streams, so an enqueue here
+        // would be a silent hold — the operator presses F1 and hears nothing.
+        // It goes into the stream instead (MMTTY's F-keys work this way).
+        e.rtty_send_text("CQ DE W9XYZ K").unwrap();
+        assert_eq!(
+            e.poll_rtty_one(),
+            None,
+            "nothing was queued behind the latch"
+        );
+        assert_eq!(
+            e.poll_rtty_stream(99),
+            RttyStreamTick::Text("CQ DE W9XYZ K".into())
+        );
+        // Unmappable-only text still refuses, exactly as a send refuses it.
+        assert!(e.rtty_send_text("%*+=").is_err());
+        // Unlatched, sends go back to being whole queued overs.
+        e.set_rtty_latched(false).unwrap();
+        e.rtty_send_text("TEST").unwrap();
+        assert_eq!(e.poll_rtty_one(), Some("TEST".to_string()));
+    }
+
     #[test]
     fn rtty_and_ft8_sequencers_never_key_together() {
         let mut e = Engine::new("W9XYZ", "EN61", 0);
@@ -14824,6 +15720,179 @@ mod tests {
         );
     }
 
+    /// ⭐ THE FIELD REPORT (FTDX10 + IC-9700 owner, 2026-08-12): *"when I select preset
+    /// frequency 144.500 for SSTV it switches to FM, but as soon as I start TXing it switches
+    /// to USB-D. That is not right."*
+    ///
+    /// This is the test its neighbour above should have been: that one asserts FM **at idle**
+    /// and never sends an image, which is exactly the gap the bug shipped through. FM is a
+    /// CLASS, not a side — and the SSTV arm asked only which SIDE the image was on, so the
+    /// moment a picture was queued an FM repeater input was commanded PKTUSB. Not a display
+    /// glitch: that is an SSB emission on an FM channel, decided in the write-side canon the
+    /// radio loop re-asserts immediately before key-down.
+    ///
+    /// Drives the REAL click order (`sstv_tune` → send), not a hand-set flag.
+    #[test]
+    fn an_sstv_image_on_an_fm_channel_commands_the_fm_data_word_not_usb() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.sstv_tune(144.500, "2m", "FM");
+        assert_eq!(
+            e.rig_mode_effective(),
+            "FM",
+            "precondition: the 2 m calling channel is FM while idle (voice through the mic)"
+        );
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTFM",
+            "queued image on an FM channel → the FM DATA submode, so the codec reaches the \
+             modulator WITHOUT changing the emission from FM to SSB"
+        );
+        // …and it holds for the whole over, not just the queued instant.
+        let _ = e.poll_sstv_tx();
+        e.set_sstv_sending(true);
+        assert_eq!(e.rig_mode_effective(), "PKTFM", "sending → still FM DATA");
+        // Image done → back to plain FM so the next voice PTT keys the mic, and the repeater
+        // shift/CTCSS gate (service.rs) sees the FM family throughout.
+        e.set_sstv_sending(false);
+        assert_eq!(e.rig_mode_effective(), "FM", "idle again → plain FM");
+    }
+
+    /// The other two ways the Phone section can be in FM — neither of which arms `fm_channel`,
+    /// so neither was reachable through the arm above. Both were PKTUSB on the air before the
+    /// shared predicate existed: the tester's own "my custom-mode frequency (local FM
+    /// repeater)" is this shape, not the preset one.
+    #[test]
+    fn a_phone_fm_policy_or_an_fm_pick_also_survives_an_sstv_send() {
+        // (1) The station-wide policy — what `repeater_tune` writes and no band change resets.
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.settings.phone_mode = "fm".to_string();
+        e.set_operating_mode("phone", false);
+        e.set_frequency(146.520, "2m", "FM");
+        assert_eq!(
+            e.rig_mode_effective(),
+            "FM",
+            "precondition: policy FM at idle"
+        );
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTFM",
+            "the station-wide FM policy outranks the SSTV side-derivation"
+        );
+
+        // (2) The cockpit's explicit FM pick, on a dial the policy says nothing about.
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.set_operating_mode("phone", false);
+        e.set_frequency(146.550, "2m", "FM");
+        e.request_sideband_override(Some("FM"));
+        assert_eq!(
+            e.rig_mode_effective(),
+            "FM",
+            "precondition: the explicit pick is FM at idle"
+        );
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTFM",
+            "an explicit FM pick outranks the SSTV side-derivation too"
+        );
+    }
+
+    /// THE GUARD ON THE FIX, and the half that matters most: HF SSTV — the overwhelmingly
+    /// common case — must be untouched, and nothing FM may appear below 29 MHz. The 29 MHz
+    /// floor is a documented bug fix (`fm_does_not_follow_the_operator_down_to_hf`): without
+    /// it, an evening on an FM repeater commands FM onto 20 m phone. A stale station-wide
+    /// `phone_mode = "fm"` must therefore change NOTHING about a 14.230 image.
+    #[test]
+    fn an_hf_sstv_send_is_unchanged_and_never_reaches_the_fm_arm() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        // The stale FM policy, deliberately left set — this is the state the floor exists for.
+        e.settings.phone_mode = "fm".to_string();
+        e.sstv_tune(14.230, "20m", "USB");
+        assert_eq!(
+            e.rig_mode_effective(),
+            "USB",
+            "precondition: the 29 MHz floor already refuses FM on 20 m at idle"
+        );
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTUSB",
+            "20 m image → DATA-U exactly as before; the FM arm must not reach HF"
+        );
+        // LSB-side HF is likewise untouched.
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.settings.phone_mode = "fm".to_string();
+        e.sstv_tune(7.171, "40m", "LSB");
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTLSB",
+            "40 m image → DATA-L exactly as before"
+        );
+    }
+
+    /// The mic-jack opt-out reaches the new word too. On that wiring a DATA submode routes TX
+    /// audio to a port the interface is not on, so the picture has to go in the mic input —
+    /// which for an FM channel is plain FM, not plain USB.
+    #[test]
+    fn the_plain_ssb_opt_out_maps_the_fm_data_word_to_plain_fm() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.settings.data_modes_plain_ssb = true;
+        e.sstv_tune(144.500, "2m", "FM");
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.rig_mode_effective(),
+            "FM",
+            "mic-jack rigs get plain FM, never PKTFM and never USB"
+        );
+    }
+
+    /// The REGRESSION GUARD the shared predicate buys, stated as the invariant rather than as
+    /// a symptom: `route_mode` and `rig_mode_effective` are asked at different moments (only
+    /// `tune_dial` asks the former, and no image is in flight there), so they never actually
+    /// disagreed in the field — the defect presented as a wrong emission, not a mis-routed
+    /// QSY. This pins that they cannot start to: with an image in flight on an FM channel the
+    /// routing class is FM and the commanded word is in the FM family.
+    #[test]
+    fn routing_and_the_commanded_mode_agree_about_fm_during_an_sstv_send() {
+        use crate::settings::RouteMode;
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_license_class("extra");
+        e.settings.phone_mode = "fm".to_string();
+        e.set_operating_mode("phone", false);
+        e.set_frequency(146.520, "2m", "FM");
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(
+            e.route_mode("2m", 146.520),
+            RouteMode::Fm,
+            "routing says FM…"
+        );
+        assert!(
+            e.rig_mode_effective().ends_with("FM"),
+            "…so the commanded word must be in the FM family, got {}",
+            e.rig_mode_effective()
+        );
+        // And below the floor both must say SSB — one predicate, one answer, both directions.
+        // (The band-crossing QSY drops the queued image with the rest of the TX queue —
+        // `halt_tx_for_context_change` — so the send has to be re-made to ask the question.)
+        e.set_frequency(14.230, "20m", "USB");
+        e.sstv_send(sstv_img_samples(), "Scottie 1".into()).unwrap();
+        assert_eq!(e.route_mode("20m", 14.230), RouteMode::Ssb, "HF routes SSB");
+        assert_eq!(
+            e.rig_mode_effective(),
+            "PKTUSB",
+            "and commands the USB-side data submode"
+        );
+    }
+
     #[test]
     fn sstv_send_validates_every_tx_gate() {
         let mut e = Engine::new("W9XYZ", "EN61", 0);
@@ -15046,6 +16115,239 @@ mod tests {
             e.settings().dial_hz(),
             14_213_000,
             "dial_hz round-trips exactly"
+        );
+    }
+
+    /// THE GENERAL-COVERAGE LISTEN (tester report, 1.2.2, FTdx10 — it reads as Yaesu-only
+    /// because an IC-9700 cannot reach an unnamed dial: 2 m, 70 cm and 23 cm are all named).
+    ///
+    /// `bandplan::band_for_dial` answers `None` for EVERY dial outside a ham band — WWV at
+    /// 5/10/15 MHz, shortwave broadcast, CB, the gap between two band edges — not merely for
+    /// the microwave dials above the table that the knob path was written for. Spinning the
+    /// VFO down to WWV for a propagation check is leaving the bands to LISTEN, not a QSY:
+    /// nothing about the 40 m context the operator is coming back to has been invalidated.
+    #[test]
+    fn a_listen_off_the_bands_keeps_the_context_it_never_left() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(7.074, "40m", "USB"); // 40 m FT8 — the band the context belongs to
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+        e.ai_cw_text = "W1AW 599 599".into();
+        e.request_sideband_override(Some("LSB"));
+        // Harness controls: every survival assertion below is worthless unless the state it
+        // names was really populated in the first place.
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "control: the decode reached the roster"
+        );
+        assert!(
+            !e.decode_history.is_empty(),
+            "control: …and the decode context"
+        );
+
+        // 5.000 MHz — WWV. No named band contains it, so the knob path sees `None`.
+        e.observe_rig_freq(5_000_000);
+        assert_eq!(
+            e.settings.band, "",
+            "off the bands the label is ABSENT, not guessed — that part is right, and it \
+             is what keeps a 5 MHz dial out of the 40 m dial-memory cell and out of ADIF"
+        );
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "the 40 m roster must survive a listen off the bands — the stations are still \
+             there and the operator is coming straight back"
+        );
+        assert!(
+            !e.decode_history.is_empty(),
+            "…and so must the decode context"
+        );
+        assert_eq!(e.ai_cw_text, "W1AW 599 599", "…and the CW copy");
+        assert_eq!(
+            e.sideband_override().as_deref(),
+            Some("LSB"),
+            "…and the operator's mode pick: dropping it re-commands the rig's mode \
+             mid-listen (`rig_mode_effective` reads it), which is a knob turning itself"
+        );
+
+        // …and back onto the band it never really left. The label was blanked, so this is
+        // the arm that fires — it must recognise the return as a return, not as a QSY onto
+        // a band the context is stale for.
+        e.observe_rig_freq(7_074_000);
+        assert_eq!(e.settings.band, "40m", "the label comes back with the dial");
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "the ROUND TRIP is what the operator actually does — clearing on the way back \
+             in loses exactly as much as clearing on the way out did"
+        );
+    }
+
+    /// The other direction, and it is the positive control for the test above: an excursion
+    /// off the bands that ENDS on a different band is a genuine cross-band QSY, and every
+    /// clear a direct 20 m → 40 m knob turn performs must still happen through the gap.
+    #[test]
+    fn a_cross_band_qsy_through_the_gap_still_clears_the_context() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(14.074, "20m", "USB");
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+        e.ai_cw_text = "W1AW 599 599".into();
+        e.request_sideband_override(Some("LSB"));
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "control: the decode reached the roster"
+        );
+
+        e.observe_rig_freq(5_000_000); // off the bands…
+        e.observe_rig_freq(7_074_000); // …and out onto 40 m: a real band change
+
+        assert_eq!(e.settings.band, "40m");
+        assert!(
+            e.app.inbox.roster.is_empty(),
+            "20 m stations are not on 40 m — the roster must not survive the crossing"
+        );
+        assert!(e.decode_history.is_empty(), "…nor the 20 m decode context");
+        assert!(e.ai_cw_text.is_empty(), "…nor the 20 m CW copy");
+        assert!(
+            e.sideband_override().is_none(),
+            "…and the mode override still ends at a band change, as its tooltip says"
+        );
+    }
+
+    /// RECEIVE IS FIRST CLASS OFF THE BANDS (operator, 2026-08-13: "many people will want to
+    /// receive and listen off of the TX bands, and that should be fully allowed"). A decode
+    /// that arrives while the dial is off the bands must be processed and displayed exactly
+    /// like any other — the decode pipeline is dial-driven and must not be band-gated.
+    #[test]
+    fn decoding_continues_off_the_bands() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(7.074, "40m", "USB");
+        e.observe_rig_freq(5_000_000); // off the bands, listening
+        assert_eq!(e.settings.band, "", "premise: the dial is off the bands");
+
+        // A decode arrives while off-band — from a shortwave-band FT8 experiment, a
+        // transverter IF, or simply the operator parked between two band edges.
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+
+        assert!(
+            !e.decode_history.is_empty(),
+            "an off-band decode still enters the decode context"
+        );
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "…and still reaches the roster"
+        );
+        let rows = e.snapshot().recent_decodes;
+        assert!(
+            rows.iter().any(|r| r.from.as_deref() == Some("PJ4DX")),
+            "…and is still projected into the live decode feed the cockpit renders"
+        );
+    }
+
+    /// The APP-COMMANDED half of the same line. The knob path was fixed first, but the UI
+    /// now lets the operator TYPE an off-band frequency (or click one on the scope), and
+    /// `tune_dial` must answer the same way the knob does: going off the bands is a listen,
+    /// not a QSY, and coming back to the band you left is a return. Without this the fix
+    /// held only for people who reach for the rig instead of the keyboard.
+    #[test]
+    fn a_typed_off_band_qsy_keeps_the_context_like_the_knob_does() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(7.074, "40m", "USB");
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "control: the decode reached the roster"
+        );
+
+        // Typing 5.000 into the readout — the UI hands the engine an empty band label,
+        // because there is no band there to name.
+        e.set_frequency(5.000, "", "USB");
+        assert_eq!(e.settings.band, "", "the label is absent, not guessed");
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "a typed off-band listen must not wipe the 40 m roster either"
+        );
+
+        // …and typing your way back.
+        e.set_frequency(7.074, "40m", "USB");
+        assert!(
+            !e.app.inbox.roster.is_empty(),
+            "the typed round trip is a round trip"
+        );
+    }
+
+    /// Positive control for the test above — the clears must still fire when the excursion
+    /// genuinely ends somewhere else, exactly as for the knob.
+    #[test]
+    fn a_typed_qsy_through_the_gap_onto_another_band_still_clears() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(14.074, "20m", "USB");
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+        assert!(!e.app.inbox.roster.is_empty(), "control: populated");
+        e.set_frequency(5.000, "", "USB");
+        e.set_frequency(7.074, "40m", "USB");
+        assert!(
+            e.app.inbox.roster.is_empty(),
+            "20 m stations are not on 40 m — the crossing still clears"
+        );
+    }
+
+    /// An off-band tune must not HAND THE SESSION TO ANOTHER RADIO. `radio_for_band` ranks a
+    /// catch-all coverage list (1) above an explicit list that does not contain the band (0),
+    /// and an empty band label is contained by no explicit list — so routing on `""` would
+    /// walk an operator off their configured HF rig onto whatever rig has no band list, just
+    /// because they tuned to WWV. The bandless tiers are the existing answer to exactly this
+    /// (the QO-100 path already uses them).
+    #[test]
+    fn an_off_band_tune_stays_on_the_active_radio() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.settings.ensure_radio_profiles();
+        let other = e.add_radio(); // a second rig with NO band list = catch-all coverage
+        e.set_active_radio(0);
+        if let Some(p) = e.settings.radios.iter_mut().find(|p| p.id == 0) {
+            p.bands = vec!["40m".into(), "20m".into()]; // the operator's configured HF rig
+        }
+        if let Some(p) = e.settings.radios.iter_mut().find(|p| p.id == other) {
+            p.bands = vec![];
+        }
+        e.set_frequency(7.074, "40m", "USB");
+        assert_eq!(
+            e.settings.active_radio, 0,
+            "control: 40 m is this rig's band"
+        );
+
+        e.set_frequency(5.000, "", "USB"); // off the bands
+        assert_eq!(
+            e.settings.active_radio, 0,
+            "tuning off the bands is not a reason to switch radios"
+        );
+    }
+
+    /// The TX halt STAYS, and this is why: `Engine::tx_allowed` keys on the dial, but
+    /// `privileges::tx_allowed` short-circuits `LicenseClass::Open` — the DEFAULT, and the
+    /// class every non-US operator and every operator who never opened Settings is on — to
+    /// `true` at any frequency. So for them the dial gate does not fail closed off the
+    /// bands, and this halt is the only thing that stops the sequencer keying there.
+    #[test]
+    fn a_knob_qsy_off_the_bands_still_cuts_transmit() {
+        let mut e = Engine::new("W9XYZ", "EN61", 0);
+        e.set_frequency(7.074, "40m", "USB");
+        e.set_tx_enabled(true);
+        assert!(e.tx_enabled, "control: armed on 40 m");
+
+        e.observe_rig_freq(5_000_000); // WWV — outside every ham band
+        assert!(
+            !e.tx_enabled,
+            "the knob leaving the bands must halt TX: nothing else will"
+        );
+        assert!(
+            e.tx_allowed(),
+            "…and the premise, stated as a check: Open class PERMITS 5 MHz, so the dial \
+             gate is not the thing protecting this"
+        );
+        // Paired control for that premise — a US class really does fail closed here, which
+        // is precisely why the hole is invisible unless you test the default class.
+        e.set_license_class("general");
+        assert!(
+            !e.tx_allowed(),
+            "control: a declared US class has no 5 MHz segment and fails closed"
         );
     }
 
@@ -20521,6 +21823,79 @@ mod tests {
         e.discard_pending_log();
         assert!(e.get_log().is_empty(), "discard logs nothing");
         assert!(e.snapshot().pending_log.is_none());
+    }
+
+    #[test]
+    fn off_band_decodes_are_not_badged_new_on_a_band_that_does_not_exist() {
+        let mut e = Engine::new("K2DEF", "FN31", 0);
+        e.set_dxcc_resolver(|call| call.chars().next().map(|c| c.to_string()));
+        // W9XYZ / EN37 worked on 40 m: entity "W" and grid EN37 are on the books there.
+        e.log_qso(QsoRecord {
+            grid: Some("EN37".into()),
+            ..qrec("W9XYZ", "40m")
+        });
+
+        // POSITIVE CONTROL — on 40 m the badges are correctly silent for that grid+entity.
+        // Without this the test below could pass by never badging anything at all.
+        e.set_frequency(7.074, "40m", "USB");
+        e.ingest_decodes_for_test(&[dec_snr("CQ W1AW EN37", -5)], 0);
+        let on40 = e.snapshot().recent_decodes;
+        let r40 = on40
+            .iter()
+            .find(|r| r.from.as_deref() == Some("W1AW"))
+            .unwrap();
+        assert!(
+            !r40.new_grid && !r40.new_band,
+            "control: EN37 and entity W ARE worked on 40 m, so neither badge belongs here"
+        );
+
+        // Now spin the knob to WWV. Nothing about the log changed; the operator is
+        // listening. The per-band lookups key on `band_key("")`, which matches nothing in
+        // the worked index — so before this fix EVERY gridded decode came back NEW GRID and
+        // every worked entity came back a new BAND slot.
+        e.observe_rig_freq(5_000_000);
+        e.ingest_decodes_for_test(&[dec_snr("CQ W1AW EN37", -5)], 1);
+        let off = e.snapshot().recent_decodes;
+        let roff = off
+            .iter()
+            .find(|r| r.from.as_deref() == Some("W1AW"))
+            .unwrap();
+        assert!(
+            !roff.new_grid,
+            "EN37 is worked; off the bands there is no band slot for it to be new in, and \
+             claiming one badges the whole roster as new"
+        );
+        assert!(!roff.new_band, "…and the same for the entity's band slot");
+    }
+
+    /// The other half of that line, and the control for it: the ALL-TIME question is still
+    /// answerable off the bands, so a genuinely-new-one heard on WWV must still read as a
+    /// new DXCC entity. Suppressing the per-band claims must not go so far as to blind the
+    /// operator to an ATNO.
+    #[test]
+    fn an_all_time_new_entity_is_still_flagged_off_the_bands() {
+        let mut e = Engine::new("K2DEF", "FN31", 0);
+        e.set_dxcc_resolver(|call| call.chars().next().map(|c| c.to_string()));
+        e.log_qso(QsoRecord {
+            grid: Some("EN37".into()),
+            ..qrec("W9XYZ", "40m")
+        });
+        e.set_frequency(7.074, "40m", "USB");
+        e.observe_rig_freq(5_000_000);
+        e.ingest_decodes_for_test(&[dec_snr("CQ DL1XYZ JO31", -9)], 1);
+        let rows = e.snapshot().recent_decodes;
+        let r = rows
+            .iter()
+            .find(|r| r.from.as_deref() == Some("DL1XYZ"))
+            .unwrap();
+        assert!(
+            r.new_dxcc,
+            "entity D has never been worked on ANY band — that answer needs no band label"
+        );
+        assert!(
+            !r.new_band,
+            "…and an all-time new one is never also a band slot (mutually exclusive)"
+        );
     }
 
     #[test]

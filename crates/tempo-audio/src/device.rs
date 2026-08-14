@@ -62,7 +62,7 @@ pub(crate) type StreamErrSlot = std::sync::Arc<Mutex<Option<String>>>;
 /// the loop ever learned the stream was dead. `RadioLoop::step` only reopens the sound card when
 /// the SETTINGS change, so a stream killed by the OS — device unplugged, a CoreAudio topology
 /// change when a Bluetooth headset connects, or a codec that drops off the bus by itself (an
-/// ON8ST station dongle did exactly this, 2.0–2.4 s after every open, 2026-08-13) — left Nexus
+/// USB codec was measured doing exactly this, 2.0–2.4 s after every open) — left Nexus
 /// running with a blank waterfall, no decodes, no banner and no diagnosis. Recording the text
 /// here lets the loop raise the same banner a failed OPEN raises and arm the same retry, so the
 /// stream comes back by itself once the device does.
@@ -398,8 +398,10 @@ where
 /// Real sound-card backend. Keep it alive for the duration of operation — the
 /// cpal streams stop when this is dropped.
 pub struct CpalBackend {
-    _in_stream: Stream,
-    _out_stream: Stream,
+    /// `Option` so [`AudioBackend::release_device`] can drop them IN PLACE. Dropping a
+    /// cpal `Stream` is what actually frees the ALSA handle; pausing does not.
+    _in_stream: Option<Stream>,
+    _out_stream: Option<Stream>,
     /// Set by the capture/playback error callbacks when the OS kills a stream, drained each tick
     /// by the radio loop via [`AudioBackend::take_stream_error`]. See [`err_recorder`] for why a
     /// dead stream has to reach the loop at all.
@@ -887,8 +889,8 @@ impl CpalBackend {
         out_stream.play().map_err(|e| e.to_string())?;
 
         Ok(Self {
-            _in_stream: in_stream,
-            _out_stream: out_stream,
+            _in_stream: Some(in_stream),
+            _out_stream: Some(out_stream),
             stream_err,
             in_ring,
             out_ring,
@@ -922,6 +924,23 @@ fn update_rx_meter(meter: &Arc<Mutex<f32>>, sum_sq: f32, n: usize) {
 }
 
 impl AudioBackend for CpalBackend {
+    /// Free every device this backend holds, in ONE critical section.
+    ///
+    /// All four holders have to go, not just the obvious two: a monitor output stream or a
+    /// live voice-mic stream keeps its card open just as firmly as the main capture stream,
+    /// and either one left behind reproduces the original bug on that card.
+    ///
+    /// Takes [`AUDIO_HOST_LOCK`] ITSELF and calls `Monitor::release_locked` (which does not
+    /// lock) rather than `Monitor::apply`, because `std::sync::Mutex` is not reentrant —
+    /// `apply` locks internally, so calling it from under the lock would deadlock the radio
+    /// loop. For the same reason the CALLER must not hold the lock around this.
+    fn release_device(&mut self) {
+        let _host_guard = AUDIO_HOST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.monitor.release_locked();
+        self.voice_mic = None;
+        self._in_stream = None;
+        self._out_stream = None;
+    }
     fn spectrum_tap(&self) -> Option<(Arc<SpscRing>, u32)> {
         Some((self.spectrum_tap.clone(), self.in_rate))
     }

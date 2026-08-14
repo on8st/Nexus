@@ -8504,6 +8504,11 @@ struct RttyStateDto {
     backend: String,
     /// An RTTY over is on the air or queued behind one (the TX indicator).
     sending: bool,
+    /// Continuous TX is latched (the cockpit's TX button) — keyed, idling on
+    /// diddle between keystrokes. Reported separately from `sending` so the
+    /// cockpit's Stop control is live from the instant the latch goes up, one
+    /// tick before the first chunk is actually keyed.
+    latched: bool,
     /// A keyer failure to surface (FSK port wouldn't open / rig refused PTT), else null.
     keyer_error: Option<String>,
     /// The RTTY auto-sequencer is active (the operator's Auto toggle is on).
@@ -8534,6 +8539,7 @@ fn rtty_state_dto(eng: &Engine) -> RttyStateDto {
         shift_hz: s.shift_hz,
         backend: s.backend,
         sending: s.sending,
+        latched: s.latched,
         keyer_error: s.keyer_error,
         auto: s.auto,
         seq_state: s.seq_state,
@@ -8712,6 +8718,33 @@ fn repeater_tune(
 fn rtty_send(state: State<'_, SharedEngine>, text: String) -> Result<RttyStateDto, String> {
     let mut eng = engine_lock(&state);
     eng.rtty_send_text(&text)?;
+    Ok(rtty_state_dto(&eng))
+}
+
+/// Continuous TX on/off — the cockpit's TX button, the MMTTY latch: stay keyed
+/// and type into a live transmission instead of one keyed over per Enter.
+///
+/// ON runs the SAME gate a send runs (so the latch can never key where a send
+/// could not) and is refused while the auto-sequencer is running a QSO. OFF stops
+/// accepting characters and lets what was already typed finish keying, then
+/// unkeys — it is a mode toggle, NOT the emergency stop. Stop TX, the Esc/Stop
+/// macro and the TX-enable latch remain the instant kills, and each of them also
+/// drops this. The engine re-checks every TX gate on every radio-loop tick while
+/// it is up, and drops the latch the moment one goes down.
+#[tauri::command(async)]
+fn rtty_set_latched(state: State<'_, SharedEngine>, on: bool) -> Result<RttyStateDto, String> {
+    let mut eng = engine_lock(&state);
+    eng.set_rtty_latched(on)?;
+    Ok(rtty_state_dto(&eng))
+}
+
+/// Feed typed characters into the live latched transmission (one insertion at a
+/// time from the compose field — RTTY has no un-send, so nothing sent can be
+/// edited or withdrawn). Refused unless continuous TX is latched.
+#[tauri::command(async)]
+fn rtty_type(state: State<'_, SharedEngine>, text: String) -> Result<RttyStateDto, String> {
+    let mut eng = engine_lock(&state);
+    eng.rtty_type(&text)?;
     Ok(rtty_state_dto(&eng))
 }
 
@@ -10807,6 +10840,23 @@ fn get_log(state: State<'_, SharedEngine>) -> Result<Vec<LoggedQso>, String> {
 #[tauri::command]
 fn resolve_entity(call: String) -> Option<String> {
     propagation::dxcc::resolve(&call).map(|i| i.entity.to_string())
+}
+
+/// Every entity name paired with its cty.dat representative location, as
+/// `[name, lat, lon]` — the fallback that lets a pane print an azimuth beside a
+/// country for a station that never sent a grid.
+///
+/// **Coordinates, not bearings, deliberately.** A bearing depends on the operator's
+/// own grid, which they can change in Settings at any moment; a table of
+/// pre-computed headings fetched once at mount would then be silently wrong on
+/// every row. Coordinates are grid-independent, so they cache for the life of the
+/// window and the bearing is re-derived in the UI from whatever `mygrid` is now.
+#[tauri::command]
+fn dxcc_entity_locations() -> Vec<(String, f64, f64)> {
+    propagation::dxcc::entity_locations()
+        .into_iter()
+        .map(|(name, lat, lon)| (name.to_string(), lat, lon))
+        .collect()
 }
 
 /// Every current DXCC entity name (sorted), for the decode panes' "hide any entity" picker
@@ -16145,6 +16195,8 @@ pub fn run() {
             aprs_tune,
             repeater_tune,
             rtty_send,
+            rtty_set_latched,
+            rtty_type,
             rtty_stop,
             rtty_clear,
             rtty_afc_reset,
@@ -16165,6 +16217,7 @@ pub fn run() {
             set_license_class,
             get_licensed_band_plan,
             dxcc_entity_names,
+            dxcc_entity_locations,
             set_frequency,
             sstv_tune,
             pick_band,

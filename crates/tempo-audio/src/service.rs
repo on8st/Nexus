@@ -22,7 +22,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tempo_app::engine::{
-    engine_lock, DecodeApplied, DecodeJob, DecodePass, DecodeResult, Engine, SatCatBackend,
+    engine_lock, DecodeApplied, DecodeJob, DecodePass, DecodeResult, Engine, RttyStreamTick,
+    SatCatBackend,
 };
 use tempo_core::tempo_fast;
 use tempo_core::timing::{now_unix_ms, SlotClock};
@@ -939,6 +940,9 @@ pub fn run_radio(engine: Arc<Mutex<Engine>>, mut cfg: RadioConfig) -> Result<(),
             // dumped its queued audio and ptt(false) unkeyed the carrier — this is
             // symmetry with the CW/RTTY cuts below).
             state.sstv_feed = None;
+            // …and the continuous-TX generator, for the same symmetry: the flush and
+            // unkey above are what actually take a latched over off the air.
+            state.rtty_stream = None;
             // Cut any in-progress CW too: stop a CAT `send_morse` and flush a
             // WinKeyer's hardware buffer NOW, deterministically, rather than
             // relying on Drop running before the process is killed (a half-sent
@@ -1594,6 +1598,60 @@ const SSTV_CHUNK_SAMPLES: usize = 24_000;
 /// loop stalls (shared CAT reads) without underrunning.
 const SSTV_FEED_AHEAD_MS: f64 = 10_000.0;
 
+/// How far ahead of real time the CONTINUOUS-TX (latched) RTTY stream may render
+/// audio, in character times. Two characters ≈ 330 ms at 45.45 baud.
+///
+/// ⚠️ THIS IS A SAFETY BOUND, not a buffer-tuning knob. A one-shot RTTY over keys
+/// against a deadline computed before a single bit goes out (`rtty_busy_until`),
+/// so `tx_until_ms` unkeys the rig even if the loop then dies. A LATCHED over has
+/// no such precomputed end — its deadline is one the loop must keep pushing
+/// forward — so the only thing standing between a wedged loop and a stuck carrier
+/// is how far forward each push may reach. At two characters, a loop that stops
+/// ticking unkeys within ~330 ms of audio + the 250 ms tail. Raising this raises
+/// the stuck-carrier window by exactly the same amount.
+///
+/// The floor is set by the loop's own 20 ms tick plus whatever a shared CAT read
+/// can stall it by; one character (165 ms) of margin over that is comfortable and
+/// the ring never underruns to silence (`device.rs` returns 0.0 when it does,
+/// which under a held PTT reads on the air as a dropout).
+const RTTY_STREAM_AHEAD_CHARS: f64 = 2.0;
+
+/// Most characters the latched stream may render in ONE tick, whatever the
+/// look-ahead deficit says. Bounds the work (and the audio) a single tick can
+/// commit when the loop has been stalled — a macro dropping 25 characters into
+/// the type buffer must not turn into 4 seconds of audio in the ring, because
+/// that is 4 seconds of `tx_until_ms` a wedged loop would then hold PTT for.
+const RTTY_STREAM_MAX_CHUNK: usize = 4;
+
+/// The live continuous-TX ("latched") RTTY stream — the generator state that has
+/// to survive across radio-loop ticks, which is the whole difference between a
+/// latched over and the send-and-done path beside it.
+///
+/// `None` whenever nothing is latched. Dropped on every abort, so a stop can
+/// never leave a half-shifted encoder or a mid-phase oscillator to be resumed
+/// into the NEXT transmission.
+struct RttyStream {
+    /// Baudot/ITA2 encoder carried across chunks — LTRS/FIGS shift state is a
+    /// property of the TRANSMISSION, not of a chunk. A fresh encoder per chunk
+    /// would silently drop the receiver's shift plane mid-word.
+    enc: tempo_core::rtty::BaudotEncoder,
+    /// Resumable AFSK generator (unused on the FSK backend, whose keyer thread
+    /// carries no state between batches). See [`crate::rtty_afsk::AfskStream`].
+    afsk: crate::rtty_afsk::AfskStream,
+    /// The keying config this stream was built for — baud, shift, reverse, and
+    /// whether it is the FSK backend. A settings change mid-over rebuilds it
+    /// rather than splicing two different waveforms into one carrier.
+    key_cfg: (f64, u32, bool, bool),
+    /// PTT has been asserted for this stream and the rig's dial/mode asserted with
+    /// it. A latched over feeds a chunk roughly every 165 ms and PTT is held
+    /// across them by `tx_until_ms`, so re-commanding it per chunk would put a
+    /// BLOCKING CAT round-trip in the loop six times a second for the length of
+    /// the over — on a slow-serial rig that is the loop stall, not a safety net.
+    /// Re-asserted only if the unkey has actually run underneath us
+    /// (`tx_until_ms == None`), which is the case that needs it.
+    keyed: bool,
+}
+
 /// The SSTV image currently streaming to the rig: the whole pre-encoded 12 kHz buffer,
 /// a feed cursor (how many samples have been handed to the backend), and timing.
 struct SstvFeed {
@@ -1875,6 +1933,9 @@ struct RadioLoop {
     /// (line back to mark) when the operator switches to AFSK.
     #[cfg(feature = "serial")]
     rtty_keyer: Option<(String, String, crate::rtty_fsk::FskKeyer)>,
+    /// The live continuous-TX stream, `None` when nothing is latched. See
+    /// [`RttyStream`].
+    rtty_stream: Option<RttyStream>,
     /// The SSTV image currently streaming to the rig (pre-encoded 12 kHz PCM + a feed
     /// cursor + timing), fed to the output ring in chunked look-ahead slices so a
     /// multi-minute image never dumps into the unbounded ring at once. `None` = no
@@ -2159,6 +2220,7 @@ impl RadioLoop {
             #[cfg(feature = "serial")]
             serial_keyer: None,
             rtty_busy_until: 0.0,
+            rtty_stream: None,
             #[cfg(feature = "serial")]
             rtty_keyer: None,
             sstv_feed: None,
@@ -2513,6 +2575,26 @@ impl RadioLoop {
         if md.trim().is_empty() {
             return;
         }
+        // Only re-assert a mode we believe actually REACHED the rig. `last_mode` holds an
+        // applied mode and nothing else — a failed set leaves it alone, and a give-up leaves
+        // the plain-sideband fallback — so a disagreement here means this loop has ALREADY
+        // established that the radio will not take `md`: either the force path's own attempt
+        // failed on this very tick, or the ladder gave up on it ticks ago. Re-asking is then
+        // guaranteed to fail, and it costs an `m` read plus an `M` write inside the rig's
+        // band-change settling window, which is the worst moment to spend them. Observed on
+        // the wire for the FT-950 report: `M PKTUSB 3000` (refused) → `F 21074000` → `m` →
+        // `M PKTUSB 3000` (refused again), all on one tick.
+        //
+        // Testing `mode_giveup` here instead would be DEAD CODE on the path that matters:
+        // the force path clears the give-up before it retunes, so on an operator's band pick
+        // — the gesture that actually crosses a band — it is always `None`.
+        //
+        // The FTDX10 band-stacking fix this function exists for is untouched: there the mode
+        // set SUCCEEDED, so `last_mode == md` and the re-assert still runs.
+        // Pinned by `a_band_cross_never_re_asks_for_a_mode_the_rig_just_refused`.
+        if !self.last_mode.trim().eq_ignore_ascii_case(md.trim()) {
+            return;
+        }
         let band_of = |hz: u64| tempo_app::bandplan::band_for_dial(hz as f64 / 1e6);
         // ⚠️ `None == None` is NOT "in-band": two dials the table cannot name (47 GHz+,
         // or one named and one not) may sit on different rig band registers, and reading
@@ -2664,6 +2746,10 @@ impl RadioLoop {
         self.last_cw_wpm = 0;
         self.cw_busy_until = 0.0;
         self.rtty_busy_until = 0.0;
+        // The latched stream belongs to the radio it was keying. `halt_tx_for_context_change`
+        // drops the engine's latch across a handoff; this drops the generator with it, so a
+        // resumed chunk can never splice the old radio's carrier onto the new one.
+        self.rtty_stream = None;
         self.slot_tx_until_ms = 0.0; // the other radio's over is not ours to protect
         self.last_fm = None;
         self.manual_ptt_applied = false;
@@ -3052,9 +3138,62 @@ impl RadioLoop {
                         eng.halt_tx_for_context_change();
                     }
                 }
+                // ⚠️ RELEASE THE OLD CARD FIRST — see `AudioBackend::release_device`.
+                // ALSA opens a card ONCE, and until this call the rebuild probed the new
+                // device while our OWN previous streams still held it, so moving to any
+                // device on the card you were already using was impossible (#2 / #8:
+                // `audio input device "plughw:CARD=CODEC,DEV=0" is not available`, with
+                // the CODEC absent from the offered list). Picking input and output in one
+                // save worked only because that opens both from a single fresh backend.
+                //
+                // `release_device` takes AUDIO_HOST_LOCK ITSELF (this is a native
+                // device-graph teardown, and a concurrent `default_host()` from
+                // `available_devices()` — Settings open, or Detect — faults natively rather
+                // than panicking). Do NOT wrap this call in the lock: it would deadlock a
+                // non-reentrant mutex, and `reopen_audio` below takes the same lock
+                // internally, which is why the swap's guard is scoped the way it is.
+                //
+                // TRADE-OFF, deliberate: if the replacement then fails to open, the
+                // operator has NO audio until `audio_retry_at` fires, where before they
+                // kept the old device. That is the right way round — the old behaviour
+                // bought graceful degradation in the rare failure case by making the
+                // common case impossible, and they are changing devices precisely because
+                // the current one is not what they want. The retry already recovers a card
+                // another app holds momentarily.
+                backend.release_device();
                 match reopen_audio(&want) {
                     Ok(b) => {
-                        *backend = b;
+                        // ⚠️ THE SWAP DROPS THE OLD BACKEND, AND THAT DROP IS A NATIVE
+                        // DEVICE-GRAPH TEARDOWN — up to four live WASAPI streams released at
+                        // once. `CpalBackend` has no `Drop` impl, so it happens right here, and
+                        // it must be serialised against every other cpal entry point:
+                        // `device.rs`'s own header says two concurrent `default_host()` callers
+                        // "fault natively and hard-kill the process (the default unwind strategy
+                        // can't catch a native SIGSEGV/abort)" — an access violation, not a Rust
+                        // panic, so nothing upstream can contain it.
+                        //
+                        // The racing party is ordinary: `available_devices()` runs on the
+                        // `audio_devices` and `detect_rigs` commands — opening Settings, or
+                        // pressing Detect. This side fires on a device change and on a
+                        // dual-radio switch.
+                        //
+                        // Two other teardowns already take this lock (`device.rs`'s reopen path
+                        // and `monitor.rs`); this one did not. When one use of a lock is guarded
+                        // and its sibling is not, the unguarded one is the bug.
+                        //
+                        // Taking it HERE and not around `reopen_audio` is deliberate: the open
+                        // path acquires it internally and `std::sync::Mutex` is not reentrant,
+                        // so wrapping the call would deadlock the radio loop.
+                        //
+                        // NOTE this is NOT the 1.2.0 startup-crash path — a card that cannot
+                        // open returns `Err`, so the retry timer spins without ever reaching
+                        // this swap. It is a real race on the device-change path regardless.
+                        {
+                            let _host_guard = crate::device::AUDIO_HOST_LOCK
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            *backend = b;
+                        }
                         audio_rebuilt = true;
                         // New stream, new ring: republish so the producer rebuilds its resampler
                         // and clears its window rather than smearing two sample rates together.
@@ -3362,11 +3501,27 @@ impl RadioLoop {
                     // `mode_giveup` below.
                     // MODE FIRST HERE TOO — same reason as the force path above: a dial written
                     // in the outgoing mode's convention is reinterpreted when the mode lands.
-                    let mode_changed = md != self.last_mode;
-                    // Apply the section's mode — unless it's the one we already gave up on
-                    // (rig kept rejecting it). `last_mode` only ever holds a mode actually
+                    // A mode we have GIVEN UP on is not "changed" — it is ABANDONED, and the
+                    // give-up belongs in the predicate itself rather than only on the mode
+                    // set below. Field report (FT-950, 2026-08-12): "whenever I click on the
+                    // frequency in dxspot, my radio goes haywire." A spot click lands the
+                    // Digital section, whose mode is PKTUSB; a rig with no DATA-USB submode
+                    // refuses it, the ladder gives up, and from then on `md` is forever
+                    // "PKTUSB" while `last_mode` is forever the "USB" fallback — so a bare
+                    // `md != last_mode` is PERMANENTLY true. The `|| mode_changed` term on
+                    // the dial re-push below then fired a real `F <hz>` round-trip every
+                    // 20 ms tick for as long as the operator stayed in the section, and each
+                    // push deferred `last_rig_poll`/`last_freq_poll`, so the dial mirror and
+                    // the heavy poll never came due again (frozen S-meter, a readout that
+                    // stopped following the VFO, hand-tuning stomped back within one tick).
+                    // The pitch-walk fix is untouched: a mode that ACTUALLY reached the rig
+                    // still re-asserts the dial in the destination mode's convention.
+                    // Pinned by `a_given_up_mode_stops_the_per_tick_dial_storm`.
+                    let mode_changed =
+                        md != self.last_mode && self.mode_giveup.as_deref() != Some(md.as_str());
+                    // Apply the section's mode. `last_mode` only ever holds a mode actually
                     // applied, so a give-up never masquerades as success.
-                    if mode_changed && self.mode_giveup.as_deref() != Some(md.as_str()) {
+                    if mode_changed {
                         match rig.set_mode(&md, retry_passband(&md, self.mode_fail_count)) {
                             Ok(()) => {
                                 self.last_mode = md.clone();
@@ -3400,17 +3555,16 @@ impl RadioLoop {
                                     self.mode_fail_count = 0;
                                     let saw_reject = std::mem::take(&mut self.mode_saw_reject);
                                     // Last rung of the ladder: a rig that actively REFUSED a
-                                    // DATA submode still speaks the plain sideband — put it
-                                    // there (filter untouched) so the operator only has to
-                                    // press the rig's DATA key, instead of a dead-end note.
-                                    // Sent ONCE; link-fault give-ups skip it (the link, not
-                                    // the mode, is the problem — don't add more traffic).
-                                    let fallback = if saw_reject {
-                                        fallback_sideband(&md)
-                                            .filter(|base| rig.set_mode(base, -1).is_ok())
-                                    } else {
-                                        None
-                                    };
+                                    // DATA submode still speaks the plain mode underneath —
+                                    // put it there (filter untouched) so the operator only has
+                                    // to press the rig's DATA key, instead of a dead-end note.
+                                    // Sent ONCE. Link-fault give-ups skip it (the link, not the
+                                    // mode, is the problem — don't add more traffic) EXCEPT for
+                                    // the FM family, which falls back unconditionally because
+                                    // the alternative is keying an SSTV image in whatever mode
+                                    // the rig was left in — see `giveup_fallback`.
+                                    let fallback = giveup_fallback(&md, saw_reject)
+                                        .filter(|base| rig.set_mode(base, -1).is_ok());
                                     if let Some(base) = fallback {
                                         self.last_mode = base.to_string();
                                     }
@@ -3451,13 +3605,20 @@ impl RadioLoop {
             // pushed before the first genuine assert — with last_fm starting None it
             // would otherwise fire on the first FM tick with no operator action, i.e. a
             // launch-time command surviving the flip.
-            if can_retune && md == "FM" && self.rig_asserted {
+            // THE FAMILY, not the word (`mode_is_fm_family`): an SSTV image on an FM channel is
+            // commanded PKTFM, so a bare `md == "FM"` test read the picture as "we have left FM"
+            // and cleared the tracker mid-over — then re-pushed the shift, offset and CTCSS the
+            // moment the image finished. The rig keeps its repeater settings either way (nothing
+            // ever tells it to stop), so this was churn rather than a dropped shift; it is still
+            // a CAT write into the seconds right after an over, and the tracker is supposed to
+            // mean "the machine's settings are current".
+            if can_retune && mode_is_fm_family(&md) && self.rig_asserted {
                 if self.last_fm.as_ref() != Some(&fm) {
                     let _ = rig.set_fm_repeater(&fm.0, fm.1, fm.2);
                     self.last_fm = Some(fm);
                     retuned = true;
                 }
-            } else if md != "FM" {
+            } else if !mode_is_fm_family(&md) {
                 self.last_fm = None;
             }
 
@@ -4413,19 +4574,39 @@ impl RadioLoop {
         // reaches the rig. Operator-initiated only: the engine's poll_rtty_one gates
         // on tx_enabled + privileges + the Rtty operating-mode ownership + not-tuning
         // (the FT8/FT1 slot sequencer is gated off for non-Digital the same way, so
-        // the two can never key together). Send-and-done — no diddle idle in v1: PTT
-        // drops when the stop bit ends (tx_until_ms expiry), on Stop/halt (the abort
-        // below), on the watchdog trip (poll_rtty_one arms the abort), and at app
-        // exit (the SHUTDOWN flush).
+        // the two can never key together). PTT drops when the stop bit ends
+        // (tx_until_ms expiry), on Stop/halt (the abort below), on the watchdog trip
+        // (poll_rtty_one arms the abort), and at app exit (the SHUTDOWN flush).
+        //
+        // CONTINUOUS TX (the MMTTY "TX" latch) is the second path through this block:
+        // instead of one keyed over per Enter, the operator stays keyed and types into
+        // a live transmission, which idles on DIDDLE (LTRS fill) between keystrokes.
+        // It shares every mechanism above — the same abort, the same tx_until_ms unkey,
+        // the same PTT — and differs in exactly one way that matters here: it has NO
+        // PRECOMPUTED END, so `tx_until_ms` is a deadline this loop must keep pushing
+        // forward instead of one it sets once. Two consequences, both deliberate:
+        //   * each push reaches only RTTY_STREAM_AHEAD_CHARS forward, so a loop that
+        //     wedges expires into an unkey rather than holding the transmitter;
+        //   * the ENGINE re-checks every TX gate on every tick (`poll_rtty_stream`) and
+        //     the loop adds `may_key` here, because a latch outlives the moment it was
+        //     granted and the gates do not.
         {
             // Same hold as the CW keyer: while the loop doesn't own the operator's radio
             // ([`Self::may_key`]) the queue is not polled, so the over waits instead of
             // going out on the outgoing rig.
             let ready = now >= self.rtty_busy_until && self.may_key();
-            let (abort, msg, baud, shift, reverse, fsk_port_line) = {
+            let (abort, msg, stream_tick, baud, shift, reverse, fsk_port_line) = {
                 let mut eng = engine_lock(engine);
                 // Keep the cockpit's sending indicator honest each tick: an over is
                 // "sending" until its computed duration has fully played out.
+                //
+                // ⚠️ DELIBERATELY NOT forced true for the latched period. This flag's
+                // falling edge is the ONLY thing that fires the auto-sequencer's
+                // `on_tx_complete` (`rtty_auto_service`), so pinning it true would hang
+                // a sequencer QSO with the rig keyed. The latch reports itself through
+                // its own flag (`rtty_state().latched`); the two are separate on
+                // purpose. A latched stream keeps this true anyway, without help,
+                // because the look-ahead keeps `rtty_busy_until` in the future.
                 eng.set_rtty_sending(now < self.rtty_busy_until);
                 // Service the RTTY auto-sequencer BEFORE poll_rtty_one, so any over it
                 // produces this tick (on_tx_complete → the next reply, or a silence
@@ -4433,10 +4614,51 @@ impl RadioLoop {
                 // fires exactly once per over, gated on the sending flag just stamped
                 // above — which shares one Unix-millis clock epoch with the RX feed.
                 eng.rtty_auto_service();
+                let baud = eng.rtty_baud();
+                // --- Continuous TX: the per-tick gate re-check + this tick's feed. ---
+                // `may_key` is the one gate the engine cannot see (a deferred handoff /
+                // a CAT hold means `rig` is not the operator's radio). For a QUEUE the
+                // loop holds the work; for a latched TRANSMITTER holding is not an
+                // option — it is already keyed — so this drops the latch outright.
+                let stream_tick = if self.may_key() {
+                    // Look-ahead budget: how many characters short of
+                    // RTTY_STREAM_AHEAD_CHARS the queued audio is. Zero when the ring is
+                    // already fed far enough — and the engine is still called, because
+                    // the GATE CHECK must run on every tick even when the feed does not.
+                    let char_ms = 7.5 * (1000.0 / baud);
+                    let ahead_ms = (self.rtty_busy_until - now).max(0.0);
+                    let deficit = RTTY_STREAM_AHEAD_CHARS * char_ms - ahead_ms;
+                    let want = if deficit <= 0.0 {
+                        0
+                    } else {
+                        ((deficit / char_ms).ceil() as usize).min(RTTY_STREAM_MAX_CHUNK)
+                    };
+                    eng.poll_rtty_stream(want)
+                } else {
+                    eng.drop_rtty_latch();
+                    RttyStreamTick::Idle
+                };
+                // The latch owns the transmitter from its first tick (before any
+                // generator exists) until its closing chunk has been rendered.
+                let latch_owns =
+                    !matches!(stream_tick, RttyStreamTick::Idle) || self.rtty_stream.is_some();
                 (
+                    // AFTER poll_rtty_stream, so an abort IT armed (a gate went down, a
+                    // ceiling tripped) is consumed on this same tick rather than one
+                    // tick later with the transmitter still up.
                     eng.take_rtty_abort(),
-                    if ready { eng.poll_rtty_one() } else { None },
-                    eng.rtty_baud(),
+                    // The message queue is HELD while the latch streams: two RTTY
+                    // transmitters on one rig is not a thing, and `rtty_send_text`
+                    // routes macros into the stream instead while latched. HELD, not
+                    // dropped — anything queued before the latch went up keys normally
+                    // once it comes down.
+                    if ready && !latch_owns {
+                        eng.poll_rtty_one()
+                    } else {
+                        None
+                    },
+                    stream_tick,
+                    baud,
                     eng.rtty_shift_hz(),
                     eng.rtty_reverse(),
                     eng.rtty_fsk_port().map(|p| (p, eng.rtty_fsk_line())),
@@ -4472,9 +4694,226 @@ impl RadioLoop {
                     self.tx_until_ms = None;
                 }
                 self.rtty_busy_until = 0.0; // a fresh send after Stop keys immediately
+                                            // The latched generator dies with the over it was rendering. Keeping
+                                            // it would resume the NEXT transmission mid-phase and mid-shift —
+                                            // and, worse, would make a stop look like a pause.
+                self.rtty_stream = None;
                 {
                     let mut eng = engine_lock(engine);
                     eng.set_rtty_sending(false);
+                }
+            }
+            // --- Continuous TX: render and key this tick's chunk. ---
+            // Everything below is gated by `stream_tick`, which the engine only
+            // returns as something other than `Idle` with every TX gate re-checked
+            // THIS tick. The keying itself is deliberately the same as the one-shot
+            // path's — same PTT, same output ring, same tx_until_ms — because the
+            // parts of RTTY TX that are already proven on the air should not fork.
+            match &stream_tick {
+                RttyStreamTick::Idle => {
+                    // Not streaming. If a generator is still open, the stream just
+                    // ENDED CLEANLY (the operator clicked TX off and everything they
+                    // typed has been rendered) rather than being aborted — the abort
+                    // branch above already took that case and dropped the generator.
+                    // Close it with one diddle carrying the key-DOWN ramp: ending a
+                    // latched carrier at full amplitude is a key click, which is the
+                    // very thing this module's shaped envelope exists to prevent.
+                    // PTT then drops on the ordinary `tx_until_ms` expiry.
+                    //
+                    // ⚠️ `may_key` AGAIN, on the close. The two ways to get here are
+                    // not the same: a CLEAN end deserves the ramp, but a latch
+                    // dropped because the loop no longer owns the operator's radio
+                    // (a deferred handoff) must render NOTHING — `rig` is the other
+                    // radio by then, and this path plays audio without commanding
+                    // PTT, which on a VOX station keys whatever is listening. Drop
+                    // the generator and let the abort's flush be the whole ending.
+                    if let Some(mut st) = self.rtty_stream.take().filter(|_| self.may_key()) {
+                        let code = st.enc.diddle();
+                        let bits = tempo_core::rtty::code_bits(&[code]);
+                        let chunk_ms = 7.5 * (1000.0 / baud);
+                        if !st.key_cfg.3 {
+                            let buf = st.afsk.char_chunk(&bits, true);
+                            if !buf.is_empty() {
+                                backend.play(&buf);
+                            }
+                        }
+                        // FSK needs no closing ramp — its keyer thread parks the line
+                        // at mark between batches, which IS the idle condition — but it
+                        // gets the same trailing character so both backends unkey on
+                        // the same schedule.
+                        #[cfg(feature = "serial")]
+                        if st.key_cfg.3 {
+                            if let Some((_, _, k)) = self.rtty_keyer.as_ref() {
+                                k.send(bits.clone(), baud);
+                            }
+                        }
+                        self.rtty_busy_until = self.rtty_busy_until.max(now) + chunk_ms;
+                        let until = self.rtty_busy_until + crate::slot::TX_TAIL_MS;
+                        self.tx_until_ms = Some(self.tx_until_ms.map_or(until, |t| t.max(until)));
+                    }
+                }
+                // Keyed and fed far enough ahead: nothing to render this tick. The
+                // gates were still re-checked to get here.
+                RttyStreamTick::Ahead => {}
+                RttyStreamTick::Text(_) | RttyStreamTick::Diddle => {
+                    // Build (or rebuild, on a settings change mid-over) the generator.
+                    // A rebuild restarts the key envelope, so it is a seam the operator
+                    // can hear — which is correct: they changed the shift or the baud,
+                    // and splicing two different waveforms into one carrier would be
+                    // worse than a clean re-key.
+                    let key_cfg = (baud, shift, reverse, fsk_port_line.is_some());
+                    if self.rtty_stream.as_ref().map(|s| s.key_cfg) != Some(key_cfg) {
+                        self.rtty_stream = Some(RttyStream {
+                            enc: tempo_core::rtty::BaudotEncoder::new(true),
+                            afsk: crate::rtty_afsk::AfskStream::new(crate::rtty_afsk::AfskConfig {
+                                space_hz: crate::rtty_afsk::MARK_HZ + shift as f32,
+                                baud,
+                                reverse,
+                                ..crate::rtty_afsk::AfskConfig::default()
+                            }),
+                            key_cfg,
+                            keyed: false,
+                        });
+                    }
+                    // Assert the rig and PTT once per stream, not once per chunk (see
+                    // `RttyStream::keyed`) — but always after an unkey has run under us.
+                    let need_key = self.tx_until_ms.is_none()
+                        || !self.rtty_stream.as_ref().is_some_and(|s| s.keyed);
+                    // Characters → ITA2 codes through the CARRIED encoder, so LTRS/FIGS
+                    // shift state spans the whole latched over exactly as it spans a
+                    // one-shot message. Diddle is LTRS, the standard RTTY idle: it
+                    // holds the far end's decoder in sync and lands the shift plane in
+                    // letters, and it is what an MMTTY operator hears between words.
+                    //
+                    // Rendered inside a scope that ENDS the borrow of the generator,
+                    // because the keying below needs `self` (the rig assert, the PTT
+                    // publish, the keyer handle) while the generator lives on `self`.
+                    let (bits, chunk_ms, buf) = {
+                        let st = self.rtty_stream.as_mut().expect("just built");
+                        let codes = match &stream_tick {
+                            RttyStreamTick::Text(t) => st.enc.encode(t),
+                            _ => vec![st.enc.diddle()],
+                        };
+                        let bits = tempo_core::rtty::code_bits(&codes);
+                        let chunk_ms = (codes.len() as f64) * 7.5 * (1000.0 / baud);
+                        // The AFSK waveform is rendered here, from the RESUMABLE
+                        // generator that carries the oscillator phase, the cross-fade
+                        // weight and the fractional bit clock across chunks. Calling
+                        // the one-shot generator per character instead would put a
+                        // phase step and a 4 ms hole in the carrier every 165 ms — see
+                        // `AfskStream`. Skipped entirely on the FSK backend, whose bits
+                        // ride the keyline and never become audio.
+                        let buf = if key_cfg.3 {
+                            Vec::new()
+                        } else {
+                            st.afsk.char_chunk(&bits, false)
+                        };
+                        (bits, chunk_ms, buf)
+                    };
+                    if chunk_ms > 0.0 {
+                        // Chunks are contiguous in AUDIO time, so the deadline advances
+                        // from wherever the queued audio ends — `.max(now)` only
+                        // re-bases it after a ring underrun, never extends it further
+                        // than one chunk beyond what is already queued. THIS is the
+                        // bound that makes a wedged loop unkey instead of sticking.
+                        let mut handled = false;
+                        #[cfg(feature = "serial")]
+                        if let Some((port, line)) = &fsk_port_line {
+                            let reopen = self
+                                .rtty_keyer
+                                .as_ref()
+                                .map(|(p, l, _)| p != port || l != line)
+                                .unwrap_or(true);
+                            let mut open_err_msg = None;
+                            if reopen {
+                                match crate::rtty_fsk::FskKeyer::open(
+                                    port,
+                                    crate::rtty_fsk::KeyLine::parse(line),
+                                ) {
+                                    Ok(k) => {
+                                        self.rtty_keyer = Some((port.clone(), line.clone(), k))
+                                    }
+                                    Err(e) => {
+                                        self.rtty_keyer = None;
+                                        open_err_msg = Some(format!(
+                                            "FSK keyline: {e}. If the port name is right, check \
+                                             that nothing else (CAT, another app) has it open — \
+                                             or use the AFSK backend."
+                                        ));
+                                    }
+                                }
+                            }
+                            let open_err = self.rtty_keyer.is_none();
+                            let mut ptt_err = false;
+                            if !open_err && need_key {
+                                self.ensure_commanded(rig); // assert dial/mode before the key
+                            }
+                            if let Some((_, _, k)) = self.rtty_keyer.as_ref() {
+                                if need_key {
+                                    self.publish_tx_intent_now(); // before keying
+                                    ptt_err = rig.ptt(true).is_err();
+                                }
+                                k.send(bits.clone(), baud);
+                                self.rtty_busy_until = self.rtty_busy_until.max(now) + chunk_ms;
+                                let until = self.rtty_busy_until + crate::slot::TX_TAIL_MS;
+                                self.tx_until_ms =
+                                    Some(self.tx_until_ms.map_or(until, |t| t.max(until)));
+                            }
+                            {
+                                let mut eng = engine_lock(engine);
+                                if open_err {
+                                    // Nothing can key on this backend, so the latch is
+                                    // a lie — drop it rather than leave the operator
+                                    // looking at a lit TX button that transmits nothing.
+                                    eng.drop_rtty_latch();
+                                    self.rtty_stream = None;
+                                }
+                                eng.set_rtty_keyer_error(if open_err {
+                                    open_err_msg
+                                } else if ptt_err {
+                                    Some(
+                                        "FSK keyer: the rig didn't accept PTT. Check your PTT \
+                                         method (CAT, or the separate PTT line) — the FSK data \
+                                         line never doubles as PTT."
+                                            .to_string(),
+                                    )
+                                } else {
+                                    None
+                                });
+                            }
+                            handled = true;
+                        }
+                        if !handled {
+                            // Soundcard AFSK (rig in LSB): the same output ring the FT8
+                            // modem and the one-shot RTTY path use, so the operator's
+                            // tx_level / drive / ALC discipline applies unchanged.
+                            if !buf.is_empty() {
+                                let mut ptt_err = false;
+                                if need_key {
+                                    self.ensure_commanded(rig); // assert before key
+                                    self.publish_tx_intent_now(); // before keying
+                                    ptt_err = rig.ptt(true).is_err();
+                                }
+                                backend.play(&buf);
+                                self.rtty_busy_until = self.rtty_busy_until.max(now) + chunk_ms;
+                                let until = self.rtty_busy_until + crate::slot::TX_TAIL_MS;
+                                self.tx_until_ms =
+                                    Some(self.tx_until_ms.map_or(until, |t| t.max(until)));
+                                if ptt_err {
+                                    let mut eng = engine_lock(engine);
+                                    eng.set_rtty_keyer_error(Some(
+                                        "AFSK keyer: the rig didn't accept PTT. Check your PTT \
+                                         method + that Nexus's audio output is routed to the rig \
+                                         (like FT8)."
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(st) = self.rtty_stream.as_mut() {
+                            st.keyed = true;
+                        }
+                    }
                 }
             }
             if let Some(text) = msg {
@@ -6669,6 +7108,20 @@ fn mode_is_data(md: &str) -> bool {
     m.starts_with("PKT") || m.starts_with("DATA")
 }
 
+/// Is `md` in the FM FAMILY — plain `FM` or its data submode `PKTFM`?
+///
+/// FM is a CLASS, not a sideband, and since an SSTV image on an FM channel is sent in
+/// `PKTFM` (see `Engine::fm_mode_word`) the class now has two spellings. Everything that
+/// keys off "the rig is in FM" has to ask about the family rather than the word — today that
+/// is the repeater shift/offset/CTCSS tracker in the retune block, which a bare `md == "FM"`
+/// test reset the instant a picture was queued, and the give-up fallback ladder.
+fn mode_is_fm_family(md: &str) -> bool {
+    matches!(
+        md.trim().to_ascii_uppercase().as_str(),
+        "FM" | "PKTFM" | "FM-D" | "PKT-FM"
+    )
+}
+
 fn passband_for(md: &str) -> i32 {
     match md.trim().to_ascii_uppercase().as_str() {
         "PKTUSB" | "PKTLSB" => 3000,
@@ -6701,7 +7154,33 @@ fn fallback_sideband(md: &str) -> Option<&'static str> {
     match md.trim().to_ascii_uppercase().as_str() {
         "PKTUSB" | "DATA-U" | "PKT-U" => Some("USB"),
         "PKTLSB" | "DATA-L" | "PKT-L" => Some("LSB"),
+        // The FM data submode's plain form. NOT a sideband — the name is historical — but the
+        // same question: what does this rig still speak underneath the DATA submode? Landing an
+        // SSTV image on plain FM keeps the EMISSION right (an FM channel stays FM) and costs
+        // only the codec routing; landing it on a sideband would put SSB on an FM repeater.
+        "PKTFM" | "FM-D" | "PKT-FM" => Some("FM"),
         _ => None,
+    }
+}
+
+/// The plain mode to fall back to after the ladder has given up on `md` — [`fallback_sideband`]
+/// plus the rule about WHEN it may be sent.
+///
+/// For a DATA-on-SSB submode the fallback is gated on `saw_reject` (an explicit `RPRT -1`): a run
+/// of link faults proves nothing about the rig's modes, and pushing another command down a mute
+/// link is noise. **The FM family is the deliberate exception** — it falls back unconditionally,
+/// timeouts included. The asymmetry is TX safety, not tidiness: `PKTFM` is only ever commanded
+/// while an SSTV image is queued on an FM channel, so the alternative to "assert plain FM" is
+/// "key a picture in whatever mode the rig happens to be in", and a rig that answers an unknown
+/// mode word with SILENCE (the slow-CI-V / mute-rig case `mode_giveup_note` was written for)
+/// never reaches an `RPRT -1` at all. One extra `M FM` on a possibly-dead link is a cheap price
+/// for the emission being right; if that command also fails, the caller's `.filter` drops it and
+/// the give-up note says so honestly.
+fn giveup_fallback(md: &str, saw_reject: bool) -> Option<&'static str> {
+    if saw_reject || mode_is_fm_family(md) {
+        fallback_sideband(md)
+    } else {
+        None
     }
 }
 
@@ -8120,6 +8599,74 @@ mod tests {
         let n = mode_giveup_note("CW", true, None);
         assert!(n.contains("refused CW"), "{n}");
         assert!(!n.contains("USB-D"), "{n}");
+    }
+
+    /// ⭐ THE SAFETY NET UNDER THE CLASS-WIDE `PKTFM` CHANGE (audit, 2026-08-12).
+    ///
+    /// `PKTFM` is commanded only while an SSTV image is queued on an FM channel, and it goes to
+    /// EVERY rig on that path — including ones nobody here can test. The whole safety story is
+    /// that a rig which does not know the word degrades to plain **FM**, never to a sideband.
+    ///
+    /// The SSB half of this ladder is gated on `saw_reject` for a good reason (a run of
+    /// timeouts proves nothing about the rig's modes, so don't push more traffic at a mute
+    /// link). Applied to `PKTFM` that gate is a trap: a backend that answers an unknown mode
+    /// word by TIMING OUT never sets `saw_reject`, so it would get no fallback at all and the
+    /// image would key in whatever mode the rig was left in. The FM family therefore falls back
+    /// unconditionally.
+    #[test]
+    fn the_fm_family_falls_back_to_plain_fm_even_when_the_rig_never_says_no() {
+        // The word itself resolves to the plain FM underneath it.
+        assert_eq!(fallback_sideband("PKTFM"), Some("FM"));
+        assert_eq!(fallback_sideband("FM-D"), Some("FM"));
+        assert_eq!(fallback_sideband("pkt-fm"), Some("FM"));
+
+        // THE AUDIT'S CASE: a mute rig / slow CI-V link, no explicit RPRT -1 anywhere in the
+        // run. The SSB submodes still (correctly) send nothing; FM still lands on FM.
+        assert_eq!(
+            giveup_fallback("PKTFM", false),
+            Some("FM"),
+            "a rig that answers PKTFM with silence must still be put in plain FM — the \
+             alternative is keying a picture in whatever mode it was left in"
+        );
+        assert_eq!(
+            giveup_fallback("PKTUSB", false),
+            None,
+            "unchanged for the SSB submodes: a link fault is not evidence about the rig's modes"
+        );
+
+        // …and an explicit rejection is unchanged for everything.
+        assert_eq!(giveup_fallback("PKTFM", true), Some("FM"));
+        assert_eq!(giveup_fallback("PKTUSB", true), Some("USB"));
+        assert_eq!(giveup_fallback("PKTLSB", true), Some("LSB"));
+
+        // A plain mode has nothing underneath it to fall back to, either way round.
+        assert_eq!(giveup_fallback("FM", false), None);
+        assert_eq!(giveup_fallback("USB", true), None);
+
+        // The note stays accurate for the new word: no bogus "select USB-D by hand" advice on
+        // an FM channel — the fallback landed, so it says which mode the rig is now in.
+        let n = mode_giveup_note("PKTFM", true, Some("FM"));
+        assert!(n.contains("refused PKTFM"), "{n}");
+        assert!(n.contains("FM-D"), "must name the rig-side mode: {n}");
+    }
+
+    /// FM is a CLASS with two spellings now, and everything that keys off "the rig is in FM"
+    /// has to ask about the family. The repeater shift/offset/CTCSS tracker is the one that
+    /// touches the air.
+    #[test]
+    fn the_fm_family_covers_the_data_submode_but_not_the_sidebands() {
+        assert!(mode_is_fm_family("FM"));
+        assert!(mode_is_fm_family("PKTFM"));
+        assert!(mode_is_fm_family(" fm-d "));
+        // The negative half — a family test that answered yes to everything would silently
+        // keep pushing repeater settings while the rig sat in USB.
+        assert!(!mode_is_fm_family("PKTUSB"));
+        assert!(!mode_is_fm_family("USB"));
+        assert!(
+            !mode_is_fm_family("FMN"),
+            "narrow FM is not a word Nexus commands"
+        );
+        assert!(!mode_is_fm_family(""));
     }
 
     #[test]
@@ -10193,6 +10740,119 @@ mod tests {
     }
 
     #[test]
+    fn a_cat_port_hold_drops_a_latched_rtty_over() {
+        // The second route by which the loop stops owning the operator's radio: the
+        // Test-CAT probe takes the serial port and `rig` becomes `Rig::vox()`, which
+        // has no control channel — so a latch that kept feeding would be a keyed
+        // transmitter with nothing able to unkey it.
+        //
+        // WHAT DROPS IT, stated honestly because it is not what it looks like:
+        // `halt_tx_for_context_change` → `halt_tx` → `drop_rtty_latch`, which BOTH
+        // edges of the hold run (taking the port, and resuming from it), exactly as
+        // the radio-switch scene below runs it. The loop's own `may_key` drop is
+        // belt-and-braces on both routes and NO test here isolates it — verified by
+        // mutation: removing it leaves this test and the switch scene green, because
+        // the halt got there first. It is kept because it is the guard that does not
+        // depend on every future route into `!may_key()` remembering to halt TX, and
+        // because a latch is the one transmission for which "hold the work" is not a
+        // safe default. What this test pins is the OUTCOME, which is what matters on
+        // the air: a CAT hold never leaves a latched carrier up.
+        let (engine, mut state, mut backend, mut rig, t) = latched_rtty_scene();
+        assert!(rig.keyed, "scene guard: the latch is keying");
+        assert!(state.rtty_stream.is_some());
+        state.cat_hold_active = true; // the probe has taken the port
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        state
+            .step(
+                &engine,
+                &mut backend,
+                &mut rig,
+                &sinks,
+                t,
+                &mut ra,
+                &mut rr,
+                &mut station,
+            )
+            .unwrap();
+        assert!(
+            !engine.lock().unwrap().rtty_latched(),
+            "a CAT port hold must DROP a latched transmitter — the loop cannot unkey \
+             through a port it has handed away, so holding the feed is not an option"
+        );
+        assert!(!rig.keyed, "…and it must unkey within the same tick");
+        assert!(
+            state.rtty_stream.is_none(),
+            "…and drop the generator with it"
+        );
+    }
+
+    #[test]
+    fn a_contended_switch_drops_a_latched_rtty_over_rather_than_holding_it() {
+        // The CONTINUOUS-TX version of the scene below, and it needs a different
+        // answer. A queued over is HELD across a contended switch — not polled, so
+        // not keyed, and it waits. A LATCHED over cannot be held: it is already
+        // keyed, and `rig` is the radio the operator switched AWAY from, so it is
+        // dropped instead.
+        //
+        // THREE INDEPENDENT THINGS drop it here, which is why this scene survives
+        // the removal of any one of them (all three checked by mutation):
+        // `set_active_radio` → `halt_tx_for_context_change` → `halt_tx` →
+        // `drop_rtty_latch`, synchronously before the loop ticks at all; the
+        // per-tick predicate, because that same `halt_tx` leaves `tx_enabled`
+        // false; and the loop's `may_key` guard. So this test does NOT isolate a
+        // mechanism — it pins the END-TO-END claim, which is the one that matters
+        // on the air: a radio switch, however contended, never resumes a latched
+        // carrier onto whichever radio the loop finds when the pool frees up.
+        let mut sc = contended_switch_scene(|e| {
+            e.set_operating_mode("rtty", true);
+            e.set_frequency(14.085, "20m", "RTTY");
+        });
+        let pool = Arc::clone(&sc.pool);
+        {
+            let mut e = sc.engine.lock().unwrap();
+            e.set_rtty_latched(true)
+                .expect("scene guard: the engine accepted the latch");
+        }
+        // The latch is up and keying on the CURRENT radio…
+        sc.tick(20.0);
+        assert!(
+            sc.engine.lock().unwrap().rtty_latched(),
+            "scene guard: the latch is up before the switch"
+        );
+        // …then the operator switches radios and the pool is contended.
+        let guard = pool.lock().unwrap();
+        {
+            let mut e = sc.engine.lock().unwrap();
+            e.set_active_radio(sc.incoming);
+        }
+        for tick in 2..=5 {
+            sc.tick(f64::from(tick) * 20.0);
+            assert!(
+                sc.state.handoff_deferred,
+                "scene guard: the contended pool keeps the handoff deferred"
+            );
+        }
+        assert!(
+            !sc.engine.lock().unwrap().rtty_latched(),
+            "a latched transmitter must be DROPPED by a contended switch, never held — \
+             holding it means keying the radio the operator switched away from"
+        );
+        assert!(
+            sc.state.rtty_stream.is_none(),
+            "the generator must go with it, so nothing can be resumed onto the new radio"
+        );
+        drop(guard);
+        for tick in 6..=10 {
+            sc.tick(f64::from(tick) * 20.0);
+        }
+        assert!(
+            !sc.engine.lock().unwrap().rtty_latched(),
+            "…and it stays down once the switch lands: re-keying is the operator's call"
+        );
+    }
+
+    #[test]
     fn a_contended_switch_never_keys_an_rtty_over_on_the_outgoing_radio() {
         // RTTY's message pump is gated the same way as CW's — on the POLL, so an unpolled
         // over stays in the queue. The AFSK backend (the default: no FSK keyline port) keys
@@ -11352,6 +12012,243 @@ mod tests {
         assert!(backend.flush_calls > 0, "queued AFSK audio was flushed");
     }
 
+    /// A radio loop with continuous RTTY TX latched and keying, plus the clock it
+    /// has reached. Ticks are 20 ms, the real loop rate.
+    fn latched_rtty_scene() -> (Arc<Mutex<Engine>>, RadioLoop, MockBackend, Rig, f64) {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_operating_mode("rtty", false); // arms TX, as a manual mode does
+            e.set_rtty_latched(true).unwrap();
+        }
+        let (mut backend, mut rig, mut state) = (MockBackend::new(), Rig::vox(), loop_state());
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut t = 100.0;
+        for _ in 0..5 {
+            state
+                .step(
+                    &engine,
+                    &mut backend,
+                    &mut rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+            t += 20.0;
+        }
+        (engine, state, backend, rig, t)
+    }
+
+    #[test]
+    fn a_latched_rtty_over_keys_one_carrier_that_idles_on_diddle() {
+        // THE FEATURE, at the layer that actually keys: with continuous TX latched
+        // and NOTHING typed, the loop holds the transmitter up and keeps feeding it
+        // — the RTTY idle (LTRS diddle), not silence and not an unkey. Send-and-done
+        // would have dropped PTT ~415 ms after the last stop bit.
+        let (engine, mut state, mut backend, mut rig, mut t) = latched_rtty_scene();
+        assert!(rig.keyed, "the latch never keyed the rig");
+        assert!(
+            !backend.played.is_empty(),
+            "nothing went to the transmitter"
+        );
+        let after_latch = backend.played.len();
+
+        // Two seconds of ticks with no typing at all — well past the ~415 ms at
+        // which send-and-done unkeys, and past a whole character time many times.
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let char_ms = 7.5 * (1000.0 / 45.45);
+        for _ in 0..100 {
+            state
+                .step(
+                    &engine,
+                    &mut backend,
+                    &mut rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+            // ⚠️ THE STUCK-CARRIER BOUND, checked on EVERY tick. A latched over has
+            // no precomputed end, so the only thing between a wedged loop and a
+            // stuck transmitter is how far ahead the unkey deadline may be pushed:
+            // the look-ahead plus at most one over-sized chunk, plus the tail.
+            let ahead = state.tx_until_ms.unwrap_or(t) - t;
+            assert!(
+                ahead
+                    <= (RTTY_STREAM_AHEAD_CHARS + RTTY_STREAM_MAX_CHUNK as f64) * char_ms
+                        + crate::slot::TX_TAIL_MS,
+                "the unkey deadline was pushed {ahead:.0} ms ahead — a wedged loop would \
+                 hold PTT that long"
+            );
+            t += 20.0;
+        }
+        assert!(
+            rig.keyed,
+            "the carrier dropped while latched with nothing typed"
+        );
+        assert!(
+            backend.played.len() > after_latch,
+            "the transmitter is keyed but nothing is being fed — that is dead air under a \
+             held PTT, which reads on the air as a dropout"
+        );
+        // The idle is a real Baudot stream at the real rate, not a filler tone: two
+        // seconds of ticks must have produced ≈2 s of 12 kHz audio.
+        let fed_ms = backend.played.len() as f64 / 12.0;
+        assert!(
+            (1600.0..2600.0).contains(&fed_ms),
+            "fed {fed_ms:.0} ms of audio across 2 s of ticks — the look-ahead is not pacing"
+        );
+    }
+
+    #[test]
+    fn every_stop_unkeys_a_latched_rtty_over_within_one_tick() {
+        // ⭐ THE STOP LINE, at the transmitter. A latched over is the one RTTY
+        // transmission that is still keying when the operator reaches for a stop,
+        // and each of these is a control the cockpit actually renders. One tick is
+        // the whole budget: flush the queued audio (the only thing that stops a VOX
+        // rig), drop PTT, and stay stopped.
+        for (name, stop) in [
+            ("Stop TX / the dock's Esc-Stop macro", 0),
+            ("halt_tx (header Stop TX, UDP HaltTx)", 1),
+            ("the TX-enable latch", 2),
+            ("leaving the RTTY section", 3),
+        ] {
+            let (engine, mut state, mut backend, mut rig, t) = latched_rtty_scene();
+            assert!(rig.keyed, "{name}: the scene did not key");
+            assert!(
+                state.rtty_stream.is_some(),
+                "{name}: the scene is not streaming"
+            );
+            backend.flush_calls = 0;
+            let played_before = backend.played.len();
+            {
+                let mut e = engine.lock().unwrap();
+                match stop {
+                    0 => e.rtty_stop(),
+                    1 => e.halt_tx(),
+                    2 => e.set_tx_enabled(false),
+                    _ => e.set_operating_mode("phone", false),
+                }
+            }
+            let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+            let mut station = StationSinks::new();
+            state
+                .step(
+                    &engine,
+                    &mut backend,
+                    &mut rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+            assert!(
+                !rig.keyed,
+                "{name}: the transmitter was still keyed a tick later"
+            );
+            assert!(
+                backend.flush_calls > 0,
+                "{name}: the queued audio was not flushed — on a VOX rig the audio IS what \
+                 holds the transmitter up, so dropping CAT PTT alone stops nothing"
+            );
+            assert!(state.tx_until_ms.is_none(), "{name}: the TX hold survived");
+            // The GENERATOR dies with the over, and an abort renders no closing
+            // chunk: a stop CUTS a transmission, it does not end one politely.
+            //
+            // Checked on the loop's own state rather than only on the rig, because
+            // every stop here also arms `slot_tx_abort`, whose hard-stop later in
+            // this same tick (search `abort_has_something_to_cut`) unkeys and
+            // flushes a second time — so `!rig.keyed` alone passes even with this
+            // branch broken, and would leave a stale generator to key back up
+            // behind any future stop that did not happen to arm the slot abort.
+            assert!(
+                state.rtty_stream.is_none(),
+                "{name}: the latched generator survived the stop"
+            );
+            assert_eq!(
+                backend.played.len(),
+                played_before,
+                "{name}: the abort queued MORE audio instead of cutting"
+            );
+            // …and it STAYS stopped: nothing re-keys on the following ticks.
+            let played = backend.played.len();
+            let mut t2 = t + 20.0;
+            for _ in 0..10 {
+                state
+                    .step(
+                        &engine,
+                        &mut backend,
+                        &mut rig,
+                        &sinks,
+                        t2,
+                        &mut ra,
+                        &mut rr,
+                        &mut station,
+                    )
+                    .unwrap();
+                t2 += 20.0;
+            }
+            assert!(!rig.keyed, "{name}: the latch keyed back up after the stop");
+            assert_eq!(
+                backend.played.len(),
+                played,
+                "{name}: audio kept being fed after the stop"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wedged_loop_unkeys_a_latched_over_instead_of_holding_it() {
+        // The failure mode a latch introduces that send-and-done does not have: the
+        // unkey deadline is one the loop must keep pushing forward, so a loop that
+        // STOPS TICKING must expire into an unkey rather than a stuck carrier.
+        // Simulated exactly: latch, key, then let the clock jump past the deadline
+        // with no ticks in between (a stalled CAT read, a wedged thread).
+        let (engine, mut state, mut backend, mut rig, t) = latched_rtty_scene();
+        assert!(rig.keyed);
+        let deadline = state
+            .tx_until_ms
+            .expect("a latched over holds PTT to a deadline");
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        // The next tick lands after the deadline. Nothing was stopped, nothing was
+        // aborted — only time passed.
+        assert!(
+            deadline - t < 2_000.0,
+            "the deadline must be near, not minutes out"
+        );
+        {
+            // Wedge the ENGINE too: the loop resumes into a section change it never
+            // saw, which is the realistic version of this (the operator gave up and
+            // navigated away while the app was stuck).
+            let mut e = engine.lock().unwrap();
+            e.set_operating_mode("phone", false);
+        }
+        state
+            .step(
+                &engine,
+                &mut backend,
+                &mut rig,
+                &sinks,
+                deadline + 1.0,
+                &mut ra,
+                &mut rr,
+                &mut station,
+            )
+            .unwrap();
+        assert!(!rig.keyed, "a wedged loop left the transmitter keyed");
+        assert!(state.tx_until_ms.is_none());
+    }
+
     #[test]
     fn tx_off_cuts_an_over_the_slot_path_did_not_key() {
         // The OTHER half of the operator's 2026-07-31 spec: only the SLOT (FT) over is
@@ -11590,6 +12487,235 @@ mod tests {
         assert!(
             !engine.lock().unwrap().sstv_sending(),
             "sending cleared on completion"
+        );
+    }
+
+    /// A logging rigctld stub parked on `dial_hz`. `reject_pkt` makes it answer `RPRT -1` to
+    /// every `M PKT…` — the rig with no DATA submode for the mode we asked for. The dial is a
+    /// parameter because the stub's `f` reply IS the read-back the loop adopts as a knob QSY:
+    /// the shared `mock_pkt_rejecting_rigctld` answers 14.074, which would drag a 2 m scene off
+    /// its own channel mid-test.
+    fn mock_rigctld_on(dial_hz: u64, reject_pkt: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log2 = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                });
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let l = line.trim().to_string();
+                    log2.lock().unwrap().push(l.clone());
+                    let dial = format!("{dial_hz}\n");
+                    let reply = if l == "f" {
+                        dial.as_str()
+                    } else if reject_pkt && l.starts_with("M PKT") {
+                        "RPRT -1\n"
+                    } else {
+                        "RPRT 0\n"
+                    };
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// An engine parked on the 2 m SSTV calling channel in FM — the tester's exact setup
+    /// (`sstv_tune` is what the channel pick calls). NO image queued: the send is a separate
+    /// operator act in both tests below, made AFTER a settling tick, because that is the real
+    /// order and the difference is not cosmetic. `sstv_tune`'s QSY arms the slot-TX abort
+    /// (`halt_tx_for_context_change`), and an image queued before the loop has run even once
+    /// is cut by that stale abort on the tick it keys.
+    fn sstv_fm_engine() -> Arc<Mutex<Engine>> {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.sstv_tune(144.500, "2m", "FM");
+        }
+        engine
+    }
+
+    /// ⭐ THE FIELD REPORT ON THE WIRE (FTDX10 + IC-9700, 2026-08-12): *"as soon as I start
+    /// TXing it switches to USB-D."* Measured as the rigctld command log, in order, because
+    /// the thing that was wrong is WHAT THE RADIO WAS TOLD in the instant before PTT — not a
+    /// value in a snapshot.
+    #[test]
+    fn an_sstv_image_on_an_fm_channel_commands_the_fm_data_word_before_it_keys() {
+        let engine = sstv_fm_engine();
+        let (addr, log) = mock_rigctld_on(144_500_000, false);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut run = |state: &mut RadioLoop, rig: &mut Rig, backend: &mut MockBackend, t: f64| {
+            state
+                .step(
+                    &engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        };
+        // Settle on the channel first — the operator picks it, listens, then presses Send.
+        run(&mut state, &mut rig, &mut backend, 1000.0);
+        let idle = log.lock().unwrap().clone();
+        assert!(
+            idle.iter().any(|l| l.starts_with("M FM")),
+            "precondition: an FM calling channel is plain FM while idle, so voice and the \
+             speaker work normally — {idle:?}"
+        );
+        let mark = log.lock().unwrap().len();
+
+        // THE SEND.
+        engine
+            .lock()
+            .unwrap()
+            .sstv_send(vec![0.2f32; 36_000], "Scottie 1".to_string())
+            .unwrap();
+        for i in 1..4 {
+            run(
+                &mut state,
+                &mut rig,
+                &mut backend,
+                1000.0 + f64::from(i) * 20.0,
+            );
+        }
+
+        let lines = log.lock().unwrap()[mark..].to_vec();
+        // POSITIVE CONTROL: the image must actually have keyed, or every claim below is
+        // vacuous — a scene that refused the send would pass "never commanded PKTUSB".
+        let keyed = lines
+            .iter()
+            .position(|l| l == "T 1")
+            .unwrap_or_else(|| panic!("control: the image must key — {lines:?}"));
+        let mode_cmd = lines
+            .iter()
+            .position(|l| l.starts_with("M PKTFM"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "an FM channel must be commanded the FM DATA submode, so the codec reaches \
+                     the modulator without changing the emission — {lines:?}"
+                )
+            });
+        assert!(
+            mode_cmd < keyed,
+            "the mode has to reach the rig BEFORE the key, not after: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("M PKTUSB") || l.starts_with("M PKTLSB")),
+            "an SSB DATA submode on an FM repeater input is the reported bug: {lines:?}"
+        );
+        // The repeater shift/offset/CTCSS tracker must still recognise the rig as being in the
+        // FM family while the picture is on the air (`mode_is_fm_family`) — a bare `md == "FM"`
+        // test dropped it the instant the image was queued.
+        assert!(
+            state.last_fm.is_some(),
+            "the FM repeater settings must still be tracked as current during an image"
+        );
+    }
+
+    /// ⚠️ THE OTHER HALF OF A CLASS-WIDE CAT CHANGE: what a rig that does NOT know `PKTFM`
+    /// gets. It must be plain FM — the mode the very same FM authority commanded while idle —
+    /// and never a sideband.
+    ///
+    /// The rung that carries this is NOT the give-up fallback, and the audit was right to ask:
+    /// inside one image the ladder gets exactly ONE attempt. `md` becomes PKTFM on the tick the
+    /// job is queued, the retune block tries it, the SSTV block keys later in that same tick,
+    /// and from then on `can_retune` is false (PTT held) so nothing retries until the picture
+    /// ends. What holds the emission right is that **a failed `set_mode` never advances
+    /// `last_mode`** — so the radio is left in the FM it was already in. The 30-try give-up and
+    /// its unconditional FM fallback are the backstop for the states where the ladder does run
+    /// out; they are unit-tested in `the_fm_family_falls_back_to_plain_fm_even_when_the_rig_
+    /// never_says_no`, which is the honest place for them.
+    #[test]
+    fn a_rig_that_refuses_pktfm_keys_the_image_in_fm_never_a_sideband() {
+        let engine = sstv_fm_engine();
+        let (addr, log) = mock_rigctld_on(144_500_000, true);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut run = |state: &mut RadioLoop, rig: &mut Rig, backend: &mut MockBackend, t: f64| {
+            state
+                .step(
+                    &engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        };
+        run(&mut state, &mut rig, &mut backend, 1000.0); // settle on the channel, in FM
+        engine
+            .lock()
+            .unwrap()
+            .sstv_send(vec![0.2f32; 36_000], "Scottie 1".to_string())
+            .unwrap();
+        for i in 1..4 {
+            run(
+                &mut state,
+                &mut rig,
+                &mut backend,
+                1000.0 + f64::from(i) * 20.0,
+            );
+        }
+
+        let lines = log.lock().unwrap().clone();
+        // POSITIVE CONTROLS. Both are needed: "it stayed in FM" proves nothing if the word was
+        // never asked for, and "never a sideband" proves nothing if the image never keyed.
+        assert!(
+            lines.iter().any(|l| l.starts_with("M PKTFM")),
+            "control: the loop must have commanded PKTFM and been refused — {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "T 1"),
+            "control: the image must key even though the mode word was refused — {lines:?}"
+        );
+        // The idle FM the channel had already commanded is what the rig is left in.
+        assert!(
+            lines.iter().any(|l| l.starts_with("M FM")),
+            "control: the channel commands plain FM while idle — that is the mode a refused \
+             PKTFM falls back to by NOT moving — {lines:?}"
+        );
+        assert_eq!(
+            state.last_mode, "FM",
+            "a refused mode must not be credited: the rig is still in FM, and the operator is \
+             one front-panel DATA press from a working picture"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("M USB")
+                || l.starts_with("M LSB")
+                || l.starts_with("M PKTUSB")
+                || l.starts_with("M PKTLSB")),
+            "never a sideband on an FM channel — not as a command, not as a fallback: {lines:?}"
         );
     }
 
@@ -13086,6 +14212,68 @@ mod tests {
     }
 
     #[test]
+    fn a_device_change_releases_the_old_card_before_probing_the_new_one() {
+        // akhepcat, 2026-08-13 (#2 / #8), on a build whose `tempo-audio` is byte-identical
+        // to the one 1.3.0 shipped: choosing input and output in SEPARATE saves fails —
+        // `audio input device "plughw:CARD=CODEC,DEV=0" is not available`, and the CODEC is
+        // missing from the offered list entirely. Choosing both in ONE save works.
+        //
+        // That asymmetry is the whole tell. One save opens both from a single fresh
+        // backend; two saves make the second rebuild probe a card OUR OWN still-live
+        // streams are holding, and ALSA opens a card once. The lazy-probe and CARD= alias
+        // fixes could not help — the holder was never another app, it was us.
+        //
+        // The mock card below refuses exactly the way ALSA does.
+        let card = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        let mut backend = MockBackend::new().holding(Arc::clone(&card));
+        let mut rig = Rig::vox();
+        let mut state = loop_state();
+        let (sinks, mut rr) = (no_sinks(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+
+        // The operator picks a different device on the SAME card (the second save).
+        engine.lock().unwrap().apply_settings(Settings {
+            audio_in: "plughw:CARD=CODEC,DEV=0".to_string(),
+            ..Settings::default()
+        });
+        let mut ra = {
+            let card = Arc::clone(&card);
+            move |_t: &Transport| -> Result<MockBackend, String> {
+                if card.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Precisely the error the operator saw.
+                    Err("audio input device \"plughw:CARD=CODEC,DEV=0\" is not available".into())
+                } else {
+                    Ok(MockBackend::new())
+                }
+            }
+        };
+        state
+            .step(
+                &engine,
+                &mut backend,
+                &mut rig,
+                &sinks,
+                0.0,
+                &mut ra,
+                &mut rr,
+                &mut station,
+            )
+            .unwrap();
+
+        let err = engine.lock().unwrap().snapshot().radio.audio_error.clone();
+        assert!(
+            err.is_none(),
+            "the rebuild must release the old card BEFORE probing the replacement; \
+             holding it makes any device on the same card impossible to select. got: {err:?}"
+        );
+        assert!(
+            state.audio_retry_at.is_none(),
+            "a successful open must not arm the retry timer"
+        );
+    }
+
+    #[test]
     fn recording_without_a_voice_mic_records_from_the_shared_input() {
         let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
         engine.lock().unwrap().start_recording(); // no voice_mic_device configured
@@ -13390,6 +14578,272 @@ mod tests {
         assert_eq!(
             state.last_mode, "USB",
             "last_mode tracks what was actually applied (the fallback)"
+        );
+    }
+
+    // ---- the DX-spot click storm (operator report, FT-950, 2026-08-12) ----
+
+    /// A rigctld shaped like the FT-950: it has NO DATA-USB submode, so every `M PKT*` is
+    /// refused (`RPRT -1`) and the rig's live mode is left alone — but it answers `m` and
+    /// `f` TRUTHFULLY, which is what [`mock_pkt_rejecting_rigctld`] deliberately does not
+    /// (it replies `RPRT 0` to `m`, and the band-cross re-assert correctly reads that as
+    /// "no evidence" and stands down). A truthful `m` is the whole point here: it is what
+    /// lets `reassert_mode_after_band_cross` see a mode that disagrees with `md` and act
+    /// on it.
+    fn mock_pkt_rejecting_rig_with_mode_read(start_hz: u64) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rec = Arc::clone(&log);
+        std::thread::spawn(move || {
+            let mut cur_hz = start_hz;
+            let mut live_mode = "USB".to_string();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut out = match stream.try_clone() {
+                    Ok(o) => o,
+                    Err(_) => return,
+                };
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    rec.lock().unwrap().push(line.clone());
+                    let mut p = line.split_whitespace();
+                    let reply: String = match p.next() {
+                        Some("M") => {
+                            let m = p.next().unwrap_or("USB");
+                            if m.starts_with("PKT") {
+                                // No DATA submode on this radio — refuse, mode unchanged.
+                                "RPRT -1\n".into()
+                            } else {
+                                live_mode = m.to_string();
+                                "RPRT 0\n".into()
+                            }
+                        }
+                        Some("F") => {
+                            cur_hz = p
+                                .next()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(cur_hz);
+                            "RPRT 0\n".into()
+                        }
+                        Some("f") => format!("{cur_hz}\n"),
+                        Some("m") => format!("{live_mode}\n2400\n"),
+                        _ => "RPRT 0\n".into(),
+                    };
+                    if out.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// Count the command lines in a recording rigctld's log that start with `pfx`, from
+    /// `from` onward — so a test can measure a WINDOW of the wire rather than a total.
+    fn count_from(log: &Arc<Mutex<Vec<String>>>, from: usize, pfx: &str) -> usize {
+        log.lock().unwrap()[from..]
+            .iter()
+            .filter(|c| c.starts_with(pfx))
+            .count()
+    }
+
+    /// ⭐ FIELD REPORT (FT-950, 2026-08-12): "whenever I click on the frequency in dxspot,
+    /// my radio goes haywire."
+    ///
+    /// A spot click is the one gesture that changes SECTION MODE + BAND + DIAL at once
+    /// (`Engine::work_spot_split` = `set_operating_mode` then `set_frequency`), and a spot
+    /// in a band's data segment is routed to the Digital section, whose commanded mode is
+    /// `PKTUSB`. On a rig with no DATA-USB submode — the FT-950's `MD0n;` table has DATA-LSB
+    /// but no DATA-USB — the bounded ladder runs its 30 attempts and latches
+    /// `mode_giveup = "PKTUSB"`, landing the radio on plain USB (`last_mode = "USB"`).
+    ///
+    /// THE DEFECT: the steady-state retune computed `mode_changed = md != self.last_mode`
+    /// WITHOUT consulting the give-up. Past the give-up `md` is forever "PKTUSB" and
+    /// `last_mode` is forever "USB", so `mode_changed` was permanently true — and the
+    /// `|| mode_changed` term on the dial re-push (the FTDX10 pitch-walk fix, which must
+    /// stay) therefore fired `F <hz>` on EVERY 20 ms tick, for as long as the section
+    /// stayed Digital. `Rig::set_freq` has no dedupe, so each one is a real round-trip.
+    ///
+    /// It also BLINDS the app, which is the other half of "haywire": every successful push
+    /// sets `retuned`, and `retuned` pushes `last_rig_poll`/`last_freq_poll` forward — so
+    /// the fast dial mirror and the 750 ms heavy poll never come due again. The S-meter
+    /// freezes, the readout stops following the VFO, and a hand-tune is stomped back within
+    /// one tick.
+    ///
+    /// Measured on the wire, not inferred: `F ` lines in the steady window past the give-up.
+    #[test]
+    fn a_given_up_mode_stops_the_per_tick_dial_storm() {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.set_operating_mode("phone", true);
+            e.set_frequency(14.250, "20m", "USB");
+        }
+        let (addr, log) = mock_pkt_rejecting_rigctld();
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        // The real loop's tick, so the READ-BACK deadlines below are the real ones.
+        const TICK_MS: f64 = 20.0;
+        let mut t = 0.0;
+        let mut run = |state: &mut RadioLoop, rig: &mut Rig, backend: &mut MockBackend, t: f64| {
+            state
+                .step(
+                    &engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        };
+        run(&mut state, &mut rig, &mut backend, t); // settle Phone / 20 m
+        t += TICK_MS;
+
+        // THE CLICK: an FT8-segment spot, i.e. the Digital section on a new dial.
+        engine.lock().unwrap().work_spot("digital", 14.074, "20m");
+
+        // Run the ladder out. Generous cap; the assertion below is that we really landed in
+        // the post-give-up state, not that it took a particular number of ticks.
+        for _ in 0..(MODE_SET_MAX_TRIES + 8) {
+            run(&mut state, &mut rig, &mut backend, t);
+            t += TICK_MS;
+        }
+        assert_eq!(
+            state.mode_giveup.as_deref(),
+            Some("PKTUSB"),
+            "precondition: the rig refused the DATA submode and the ladder gave up"
+        );
+        assert_eq!(
+            state.last_mode, "USB",
+            "precondition: the radio was left on the plain-sideband fallback"
+        );
+
+        let mark = log.lock().unwrap().len();
+        // POSITIVE CONTROL for the counter and the mock: the ladder window MUST contain dial
+        // writes, or a zero below would prove nothing about the fix (a log that records no
+        // `F ` at all, or a loop that stopped stepping, would read as a pass).
+        assert!(
+            count_from(&log, 0, "F ") > 0,
+            "control: the click itself must have written the dial — {:?}",
+            log.lock().unwrap()
+        );
+
+        // THE STEADY WINDOW. Nothing changes: no click, no QSY, no band change. The operator
+        // is just sitting there. 60 ticks = 1.2 s, long enough for the deferred fast dial
+        // mirror (570 ms + 180 ms) and the 750 ms heavy poll to come due.
+        const STEADY_TICKS: usize = 60;
+        for _ in 0..STEADY_TICKS {
+            run(&mut state, &mut rig, &mut backend, t);
+            t += TICK_MS;
+        }
+
+        // Both symptoms are counted BEFORE either is asserted, so a failure reports the
+        // whole picture rather than stopping at the first one.
+        let (writes, reads) = (count_from(&log, mark, "F "), count_from(&log, mark, "f"));
+        assert_eq!(
+            writes, 0,
+            "a mode the rig has been GIVEN UP on must not keep claiming the dial re-push: \
+             {STEADY_TICKS} idle ticks past the give-up wrote the dial {writes} times \
+             (pre-fix: one per tick, forever) and read it back {reads} times"
+        );
+        // The other half of the report — the starved read-backs. With the storm running,
+        // every push set `retuned`, which deferred `last_rig_poll`/`last_freq_poll` past the
+        // next tick's deadline every single tick, so this was 0: the frozen S-meter and the
+        // readout that stops following the VFO.
+        assert!(
+            reads > 0,
+            "the dial read-back must come due again once the storm stops (a frozen S-meter / \
+             a readout that no longer follows the VFO is the same defect): {reads} reads in \
+             {STEADY_TICKS} ticks — {:?}",
+            log.lock().unwrap()[mark..].to_vec()
+        );
+    }
+
+    /// The band-cross half of the same report, from the adversarial audit.
+    ///
+    /// `reassert_mode_after_band_cross` exists for the FTDX10 band-stacking window: after a
+    /// dial write that crosses a band, read the rig's REAL mode back and re-assert once if
+    /// the rig's own band register overrode us. It consulted nothing about whether the mode
+    /// it is re-asserting ever reached the rig in the first place — so on a radio that
+    /// refuses `PKTUSB`, the read-back reports "USB", disagrees with `md`, and it sends a
+    /// SECOND doomed `M PKTUSB 3000` on the very tick the ladder's own attempt already
+    /// failed. Bounded rather than a storm, but it is pure waste inside the rig's band-change
+    /// settling window, which is the worst possible moment.
+    ///
+    /// NOTE the guard this needs is NOT `mode_giveup == md` (the audit's suggestion): the
+    /// force path CLEARS `mode_giveup` before it retunes, so that test is false exactly here.
+    /// The invariant that holds on both paths is `last_mode` — which by construction only
+    /// ever holds a mode the rig actually took.
+    #[test]
+    fn a_band_cross_never_re_asks_for_a_mode_the_rig_just_refused() {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.set_operating_mode("digital", true);
+            e.set_frequency(14.074, "20m", "USB");
+        }
+        let (addr, log) = mock_pkt_rejecting_rig_with_mode_read(14_074_000);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut t = 0.0;
+        let mut run = |state: &mut RadioLoop, rig: &mut Rig, backend: &mut MockBackend, t: f64| {
+            state
+                .step(
+                    &engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        };
+        // Settle on 20 m digital and run the ladder out, so the radio is parked on plain USB.
+        for _ in 0..(MODE_SET_MAX_TRIES + 8) {
+            run(&mut state, &mut rig, &mut backend, t);
+            t += 20.0;
+        }
+        assert_eq!(
+            state.mode_giveup.as_deref(),
+            Some("PKTUSB"),
+            "precondition: the rig refused the DATA submode and the ladder gave up"
+        );
+
+        // THE BAND-CROSSING QSY: the operator picks 15 m. This is a FORCE retune, so the
+        // give-up is cleared and the ladder is entitled to ONE fresh attempt this tick.
+        let mark = log.lock().unwrap().len();
+        engine.lock().unwrap().pick_band("15m", None);
+        run(&mut state, &mut rig, &mut backend, t);
+
+        let pkt = count_from(&log, mark, "M PKTUSB");
+        // POSITIVE CONTROL: the tick must have tried the mode at all, or "not twice" is
+        // vacuous — a tick that commanded nothing would pass the real assertion below.
+        assert!(
+            pkt > 0,
+            "control: the band pick must command the section's mode: {:?}",
+            log.lock().unwrap()[mark..].to_vec()
+        );
+        assert_eq!(
+            pkt,
+            1,
+            "the band-cross re-assert must not re-ask for a mode this same tick already \
+             proved the rig refuses — one attempt per tick, not two: {:?}",
+            log.lock().unwrap()[mark..].to_vec()
         );
     }
 
