@@ -24,6 +24,7 @@ import { halvingChain } from '../sstvResample'
 import { drawIdPlate, normalizeCall } from '../sstvIdOverlay'
 import { SSTV_PANEL_IDS, type SstvPanelId, type PanelLayoutApi } from '../features/panelState'
 import {
+  atuTune,
   getLicensedBandPlan,
   getSstvState,
   haltTx,
@@ -413,11 +414,18 @@ function fmtUtc(iso: string): string {
     : iso
 }
 
-/** One completed gallery image: BMP over the asset protocol, with a
- * fetch-and-rasterize canvas fallback if this webview's <img> lacks BMP
- * decode (older WebKitGTK). Outside the shell (tests) → caption-only card. */
+/** One completed gallery image over the asset protocol.
+ *
+ * Images received from 2026-08-15 on are PNG, which every webview decodes natively — the
+ * canvas fallback below is for the `.bmp` files older galleries are full of, on webviews whose
+ * <img> cannot read BMP (older WebKitGTK). It is SCOPED TO .bmp on purpose: `drawBmp` parses a
+ * BMP header, so pointing it at a PNG that failed for some OTHER reason (a scope miss, a
+ * deleted file) would silently draw nothing — a blank box that looks exactly like the bug it
+ * would be hiding. Anything not .bmp keeps the broken-image indicator, which is at least
+ * honest. Outside the shell (tests) → caption-only card. */
 function GalleryThumb({ entry }: { entry: SstvGalleryEntry }) {
   const src = assetUrl(entry.path)
+  const isBmp = /\.bmp$/i.test(entry.path)
   const [fallback, setFallback] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
@@ -443,7 +451,7 @@ function GalleryThumb({ entry }: { entry: SstvGalleryEntry }) {
       src={src}
       alt={alt}
       loading="lazy"
-      onError={() => setFallback(true)}
+      onError={() => isBmp && setFallback(true)}
     />
   )
 }
@@ -1213,6 +1221,11 @@ export function SstvView({ snap, theme = 'default', onSnap, active = true, onSet
             title: 'RF output power — set it against a Tune carrier, below ALC',
           }}
           onTune={(on) => void setTune(on).then((st) => onSnap?.(st))}
+          onAtuTune={() =>
+            void atuTune()
+              .then((st) => onSnap?.(st))
+              .catch((e) => pushToast(String(e), 'error'))
+          }
           onStopTx={() => void haltTx()}
           modeIndicator={
             <span

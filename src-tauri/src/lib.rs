@@ -13,6 +13,7 @@
 //! - `select_peer { peer }` -> `AppSnapshot`
 //! - `set_tier { tier }` -> `AppSnapshot`  (tier is "TempoFast" | "FT8" | "FT4" | "TempoDeep")
 //! - `get_spectrum_row` -> `Spectrum`      (one waterfall row)
+//! - `get_scope_row`     -> `Spectrum`      (one rig-scope row, over the scope's own span)
 //!
 //! ## Live radio (`--features radio`, built on the station PC)
 //! With the `radio` feature, `run()` spawns [`tempo_audio::service::run_radio`]
@@ -33,6 +34,10 @@
 mod chains;
 mod pouncer;
 mod window_state;
+/// Pins `assetProtocol.scope` to where SSTV images are actually written — they are one fact in
+/// two files, and when they drifted every gallery preview silently went blank.
+#[cfg(test)]
+mod sstv_scope_test;
 
 use chains::{panel_key, panel_label, Instance};
 use std::path::PathBuf;
@@ -3624,6 +3629,31 @@ fn us_state_hint(call: &str, grid: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The roster / log-record answer to "where is this station" — a US state OR a Canadian
+/// province, both as ADIF `STATE` codes (the field's actual definition is "primary
+/// administrative subdivision", which is the province for DXCC 1).
+///
+/// Superset of [`us_state_hint`], which stays exactly what it is — the WAS need hint — because
+/// WAS is US-only. Where both answer they answer the same, so the roster's cell and a NewState
+/// pill still cannot name different places; the province is only ever reached where the WAS
+/// hint has nothing to say.
+///
+/// PROVINCE FIRST, and that ordering is the fix rather than an accident. `us_state_hint` falls
+/// back to `state_for_grid`, whose table is generated from US state polygons alone, so a 4-char
+/// cell that straddles the border answers with the US side of it: EN82 holds Windsor, Ontario
+/// and Detroit, and a VE3 in Windsor came out "MI". The callsign knows the country; the grid
+/// cell does not, so the callsign is asked first.
+///
+/// None of the 13 Canadian codes collides with a WAS state (pinned in
+/// `propagation::province`), which is what makes it safe for this to feed the same worked-states
+/// set and the same logged `STATE` field the US side does.
+fn subdivision_hint(call: &str, grid: Option<&str>) -> Option<String> {
+    if let Some(p) = propagation::province_for_call(call) {
+        return Some(p.to_string());
+    }
+    us_state_hint(call, grid)
+}
+
 #[tauri::command]
 fn get_fcc_states_status() -> FccStatesStatus {
     fcc_status()
@@ -7165,6 +7195,41 @@ fn get_spectrum_row(
     Ok(eng.spectrum_row())
 }
 
+/// One row for the RIG SCOPE, computed over the span that scope is actually showing.
+///
+/// Same fast path and same fallbacks as `get_spectrum_row`; the difference is that the caller
+/// says what window it is drawing, and gets its 512 bins spread across THAT window instead of
+/// across the whole 0-4000 Hz capture. On the CW cockpit's 300-1100 Hz view that is 1.5625 Hz
+/// per bin against 7.8125, five times finer for the same payload.
+///
+/// The span request rides this poll rather than a separate setter — see
+/// `SpectrumFeed::scope_row` for why the fallback is structural rather than sequenced. A caller
+/// showing a native RF panadapter, or asking for a span that is not a sane audio window, simply
+/// gets what `get_spectrum_row` would have returned.
+#[tauri::command(async)]
+fn get_scope_row(
+    lo_hz: f32,
+    hi_hz: f32,
+    window: Option<String>,
+    feed: State<'_, tempo_app::engine::SpectrumFeed>,
+    state: State<'_, SharedEngine>,
+) -> Result<Spectrum, String> {
+    // An absent or unrecognised tag is the DEFAULT, stated here rather than hidden in
+    // `from_tag`: a scope that keeps drawing at the shipped window is the right failure for a
+    // UI that is out of step with this build, and it is the only failure that cannot surprise
+    // an operator who never opened the control.
+    let win = window
+        .as_deref()
+        .and_then(tempo_core::spectrum::WindowN::from_tag)
+        .unwrap_or_default();
+    if let Some(row) = feed.scope_row(lo_hz, hi_hz, win) {
+        return Ok(row);
+    }
+    // Nothing published yet — the Companion/UDP path, exactly as in `get_spectrum_row`.
+    let eng = engine_lock(&state);
+    Ok(eng.spectrum_row())
+}
+
 /// The live meters (RX audio level + CAT S-meter), read lock-free off the meter bus — never
 /// the engine mutex, which the radio loop holds across blocking CAT (the same stall that used
 /// to freeze the waterfall would freeze a snapshot-fed needle). The meter widgets poll this at
@@ -9507,6 +9572,19 @@ fn set_tune(state: State<'_, SharedEngine>, on: bool) -> Result<AppSnapshot, Str
     Ok(eng.snapshot())
 }
 
+/// Ask the radio to run its OWN built-in antenna tuner (Hamlib `RIG_FUNC_TUNER`) — the ATU
+/// tune-up WSJT-X fires from a right-click on Tune. Unlike [`set_tune`], which plays our carrier
+/// through the sound card, the rig produces its own; and unlike [`set_rig_func`], which toggles
+/// receive-side DSP, this KEYS THE TRANSMITTER — so it goes through `Engine::atu_tune_gate` (TX
+/// armed, inside the operator's privileges, transmitter idle, and the rig actually has a tuner)
+/// and comes back as `Err(reason)` when any of that is not true. Never a silent no-op.
+#[tauri::command(async)]
+fn atu_tune(state: State<'_, SharedEngine>) -> Result<AppSnapshot, String> {
+    let mut eng = engine_lock(&state);
+    eng.atu_tune()?;
+    Ok(eng.snapshot())
+}
+
 /// Stop transmitting now: drop any queued frames and clear the TX indicator.
 #[tauri::command(async)]
 fn halt_tx(state: State<'_, SharedEngine>) -> Result<AppSnapshot, String> {
@@ -9769,15 +9847,14 @@ fn set_license_class(state: State<'_, SharedEngine>, class: String) -> Result<Ap
     Ok(eng.snapshot())
 }
 
-/// The bands the operator may use in the CURRENT operating mode, each parked at the START of
-/// their licensed segment (CW-segment start in CW, phone-segment start in Phone) — the
-/// per-cockpit band dropdown. Bands with no privilege for this class+mode are omitted; Open
-/// shows the conventional starts. (60 m is omitted — it's channelized; tune it manually.)
-#[tauri::command(async)]
-fn get_licensed_band_plan(
-    state: State<'_, SharedEngine>,
-    mode: String,
-) -> Result<Vec<tempo_app::bandplan::BandChannel>, String> {
+/// The bands the phone/CW dropdown offers `class` in `mode`, each parked at its licensed
+/// home dial. Split out of [`get_licensed_band_plan`] so the list and the privilege filter
+/// that trims it can be driven directly by a test, with no engine and no Tauri state — the
+/// band that is MISSING from a list is invisible to every test that goes through the command.
+fn licensed_bands(
+    class: tempo_app::settings::LicenseClass,
+    mode: tempo_app::settings::OperatingMode,
+) -> Vec<tempo_app::bandplan::BandChannel> {
     use tempo_app::bandplan::BandChannel;
     use tempo_app::settings::OperatingMode;
     const BANDS: &[(&str, &str)] = &[
@@ -9791,6 +9868,11 @@ fn get_licensed_band_plan(
         ("12m", "HF"),
         ("10m", "HF"),
         ("6m", "VHF"),
+        // 4 m is IARU Region 1 only — the US has no allocation at any class (#75). It sits
+        // here rather than being left to the FT dropdown because the privilege filter below
+        // is what decides who sees it: a US class holds no 4 m segment and never sees the
+        // row, while the non-US `Open` class does, in SSB and CW as well as in FT8.
+        ("4m", "VHF"),
         ("2m", "VHF"),
         ("1.25m", "VHF"),
         ("70cm", "UHF"),
@@ -9805,35 +9887,6 @@ fn get_licensed_band_plan(
         ("3cm", "UHF"),
         ("1.25cm", "UHF"),
     ];
-    let eng = engine_lock(&state);
-    let class = eng.settings().license_class;
-    // RTTY / SSTV: fixed standard watering-hole channels (like WSJT-X's per-mode
-    // dials), license-filtered per band — a Technician sees only the bands their
-    // class can key there (RTTY rides digital privileges, SSTV rides phone).
-    let lower = mode.to_ascii_lowercase();
-    if lower == "rtty" || lower == "sstv" {
-        let (plan, priv_mode) = if lower == "rtty" {
-            (tempo_app::bandplan::rtty_band_plan(), OperatingMode::Digital)
-        } else {
-            (tempo_app::bandplan::sstv_band_plan(), OperatingMode::Phone)
-        };
-        return Ok(plan
-            .into_iter()
-            .filter(|c| {
-                // Channel band ids may carry a suffix ("2m-call") — privilege-check
-                // the base band, via THE canonicaliser (one home, not a hand-split).
-                let base = tempo_app::bandplan::canonical_band(&c.band);
-                tempo_app::privileges::segment_start(class, &base, priv_mode).is_some()
-            })
-            .collect());
-    }
-    // The caller (the cockpit) passes its mode explicitly — the engine's operating_mode is
-    // set asynchronously on section entry, so reading it here would race the first mount.
-    let mode = match lower.as_str() {
-        "phone" => OperatingMode::Phone,
-        "cw" => OperatingMode::Cw,
-        _ => OperatingMode::Digital,
-    };
     let mut out = Vec::new();
     for (band, group) in BANDS {
         // PHONE goes through THE phone home (`privileges::phone_home`), which lifts an LSB
@@ -9867,7 +9920,49 @@ fn get_licensed_band_plan(
             });
         }
     }
-    Ok(out)
+    out
+}
+
+/// The bands the operator may use in the CURRENT operating mode, each parked at the START of
+/// their licensed segment (CW-segment start in CW, phone-segment start in Phone) — the
+/// per-cockpit band dropdown. Bands with no privilege for this class+mode are omitted; Open
+/// shows the conventional starts. (60 m is omitted — it's channelized; tune it manually.)
+#[tauri::command(async)]
+fn get_licensed_band_plan(
+    state: State<'_, SharedEngine>,
+    mode: String,
+) -> Result<Vec<tempo_app::bandplan::BandChannel>, String> {
+    use tempo_app::settings::OperatingMode;
+    let eng = engine_lock(&state);
+    let class = eng.settings().license_class;
+    // RTTY / SSTV: fixed standard watering-hole channels (like WSJT-X's per-mode
+    // dials), license-filtered per band — a Technician sees only the bands their
+    // class can key there (RTTY rides digital privileges, SSTV rides phone).
+    let lower = mode.to_ascii_lowercase();
+    if lower == "rtty" || lower == "sstv" {
+        let (plan, priv_mode) = if lower == "rtty" {
+            (tempo_app::bandplan::rtty_band_plan(), OperatingMode::Digital)
+        } else {
+            (tempo_app::bandplan::sstv_band_plan(), OperatingMode::Phone)
+        };
+        return Ok(plan
+            .into_iter()
+            .filter(|c| {
+                // Channel band ids may carry a suffix ("2m-call") — privilege-check
+                // the base band, via THE canonicaliser (one home, not a hand-split).
+                let base = tempo_app::bandplan::canonical_band(&c.band);
+                tempo_app::privileges::segment_start(class, &base, priv_mode).is_some()
+            })
+            .collect());
+    }
+    // The caller (the cockpit) passes its mode explicitly — the engine's operating_mode is
+    // set asynchronously on section entry, so reading it here would race the first mount.
+    let mode = match lower.as_str() {
+        "phone" => OperatingMode::Phone,
+        "cw" => OperatingMode::Cw,
+        _ => OperatingMode::Digital,
+    };
+    Ok(licensed_bands(class, mode))
 }
 
 /// Change band / dial frequency / mode live (does not reset the operating mode).
@@ -10625,6 +10720,21 @@ fn set_hold_tx_freq(state: State<'_, SharedEngine>, on: bool) -> Result<AppSnaps
     eng.set_hold_tx_freq(on);
     if let Err(e) = eng.settings().save(&settings_path()) {
         eprintln!("tempo: failed to persist hold-tx: {e}");
+    }
+    Ok(eng.snapshot())
+}
+
+/// Set (or clear) who is at the key — the seat-swap chip, the Field Day panel's Operator
+/// field and the pop-out scoreboard, one write path for all three. A NARROW write — never
+/// `apply_settings` (#54: the heavyweight path resets the mode, clears the TX queue and
+/// re-derives the TX cycle from the caller's snapshot, and a seat swap happens mid-QSO by
+/// definition). Persists; `log_qso` stamps the new operator from the next contact on.
+#[tauri::command(async)]
+fn set_fd_operator(state: State<'_, SharedEngine>, call: String) -> Result<AppSnapshot, String> {
+    let mut eng = engine_lock(&state);
+    let s = eng.set_fd_operator(call);
+    if let Err(e) = s.save(&settings_path()) {
+        eprintln!("tempo: failed to persist field day operator: {e}");
     }
     Ok(eng.snapshot())
 }
@@ -15478,6 +15588,9 @@ pub fn run() {
         meter_feed: meter_feed.clone(),
         ptt_method: settings.ptt_method.clone(),
         rig_model: settings.rig_model,
+        // Seeded here rather than waiting for the first settings tick: the launch of rigctld is
+        // itself what keys an undeclared RTS-wired cable, so a tick later is too late (#44).
+        cat_rts_keys_ptt: settings.cat_rts_keys_ptt,
         serial_port: settings.serial_port.clone(),
         baud: settings.baud,
         rig_conn: settings.rig_conn.clone(),
@@ -15629,12 +15742,17 @@ pub fn run() {
         eng.set_dxcc_resolver(|call| {
             propagation::dxcc::resolve(call).map(|i| i.entity.to_string())
         });
-        // Wire the US-state resolver to the SAME `us_state_hint` the heard side uses
-        // (get_need_alerts / the spot rows). That shared function is the whole point of the
-        // fix: the worked side used to have no resolver at all and could only read a logged
-        // ADIF STATE, which the auto-log path never wrote — so a worked state stayed "needed"
-        // forever. Set BEFORE the log loads so the one-time backfill runs over it.
-        eng.set_state_resolver(us_state_hint);
+        // Wire the subdivision resolver — `us_state_hint`, the SAME function the heard side
+        // uses (get_need_alerts / the spot rows), plus the Canadian province. That shared
+        // function is the whole point of the fix: the worked side used to have no resolver at
+        // all and could only read a logged ADIF STATE, which the auto-log path never wrote —
+        // so a worked state stayed "needed" forever. Set BEFORE the log loads so the one-time
+        // backfill runs over it.
+        //
+        // The province half rides the same wire deliberately: ADIF STATE means "primary
+        // administrative subdivision", so "ON" on a Canadian contact is the correct value for
+        // an export and for TQSL, and no province code can collide with a WAS state.
+        eng.set_state_resolver(subdivision_hint);
         // Grid-rarity gems: geography table + the measured-activity census
         // (demote-only refinement). Restore the persisted census BEFORE any
         // stamping so the first snapshot already shows refined tiers.
@@ -16281,6 +16399,7 @@ pub fn run() {
             set_tier,
             set_source,
             get_spectrum_row,
+            get_scope_row,
             get_meters,
             set_mode,
             get_settings,
@@ -16428,6 +16547,7 @@ pub fn run() {
             route_preview,
             update_radio_profile,
             set_tune,
+            atu_tune,
             halt_tx,
             test_cat,
             set_tx_even,
@@ -16449,6 +16569,7 @@ pub fn run() {
             n3fjp_test_connection,
             set_hold_tx_freq,
             set_blocked_calls,
+            set_fd_operator,
             call_station,
             open_panel_window,
             dock_bandmap_window,
@@ -16740,6 +16861,84 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// The roster's State-or-Province column and the log record's ADIF `STATE` both come from
+    /// `subdivision_hint`. Two things have to hold, and only the first one did.
+    ///
+    /// A Canadian call must resolve to its province — the operator asked for "State or
+    /// Province" and got a US-only column. And it must do so from the CALLSIGN, before the
+    /// grid is consulted: `us_state_hint` falls back to `state_for_grid`, whose table is
+    /// generated from US state polygons, so a border cell answers with the US side of the
+    /// border. EN82 holds Windsor, Ontario AND Detroit — a VE3 in Windsor was labelled "MI".
+    #[test]
+    fn a_canadian_call_reads_its_province_even_from_a_border_grid() {
+        assert_eq!(
+            super::subdivision_hint("VE3ABC", Some("EN82")).as_deref(),
+            Some("ON"),
+            "the callsign says Ontario; the shared border cell must not overrule it"
+        );
+        assert_eq!(
+            super::subdivision_hint("VY2ABC", None).as_deref(),
+            Some("PE"),
+            "a province resolves with no grid at all — the numeral is the whole input"
+        );
+        // The US side is unchanged: no FCC index is loaded in a unit test, so this is the
+        // grid fallback, which must still answer for a US call.
+        assert_eq!(
+            super::subdivision_hint("W9XYZ", Some("EN52")).as_deref(),
+            Some("WI"),
+            "US stations keep the state hint they already had"
+        );
+        assert_eq!(super::subdivision_hint("G0ABC", Some("IO91")), None);
+    }
+
+    /// #75: 4 m shipped in ONE of the two band dropdowns. The FT/digital cockpit reads
+    /// `Engine::band_plan` → `bandplan::ft8_band_plan`, which has 4 m at 70.154; the phone
+    /// and CW cockpits read THIS list, which did not. So a Region-1 operator could work
+    /// 4 m FT8 and then watch the band vanish the moment they switched to SSB or CW.
+    ///
+    /// Driving `licensed_bands` rather than the command is the point: the defect was a
+    /// band ABSENT from a hardcoded list, and nothing that asserts on the rows the command
+    /// returns can see a row that was never built.
+    #[test]
+    fn the_phone_and_cw_dropdowns_offer_4m_to_a_region_1_operator() {
+        use tempo_app::settings::LicenseClass::{Extra, General, Open, Technician};
+        use tempo_app::settings::OperatingMode::{Cw, Phone};
+        let ch = |class, mode| {
+            super::licensed_bands(class, mode)
+                .into_iter()
+                .find(|c| c.band == "4m")
+        };
+        // `Open` is the non-US class — the only licensee with a 4 m allocation, and the
+        // default class, so this is what an operator who never set one sees. Phone parks at
+        // the bottom of the all-mode segment (the 6 m 50.100 shape); CW lifts off the
+        // 70.000 band edge onto the R1 SSB/CW calling frequency, as 20 m CW lifts to 14.030.
+        let phone = ch(Open, Phone).expect("Open must be offered 4 m in the phone dropdown");
+        assert_eq!((phone.dial_mhz, phone.mode.as_str()), (70.100, "USB"));
+        assert_eq!(phone.group, "VHF");
+        assert_eq!(
+            ch(Open, Cw).map(|c| c.dial_mhz),
+            Some(70.200),
+            "a CW pick parks on the 4 m SSB/CW calling frequency"
+        );
+        // …and it stays unkeyable-by-omission for every US class: no FCC 4 m allocation
+        // exists, so the row must not reach their dropdown at all. The 2 m control is what
+        // makes each `None` evidence rather than an empty list.
+        for class in [Technician, General, Extra] {
+            for mode in [Phone, Cw] {
+                assert!(
+                    ch(class, mode).is_none(),
+                    "{class:?} {mode:?}: the US has no 4 m allocation"
+                );
+                assert!(
+                    super::licensed_bands(class, mode)
+                        .iter()
+                        .any(|c| c.band == "2m"),
+                    "control: {class:?} {mode:?} still gets the VHF bands they do hold"
+                );
+            }
+        }
+    }
+
     /// ⭐ THE SESSION HEALTH STORE KEEPS BOTH HALVES. HRDLog and Cloudlog leave no per-QSO
     /// stamp, so this map is the only health they will ever have — and the obvious shape
     /// for it (one slot: `(id, ok, when, detail)`) cannot hold what the panel needs. With
@@ -17164,6 +17363,8 @@ mod tests {
             grid_rarity: None,
             lotw_user: false,
             freq_hz: None,
+            calling: None,
+            state: None,
         };
         let spots = |stations: &[tempo_app::dto::Station], clock: &SlotClock, period: f64| {
             roster_local_spots(
@@ -17251,6 +17452,8 @@ mod tests {
             grid_rarity: None,
             lotw_user: false,
             freq_hz: None,
+            calling: None,
+            state: None,
         };
         // The renumbering, measured rather than asserted from memory: the FT4 index of
         // 17:00 runs ahead of the FT8 index of 18:00, which is impossible on one clock.

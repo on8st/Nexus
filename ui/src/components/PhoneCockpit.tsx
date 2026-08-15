@@ -29,7 +29,9 @@ import {
   startQsoRecording,
   stopQsoRecording,
   setTune,
+  atuTune,
   haltTx,
+  setTxEnabled,
 } from '../api'
 import { pushToast } from '../toast'
 import { RotorStrip } from './RotorStrip'
@@ -238,16 +240,17 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     setNr(pct)
     void setNrLevel(pct / 100)
   }
-  // AGC speed — local optimistic mirror so the segmented highlight flips on click. Reading
+  // AGC speed — the chip lights on the click, then the rig gets the last word. Reading
   // snap.radio.agc directly lagged ~0.75–1.5 s: setAgc's snapshot returns the OLD rig read-back
-  // (rig_agc.or(agc)) until the next RX poll, so the clicked chip wouldn't light up. Sync from
-  // the snapshot when it changes (confirms / corrects), exactly like the NR slider above.
-  const [agc, setAgcLocal] = useState<string | null>(() => snap.radio.agc ?? null)
-  useEffect(() => {
-    if (snap.radio.agc != null) setAgcLocal(snap.radio.agc)
-  }, [snap.radio.agc])
+  // (rig_agc.or(agc)) until the next RX poll, so the clicked chip wouldn't light up. DERIVED
+  // rather than a remembered mirror, because a mirror synced only "when the snapshot changes"
+  // is blind to a REFUSAL — a rig whose Hamlib backend lacks that AGC step answers RPRT -1, the
+  // read-back never moves, and the chip claimed a speed the radio never took.
+  const [agcPick, setAgcPick] = useState<string | null>(null)
+  const agc =
+    agcPick != null && agcPick !== snap.radio.refusedAgc ? agcPick : (snap.radio.agc ?? null)
   const changeAgc = (sp: 'fast' | 'mid' | 'slow') => {
-    setAgcLocal(sp)
+    setAgcPick(sp)
     void setAgc(sp)
       .then((s) => onSnap?.(s))
       .catch(() => {})
@@ -414,6 +417,35 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     // Don't key (or show ON-AIR) outside license privileges — the engine blocks it anyway.
     if (on && !snapRef.current.radio.txAllowed) {
       pushToast('TX locked — this frequency/mode is outside your license privileges', 'info', 3500)
+      return
+    }
+    // TX SWITCHED OFF IS A SECOND, SEPARATE REFUSAL, and until #81 it was a SILENT one.
+    // `Engine::set_ptt` is `on && tx_enabled && tx_allowed()` — two conditions — and this
+    // cockpit only ever showed the second. With TX off the click went to the wire, the wire
+    // discarded it, and `setKeyed(true)` below had ALREADY run: the button lit up red and read
+    // "ON AIR — release to stop" over a transmitter that was not keyed. From the operator's
+    // chair that is indistinguishable from a dead PTT line, which is how #81 was reported
+    // (FTdx10 over USB, nothing wrong with the rig). Stop TX, the TX watchdog and a UDP HaltTx
+    // all leave exactly this state.
+    //
+    // So: say which switch is down, and PUT IT BACK UP. Phone has no other Enable-Tx
+    // affordance on screen — App hides the TopBar's TX cluster in this view, and the header's
+    // TX pill is display-only here (CockpitHeader arms only when it is passed onSetTxEnabled,
+    // which Phone deliberately does not: doing so would replace the ▲ TX on-air pill with an
+    // arm button mid-over, since `transmitting` is the FT slot flag alone) — so a message that
+    // named a switch would name one that is not there, and he would stay stuck until he
+    // navigated out of Phone and back. Arming keys NOTHING by itself, and it is no more than
+    // entering Phone already does (`set_operating_mode` arms TX for the manual modes); the
+    // rig keys on the NEXT press, through the ordinary path below.
+    //
+    // ⚠️ THE ENGINE'S GATE IS UNTOUCHED. This is what the operator is TOLD, not what he is
+    // allowed: set_ptt still refuses while tx_enabled is false, and TX is still only ever
+    // armed by an explicit operator action.
+    if (on && !snapRef.current.radio.txEnabled) {
+      pushToast('TX was off — turned it back on. Press PTT again to talk.', 'info', 4000)
+      void setTxEnabled(true)
+        .then((s) => onSnap?.(s))
+        .catch(() => {})
       return
     }
     setKeyed(on)
@@ -909,6 +941,11 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
         }}
         txActiveLabel="▲ TX"
         onTune={(on) => void setTune(on).then((s) => onSnap?.(s))}
+        onAtuTune={() =>
+          void atuTune()
+            .then((s) => onSnap?.(s))
+            .catch((e) => pushToast(String(e), 'error'))
+        }
         onStopTx={() => void haltTx()}
       >
         {modeMismatch && (
@@ -1195,9 +1232,17 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
             <span className="ph-fd-give-exch mono">{fdExchange}</span>
           </span>
         )}
+        {/* THE BUTTON ANSWERS THREE STATES, NOT TWO (#81). The engine drops a key on either of
+            `tx_enabled` / `tx_allowed` and they are different facts with different remedies:
+            the lock is a licence question (change band or licence class), TX-off is a switch
+            the operator himself, the watchdog or a UDP HaltTx put down. One label covering both
+            is what made #81 unreportable — "PUSH TO TALK" over a rig that could not be keyed,
+            with the operator left to guess between his cable and his software. */}
         <button
           type="button"
-          className={`ph-ptt${keyed ? ' keyed' : ''}`}
+          className={`ph-ptt${keyed ? ' keyed' : ''}${
+            snap.radio.txAllowed && !snap.radio.txEnabled ? ' txoff' : ''
+          }`}
           aria-pressed={lock ? keyed : undefined}
           onPointerDown={onPttDown}
           onPointerUp={onPttUp}
@@ -1221,12 +1266,20 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
           // operator keying up believing Nexus carries his audio. Pinned in
           // PhoneCockpit.structure.test.tsx.
           title={
-            snap.radio.txAllowed
-              ? "Hold to talk (or Space). Toggle 'Lock' for hands-free (then Enter keys/unkeys). You talk on the rig's mic."
-              : 'TX locked — outside your license privileges (pick a band, or change your license in Settings)'
+            !snap.radio.txAllowed
+              ? 'TX locked — outside your license privileges (pick a band, or change your license in Settings)'
+              : !snap.radio.txEnabled
+                ? "Transmit is switched OFF, so keying is discarded — Stop TX, the TX watchdog or a logger's Halt Tx turns it off. Click to enable transmit, then hold to talk. You talk on the rig's mic."
+                : "Hold to talk (or Space). Toggle 'Lock' for hands-free (then Enter keys/unkeys). You talk on the rig's mic."
           }
         >
-          {!snap.radio.txAllowed ? '🔒 TX LOCKED' : keyed ? 'ON AIR — release to stop' : 'PUSH TO TALK'}
+          {!snap.radio.txAllowed
+            ? '🔒 TX LOCKED'
+            : !snap.radio.txEnabled
+              ? '■ TX OFF — CLICK TO ENABLE'
+              : keyed
+                ? 'ON AIR — release to stop'
+                : 'PUSH TO TALK'}
         </button>
         <label className="ph-lock" title="Hands-free: click PTT once to key, again to unkey">
           <input type="checkbox" checked={lock} onChange={(e) => setLock(e.target.checked)} />

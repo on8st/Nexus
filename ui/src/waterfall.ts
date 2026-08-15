@@ -48,7 +48,7 @@ function clamp01(x: number): number {
 }
 
 /** Value at percentile `p`∈[0,1] of an ascending-sorted array (linear interp). */
-function percentile(sorted: number[], p: number): number {
+function percentile(sorted: ArrayLike<number>, p: number): number {
   const n = sorted.length
   if (n === 1) return sorted[0]
   const idx = clamp01(p) * (n - 1)
@@ -60,6 +60,89 @@ function percentile(sorted: number[], p: number): number {
 }
 
 /**
+ * Sort scratch for `agcRange`, reused across calls.
+ *
+ * Four canvases call `agcRange` up to 20x/second each, and it used to build a fresh `number[]`
+ * and sort it every time — ~500 numbers of garbage per row per scope, for a result that is two
+ * floats. `Float64Array`, deliberately NOT `Float32Array`: the rows arrive from JSON as doubles,
+ * and narrowing them here would move the AGC floor in the last few bits — a real (if tiny)
+ * behaviour change to buy nothing, since the win is the allocation, not the width.
+ *
+ * Safe to share: `agcRange` is synchronous and calls nothing that could re-enter it, so no two
+ * users of the scratch are ever live at once.
+ */
+let agcScratch = new Float64Array(0)
+
+/**
+ * Trace peak-hold decay constants for the rig scope (`PhoneScope`), in ms.
+ *
+ * The panadapter trace holds each column's peak and decays it, so a bursty signal does not
+ * strobe at frame rate with every gap in speech or keying (the "flashing vertical line"
+ * report). The hold is REQUIRED — what was wrong was having ONE time constant for two very
+ * different signals:
+ *
+ *   - CW at 25 WPM keys a 48 ms dit. A 400 ms hold gives back 11% of the trace height between
+ *     elements, so keying renders as a static bar and the operator sees no rhythm at all.
+ *   - Voice syllables run ~150-300 ms, and a hold that short would flicker on every one.
+ *
+ * So CW gets `fast` and phone gets `normal`. `slow` is the pre-2026-08 value, kept because it
+ * is the right answer for a very slow or very weak signal and costs one line to keep.
+ */
+export const TRACE_HOLD_MS = { fast: 120, normal: 250, slow: 400 } as const
+
+/**
+ * Fraction of a held trace peak still standing `ms` after the signal stops — `exp(-ms/tau)`.
+ *
+ * Time-based rather than per-frame so the fade runs at the same speed under reduced-motion's
+ * slower row cadence. Exported for the guard: the two ends of this decision (does keying show?
+ * does it strobe?) are arithmetic, and arithmetic can be pinned without a browser.
+ */
+export function traceHoldDecay(ms: number, tauMs: number): number {
+  if (!(tauMs > 0)) return 0
+  return Math.exp(-Math.max(0, ms) / tauMs)
+}
+
+/**
+ * The RIG SCOPE's display window, in dB above the noise floor.
+ *
+ * ⚠️ THE WHOLE POINT IS THAT IT IS FIXED. `agcRange`'s ceiling is the 99.5th percentile — the
+ * signal itself — so the scope re-fitted its own peak to full scale on EVERY row, and a signal
+ * could not get taller because it was already at the top. Measured on a modelled row, the peak
+ * normalises to exactly 1.000 at +12 dB SNR and exactly 1.000 at +40 dB:
+ *
+ *     CW quiet tone  +12dB   ceil=-83.0dBFS   PEAK->1.000
+ *     CW loud tone   +40dB   ceil=-55.0dBFS   PEAK->1.000
+ *
+ * That is the operator's report (2026-08-15): "on my FTDX10 I see big vertical spikes where the
+ * voice is; on Nexus it seems like it's all smoothed out without the aggressive peaks." A
+ * hardware scope has a FIXED vertical scale, so loud draws tall. This restores that.
+ *
+ * 50 dB is chosen against real signal levels rather than taste: a +40 dB voice peak draws at
+ * 80% height, a +12 dB weak one at 24%, and both are unmistakably different — which is the
+ * property that was missing. A signal more than 50 dB over the noise clips at the top, exactly
+ * as it does on a rig, and the Gain slider already widens the window (`applyGainZero` takes it
+ * to 2x at G-1) for anyone who wants the headroom back.
+ *
+ * ANCHORED TO THE NOISE, so it is self-scaling: on a noisy band the floor rises and the window
+ * rises with it. That is why a fixed window does not need a band-conditions control.
+ *
+ * ⚠️ THE FLOOR IT SITS ON MUST BE `WF_FLOOR_PCT`, NOT `agcRange`'s 5% DEFAULT — the scope passed
+ * the default and that was the second half of the same report. A low percentile is a statistic
+ * of the row's LEFT TAIL, which on an audio row is the rig's SSB stopband: measured 42 dB below
+ * the passband noise, which put the noise floor itself at 0.956 of full panel height. The median
+ * lands on the passband noise (see WF_FLOOR_PCT's own note) and is barely moved by a wide phone
+ * signal — 2 dB across a 200-bin voice on the modelled row.
+ *
+ * Measured end to end at 50 dB, floor = median, on a modelled 0-4000 Hz row with a real filter
+ * skirt — this is the whole point of the change, in one table:
+ *
+ *     no signal        peak 0.100   noise 0.100
+ *     CW tone +12 dB   peak 0.280   noise 0.100
+ *     CW tone +40 dB   peak 0.840   noise 0.100
+ */
+export const SCOPE_WINDOW_DB = 50
+
+/**
  * Visual-AGC: a robust floor/ceiling for one (or a window of) waterfall row(s).
  * The floor is the low percentile (the noise) and the ceiling the high
  * percentile (the strong signals) — clipping the outliers so a single hot
@@ -69,17 +152,21 @@ function percentile(sorted: number[], p: number): number {
  * doesn't flicker as a signal keys up.
  */
 export function agcRange(
-  magnitudes: Float32Array | number[],
+  // ArrayLike, so a caller can pass a reusable scratch of its own (PhoneScope's AGC window)
+  // instead of slicing a fresh array per row. Read-only here.
+  magnitudes: ArrayLike<number>,
   loPct = 0.05,
   hiPct = 0.995,
 ): { floor: number; ceil: number } {
-  const arr: number[] = []
+  if (agcScratch.length < magnitudes.length) agcScratch = new Float64Array(magnitudes.length)
+  let n = 0
   for (let i = 0; i < magnitudes.length; i++) {
     const v = magnitudes[i]
-    if (Number.isFinite(v)) arr.push(v)
+    if (Number.isFinite(v)) agcScratch[n++] = v
   }
-  if (arr.length === 0) return { floor: 0, ceil: 1 }
-  arr.sort((a, b) => a - b)
+  if (n === 0) return { floor: 0, ceil: 1 }
+  const arr = agcScratch.subarray(0, n)
+  arr.sort() // TypedArray sorts NUMERICALLY by default — the `number[]` version needed a comparator
   const floor = percentile(arr, loPct)
   let ceil = percentile(arr, hiPct)
   if (!(ceil > floor)) ceil = floor + MIN_SPAN // all-equal / lo>=hi → safe span

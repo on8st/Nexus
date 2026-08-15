@@ -31,6 +31,7 @@
   "radio": {
     "activeVfo": "A",
     "agc": null,
+    "atu": null,
     "audioError": null,
     "band": "20m",
     "beacon": false,
@@ -58,6 +59,7 @@
     "qsoRecording": false,
     "radioConfigWarning": null,
     "recordingWarning": null,
+    "refusedAgc": null,
     "refusedDialMhz": null,
     "rfPower": null,
     "rigConfirmed": false,
@@ -125,6 +127,7 @@
   "stations": [
     {
       "call": "N7GHI",
+      "calling": null,
       "country": null,
       "freqHz": 1500,
       "grid": "DM79",
@@ -134,6 +137,7 @@
       "lotwUser": false,
       "presence": "active",
       "snr": 72,
+      "state": null,
       "tier": "FT4",
       "worked": false
     }

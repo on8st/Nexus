@@ -269,6 +269,7 @@ impl AppState {
                 notch: None,
                 comp: None,
                 vox: None,
+                atu: None, // engine fills from the CAT TUNER probe (None = no ATU on this rig)
                 filter_width_hz: None, // engine fills from the CAT `m` passband read-back
                 rit_hz: 0,
                 xit_hz: 0,
@@ -285,6 +286,7 @@ impl AppState {
                 cat_detail: String::new(),
                 rx_ranges_mhz: Vec::new(),
                 refused_dial_mhz: None,
+                refused_agc: None,
                 cw_keyer: "cat".to_string(),
                 cw_wpm: 25,
                 split_tx_mhz: None,
@@ -843,6 +845,9 @@ impl AppState {
             // Stamped by the engine from the grid-rarity resolver; None here.
             grid_rarity: None,
             freq_hz: h.freq_hz,
+            calling: h.calling.clone(),
+            // Stamped by the engine from the subdivision resolver; None at this layer.
+            state: None,
         }
     }
 

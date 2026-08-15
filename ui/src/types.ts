@@ -940,6 +940,14 @@ export interface Station {
    * waterfall. A roster click passes it so RX/TX move there like a Band Activity
    * double-click. Null for stations known only from free-text attribution. */
   freqHz?: number | null
+  /** Who this station is calling — the addressee of its last decoded frame. Null when
+   * it addressed nobody, i.e. it is calling CQ (the roster renders that as "CQ"). */
+  calling?: string | null
+  /** Primary administrative subdivision as its ADIF `STATE` code — a US state from the
+   * callsign (FCC index) or the heard grid, or a Canadian province from the regional
+   * numeral. The same hint the needed board uses. Null elsewhere in the world, or when
+   * the FCC index isn't loaded. */
+  state?: string | null
 }
 
 export interface ContestEvent {
@@ -1060,6 +1068,11 @@ export interface RadioStatus {
   notch?: boolean | null
   comp?: boolean | null
   vox?: boolean | null
+  /** The rig's BUILT-IN ANTENNA TUNER: null/absent = this radio doesn't report one, so no ATU
+   * control is shown at all; a boolean = it has one, and the value is whether it's switched
+   * in-line. NOT a DSP toggle — running it keys the transmitter, so it rides the gated
+   * `atuTune()` command, never `setRigFunc`. */
+  atu?: boolean | null
   /** Rig RX passband / filter width in Hz over CAT; null/absent = unknown or the rig's default. */
   filterWidthHz?: number | null
   /** RIT (receive incremental tuning) offset in Hz — last commanded (0 = off). */
@@ -1103,6 +1116,11 @@ export interface RadioStatus {
   rxRangesMhz?: [number, number][]
   /** The dial (MHz) the radio most recently REFUSED, so the UI can name it. */
   refusedDialMhz?: number | null
+  /** The AGC speed ('fast'|'mid'|'slow') the radio most recently REFUSED. Hamlib's AGC is an
+   * enum and not every backend implements every step (MEDIUM least of all), so a pick can be
+   * rejected outright. The cockpits' segmented AGC chip is optimistic — the rig read-back lags
+   * a poll — and this is what stops it claiming a speed the radio never took. */
+  refusedAgc?: string | null
   /** The CW keyer backend the engine is actually using: 'cat' (rig in CW) or
    * 'soundcard' (rig in USB/LSB). Lets the CW cockpit toggle show the REAL state. */
   cwKeyer?: string
@@ -2350,6 +2368,14 @@ export interface Settings {
   /** Dedicated serial/COM port for RTS/DTR PTT when it differs from the CAT port
    * (SO2R controllers key on their own COM port). Empty = key on `serialPort`. */
   pttSerialPort: string
+  /** "My interface keys PTT on the CAT port's RTS line" — a fact only the operator can supply.
+   *
+   * A one-cable interface (Digirig class) keys RTS on the same port that carries CAT, so RTS
+   * must be held low or the rig transmits from the moment the port opens. Nexus cannot detect
+   * this: a stock Digirig enumerates with the same USB identity as an FTDX10, so no rule can
+   * separate "cable that keys RTS" from "radio that needs its hardware handshake". Ticking this
+   * lets Nexus drop the declared handshake to hold the line — which is why it defaults off. */
+  catRtsKeysPtt: boolean
   /** Serial baud rate. */
   baud: number
   /** Rig connection: "serial" (default) or "network" (rigctld → rigAddr over TCP, e.g. a

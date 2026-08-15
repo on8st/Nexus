@@ -45,6 +45,7 @@ import {
   setFlexPanRef,
   openPanelWindow,
   setTune,
+  atuTune,
   setFrequency,
   haltTx,
   startQsoRecording,
@@ -57,7 +58,7 @@ import { useWheelTune } from '../useWheelTune'
 import { useScopeTune } from '../useScopeTune'
 import { useRegionCols } from '../useRegionCols'
 import { usePinnedScroll } from '../usePinnedScroll'
-import { isRfScopeSource, sidebandSign, NO_NATIVE_SCOPE_REASON } from '../waterfall'
+import { isRfScopeSource, sidebandSign, TRACE_HOLD_MS, NO_NATIVE_SCOPE_REASON } from '../waterfall'
 
 /** Client-side RF-zoom presets for a native panadapter (mirror of the Phone cockpit). */
 const RF_SPANS = [
@@ -318,14 +319,16 @@ export function CwCockpit({
     setNr(pct)
     void setNrLevel(pct / 100)
   }
-  // AGC speed — local optimistic mirror so the segmented highlight flips on click (same fix as
-  // the Phone cockpit: snap.radio.agc lags a poll behind the click).
-  const [agc, setAgcLocal] = useState<string | null>(() => snap.radio.agc ?? null)
-  useEffect(() => {
-    if (snap.radio.agc != null) setAgcLocal(snap.radio.agc)
-  }, [snap.radio.agc])
+  // AGC speed — the chip lights on the click (snap.radio.agc is the rig READ-BACK and lags a
+  // poll behind), then the rig gets the last word: DERIVED, so there is no mirror to go stale.
+  // Showing the pick past a REFUSAL is the case that matters — Hamlib's AGC is an enum and a
+  // rig without that step answers RPRT -1, so the read-back never becomes the pick and a
+  // remembered mirror would light Mid forever on a radio that is still on Fast.
+  const [agcPick, setAgcPick] = useState<string | null>(null)
+  const agc =
+    agcPick != null && agcPick !== snap.radio.refusedAgc ? agcPick : (snap.radio.agc ?? null)
   const changeAgc = (sp: 'fast' | 'mid' | 'slow') => {
-    setAgcLocal(sp)
+    setAgcPick(sp)
     void setAgc(sp)
       .then((s) => onSnap?.(s))
       .catch(() => {})
@@ -1118,6 +1121,11 @@ export function CwCockpit({
           />
         }
         onTune={(on) => void setTune(on).then((s) => onSnap?.(s))}
+        onAtuTune={() =>
+          void atuTune()
+            .then((s) => onSnap?.(s))
+            .catch((e) => pushToast(String(e), 'error'))
+        }
         onStopTx={abort}
       >
         <label className="cw-wpm" title="Keyer speed — PgUp/PgDn to nudge (Shift = ±4)">
@@ -1328,6 +1336,7 @@ export function CwCockpit({
           filterWidthHz={filterHz ?? 500}
           pitchHz={pitch}
           cwPitchRefDial={keyer !== 'soundcard'}
+          traceHoldMs={TRACE_HOLD_MS.fast}
           interactive={catOk && !snap.radio.txBusyReason && !snap.radio.transmitting && snap.radio.dialMhz > 0}
         />
       </section>

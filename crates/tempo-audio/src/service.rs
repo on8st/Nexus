@@ -31,7 +31,7 @@ use tempo_core::timing::{now_unix_ms, SlotClock};
 use crate::backend::AudioBackend;
 use crate::device::CpalBackend;
 use crate::frames::RxRing;
-use crate::rig::{PttMode, Rig, SerialLine};
+use crate::rig::{PttMode, Rig, SerialLine, ATU_START_TUNE};
 use crate::rigctld_proc::{spawn_rigctld, RigctldProc};
 
 /// The daemon serving the rigctld protocol on a radio's TCP port: Hamlib's spawned
@@ -157,7 +157,10 @@ fn spawn_cat_daemon(
         t.baud,
         t.rigctld_port,
         network,
-        ptt_line,
+        crate::rigctld_proc::KeyingFacts {
+            ptt_line,
+            rts_declared: t.cat_rts_keys_ptt,
+        },
         t.control_lines,
     )
     .map(|p| (CatDaemon::Spawned(p), native_fallback))
@@ -643,6 +646,13 @@ pub struct RadioConfig {
     pub ptt_method: String,
     /// Hamlib rig model number for `rigctld -m` (0 = none / VOX).
     pub rig_model: u32,
+    /// The operator's "my interface keys PTT on the CAT port's RTS line" declaration
+    /// (`Settings::cat_rts_keys_ptt`). Carried in the STARTUP SEED, not left to the first
+    /// settings tick, because launching rigctld is itself what keys the rig on an undeclared
+    /// cable — arriving a tick later would be after the fact (issue #44). Defaulted false so
+    /// existing constructions (tests, tools) need no change.
+    #[allow(clippy::struct_excessive_bools)]
+    pub cat_rts_keys_ptt: bool,
     /// Serial port for CAT / serial PTT, e.g. `"COM5"` or `"/dev/ttyUSB0"`.
     pub serial_port: String,
     /// Serial baud for CAT.
@@ -688,6 +698,7 @@ impl Default for RadioConfig {
             meter_feed: tempo_app::engine::MeterFeed::default(),
             ptt_method: "vox".to_string(),
             rig_model: 0,
+            cat_rts_keys_ptt: false,
             serial_port: String::new(),
             baud: 38400,
             rig_conn: "serial".to_string(),
@@ -1074,6 +1085,9 @@ impl Transport {
             // better: nothing in this transport will ever key or unkey, so an interface wired
             // to key from RTS would sit in transmit for as long as the monitor is open.
             control_lines: crate::rigctld_proc::ControlLines::hold_low(),
+            // A monitor radio is read-only and never keys, so there is no keying cable to
+            // declare — and dropping its handshake could only cost it CAT.
+            cat_rts_keys_ptt: false,
             baud: p.baud,
             rig_conn: p.rig_conn.clone(),
             rig_addr: p.rig_addr.clone(),
@@ -1950,6 +1964,15 @@ struct RadioLoop {
     /// Last NR level / AGC speed we pushed to the rig — only set on change.
     last_nr_level: Option<f32>,
     last_agc: Option<String>,
+    /// The AGC speed this rig REFUSED, so it stops being re-sent. Hamlib carries AGC as an
+    /// enum (OFF/SUPERFAST/FAST/SLOW/USER/MEDIUM/AUTO) and backends do not all implement every
+    /// step — MEDIUM is the one rigs commonly lack. A refused `L AGC` leaves `last_agc`
+    /// unchanged, so without this the loop re-sent the same doomed command on EVERY 20 ms
+    /// tick, forever: an extra CAT round-trip per tick starving the dial mirror, the S-meter
+    /// and the keyer behind it (the same shape as the FT-950 dial storm, which is why modes
+    /// have `MODE_SET_MAX_TRIES`). Cleared by a fresh operator pick, a rig handoff, and a CAT
+    /// recovery — a give-up is a rate limit, never a permanent latch.
+    agc_giveup: Option<String>,
     /// Open WAV sink while a QSO recording is streaming live RX capture to disk (audio
     /// bridge). The loop owns the file handle so the audio never has to live in RAM.
     qso_sink: Option<crate::voice::WavSink>,
@@ -2138,6 +2161,13 @@ struct RadioLoop {
     /// (40 → 80 → 160 … heavy polls, capped), and reset on a successful read.
     func_retry_at: [u32; 5],
     func_retry_backoff: [u32; 5],
+    /// Whether the rig's BUILT-IN ATU (Hamlib `TUNER`) has been probed for the current CAT
+    /// confirmation. Probed ONCE per confirmation like [`Self::rx_ranges`] rather than round-robin
+    /// like the DSP funcs — it is a capability the cockpit shows or hides a TRANSMIT control on,
+    /// not a value that moves under the operator's hand — so a rig with no tuner costs one
+    /// round-trip per confirmation, not one per poll. The answer itself lives on the engine
+    /// (`Engine::rig_tuner`), which is what the gate and the snapshot both read.
+    tuner_probed: bool,
     /// Where every spectrum source publishes. Held here so the CI-V native row can be published
     /// WITHOUT the engine mutex — that mutex is held across this loop's own blocking CAT at the
     /// slot boundary, which is what starved the panadapter along with the audio row.
@@ -2229,6 +2259,7 @@ impl RadioLoop {
             last_mic_gain: None,
             last_nr_level: None,
             last_agc: None,
+            agc_giveup: None,
             qso_sink: None,
             qso_started_ms: None,
             voice_mic_open: false,
@@ -2276,6 +2307,7 @@ impl RadioLoop {
             func_state: [None; 5],
             func_retry_at: [0; 5],
             func_retry_backoff: [FUNC_RETRY_BACKOFF_BASE; 5],
+            tuner_probed: false,
             spectrum_feed: cfg.spectrum_feed.clone(),
             rx_tap: cfg.rx_tap.clone(),
             meter_feed: cfg.meter_feed.clone(),
@@ -2595,16 +2627,10 @@ impl RadioLoop {
         if !self.last_mode.trim().eq_ignore_ascii_case(md.trim()) {
             return;
         }
-        let band_of = |hz: u64| tempo_app::bandplan::band_for_dial(hz as f64 / 1e6);
-        // ⚠️ `None == None` is NOT "in-band": two dials the table cannot name (47 GHz+,
-        // or one named and one not) may sit on different rig band registers, and reading
-        // the equality as same-band skipped the mode re-assert exactly where the rig's
-        // band-stacking memory is least predictable. Only two EQUAL NAMED bands skip.
-        let same_named_band = matches!(
-            (band_of(prev_dial), band_of(dial)),
-            (Some(a), Some(b)) if a == b
-        );
-        if prev_dial == 0 || same_named_band {
+        // `same_named_band` carries the ⚠️ here: `None == None` is NOT "in-band", so only two
+        // EQUAL NAMED bands skip the re-assert. (The same question the force path's passband
+        // gate asks — one answer, one place.)
+        if prev_dial == 0 || same_named_band(prev_dial, dial) {
             return; // in-band: the a85f39ac order alone is complete
         }
         let Some(reported) = rig.read_mode() else {
@@ -2757,6 +2783,7 @@ impl RadioLoop {
         self.last_mic_gain = None;
         self.last_nr_level = None;
         self.last_agc = None;
+        self.agc_giveup = None; // a fresh rig may well take the step the old one refused
         self.fake_it_restore = None;
         self.audio_rig_split = false;
         self.last_rig_poll = 0.0; // poll the new rig's health/mode/S-meter immediately
@@ -2784,6 +2811,7 @@ impl RadioLoop {
         self.func_supported = [None; 5];
         self.func_misses = [0; 5];
         self.func_state = [None; 5];
+        self.tuner_probed = false;
         self.level_supported = [None; 4];
         self.level_misses = [0; 4];
         // The audio device must be (re)opened for the new radio even if its device name matches
@@ -3447,7 +3475,13 @@ impl RadioLoop {
                         // skip the diagnostic mode read-back then, so continuous wheel-tuning doesn't
                         // fire an extra `w MD0;` round-trip per ~120 ms flush. The mode is still
                         // re-asserted (an explicit same-mode re-click must still command the rig).
-                        match rig.set_mode(&md, passband_for(&md)) {
+                        // …and it is re-asserted WITHOUT re-commanding the width when neither the
+                        // mode nor the band moved — see `retune_passband` for why that gate is not
+                        // `mode_changed` alone (#67).
+                        match rig.set_mode(
+                            &md,
+                            retune_passband(&md, mode_changed, self.last_dial, dial),
+                        ) {
                             Ok(()) => {
                                 self.last_mode = md.clone();
                                 self.rig_asserted = true; // a real assert — credit the latch
@@ -3522,7 +3556,8 @@ impl RadioLoop {
                     // Apply the section's mode. `last_mode` only ever holds a mode actually
                     // applied, so a give-up never masquerades as success.
                     if mode_changed {
-                        match rig.set_mode(&md, retry_passband(&md, self.mode_fail_count)) {
+                        let sent_pb = retry_passband(&md, self.mode_fail_count);
+                        match rig.set_mode(&md, sent_pb) {
                             Ok(()) => {
                                 self.last_mode = md.clone();
                                 self.rig_asserted = true; // a real assert — credit the latch
@@ -3530,7 +3565,15 @@ impl RadioLoop {
                                 self.mode_giveup = None; // a success clears any prior give-up
                                 self.mode_saw_reject = false;
                                 retuned = true;
-                                retune_note = Some(mode_set_note(rig, &md, self.applied.rig_model));
+                                // Rung 2 lands the mode at the RIG's own default width (6 kHz on
+                                // the Flex of issue #82). Assert the width we wanted, and if the
+                                // rig keeps its own say so — a refused width OUTRANKS the mode
+                                // note, because a cheerful "rig confirmed in PKTUSB" beside a
+                                // 6 kHz filter is exactly how this stayed mysterious.
+                                retune_note = width_reassert_after_default_rung(rig, &md, sent_pb)
+                                    .or_else(|| {
+                                        Some(mode_set_note(rig, &md, self.applied.rig_model))
+                                    });
                             }
                             Err(e) => {
                                 // Retries cover a rig/rigctld still settling; past the budget the
@@ -3665,6 +3708,7 @@ impl RadioLoop {
                     self.func_supported = [None; 5];
                     self.func_misses = [0; 5];
                     self.func_state = [None; 5];
+                    self.tuner_probed = false;
                     self.level_supported = [None; 4];
                     self.level_misses = [0; 4];
                     {
@@ -3731,8 +3775,10 @@ impl RadioLoop {
                             self.func_supported = [None; 5];
                             self.func_misses = [0; 5];
                             self.func_state = [None; 5];
+                            self.tuner_probed = false;
                             self.level_supported = [None; 4];
                             self.level_misses = [0; 4];
+                            self.agc_giveup = None; // the refusal may have been the dead link
                             self.rx_ranges_probed = false;
                             {
                                 let mut eng = engine_lock(engine);
@@ -3759,6 +3805,27 @@ impl RadioLoop {
                             {
                                 let mut eng = engine_lock(engine);
                                 eng.observe_rig_rx_ranges(self.rx_ranges.clone());
+                            }
+                        }
+                        // Does this radio have a built-in ATU? ONE round-trip per CAT
+                        // confirmation, like the range table above and deliberately NOT the
+                        // round-robin the DSP funcs use: this is a capability the cockpit shows
+                        // or hides a TRANSMIT control on, not a value that moves under the
+                        // operator's hand. A rig that doesn't answer `u TUNER` stays `None` and
+                        // is offered no ATU button — an ATU control on a radio with no ATU is
+                        // worse than no control.
+                        //
+                        // KNOWN GAP: the NATIVE CI-V daemon has no `TUNER` token (`civ::commands
+                        // ::func_sub` covers the `0x16` DSP family; Icom's ATU is `1C 01`), so a
+                        // native-Icom operator gets `None` here and no button. That is the honest
+                        // answer rather than a wrong one, and adding it means a second CAT surface
+                        // this machine has no rig to verify — deliberately left for a bench pass.
+                        if !self.tuner_probed {
+                            self.tuner_probed = true;
+                            let tuner = rig.read_func("TUNER");
+                            {
+                                let mut eng = engine_lock(engine);
+                                eng.observe_rig_tuner(tuner);
                             }
                         }
                         // RF power / mic gain / NR / AGC read-backs mirror the rig's real knob
@@ -3932,6 +3999,45 @@ impl RadioLoop {
                                 }
                             }
                         }
+                        // ⚠️ THE ATU TUNE-UP — THIS KEYS THE TRANSMITTER. The radio puts its own
+                        // carrier into its tuner for a second or two, so this is NOT the
+                        // receive-side `set_func` above wearing a different token; it is a keying
+                        // command, and it passes through the same TWO doors the tune carrier does:
+                        //
+                        //  • the ENGINE's door — `take_atu_tune` re-runs every TX gate HERE, at
+                        //    the wire, because the operator's press was up to a poll ago and the
+                        //    dial, the TX latch or the transmitter's owner may have changed since.
+                        //    It also EXPIRES a stale press rather than holding it;
+                        //  • the LOOP's door — `may_key()`, plus this whole poll block's own
+                        //    `tx_until_ms.is_none() && !tuning_keyed && !manual_ptt_applied`. A
+                        //    radio switch mid-flight or a Test-CAT port hold and the ATU never
+                        //    starts.
+                        //
+                        // Note the ORDER: the press is DRAINED first and only then tested against
+                        // `may_key`, so one that can't be acted on is dropped, never queued behind
+                        // a handoff to key when it lands. The tune carrier deliberately HOLDS
+                        // there — but that is a button the operator is still holding down, and
+                        // this is a one-shot press they have already let go of.
+                        //
+                        // ⚠️ THE VALUE IS 2, NOT 1, AND THAT IS THE WHOLE BUG (operator,
+                        // 2026-08-15, FTDX10: "the atu button does nothing when clicked").
+                        // `U TUNER 1` is Yaesu `AC001` — ATU IN LINE — which on a rig whose
+                        // tuner is already in line is a visible no-op. `U TUNER 2` is `AC002`,
+                        // "start tuning". The question the old note here left open — whether a
+                        // brand STARTS a tune-up or only switches the tuner in-line — turned out
+                        // to be the defect rather than a caveat. See `rig::ATU_START_TUNE` for
+                        // the Hamlib source this was read out of, and for why 2 is a no-op
+                        // rather than a new behaviour on Icom and Kenwood.
+                        let fire_atu = engine_lock(engine).take_atu_tune();
+                        if fire_atu && self.may_key() {
+                            crate::civ::diag::note("ATU: operator asked the rig to tune up");
+                            if let Err(e) = rig.set_func_value("TUNER", ATU_START_TUNE) {
+                                // NOT re-queued: retrying a keying command the radio already
+                                // refused would key on a later tick the operator didn't ask for.
+                                // They press it again if they want it again.
+                                crate::civ::diag::note(&format!("ATU: the rig refused it: {e}"));
+                            }
+                        }
                         // Apply pending RIT/XIT/VFO clarifier requests (CAT-panel controls). Drain
                         // under the lock, RELEASE it, then do the CAT round-trip. Write-only +
                         // optimistic — the snapshot already mirrors the commanded value.
@@ -4028,6 +4134,7 @@ impl RadioLoop {
                             self.func_supported = [None; 5];
                             self.func_misses = [0; 5];
                             self.func_state = [None; 5];
+                            self.tuner_probed = false;
                             // Name the rig config in the diagnostic too, so a capture taken while
                             // the fault is ongoing records model/port/baud (the spawn note may
                             // predate logging being armed).
@@ -4051,6 +4158,7 @@ impl RadioLoop {
                                 eng.clear_rig_smeter();
                                 eng.clear_rig_mode();
                                 eng.clear_rig_funcs();
+                                eng.clear_rig_tuner();
                                 eng.clear_rig_passband();
                                 eng.set_cat_status(Some(false), msg);
                             }
@@ -5371,19 +5479,50 @@ impl RadioLoop {
             }
             // RX DSP levels: NR level (0..1) + AGC speed — applied on change like mic gain.
             let (nr, agc) = {
-                let e = engine_lock(engine);
-                (e.nr_level(), e.agc())
+                let mut e = engine_lock(engine);
+                (e.nr_level(), e.agc_to_command())
             };
             if let Some(n) = nr {
                 if Some(n) != self.last_nr_level && rig.set_rx_level("NR", n).is_ok() {
                     self.last_nr_level = Some(n);
                 }
             }
-            if let Some(a) = agc {
-                if self.last_agc.as_deref() != Some(a.as_str())
-                    && rig.set_agc(agc_to_hamlib(&a)).is_ok()
-                {
-                    self.last_agc = Some(a);
+            // AGC. `picked` is the operator's own click and OVERRIDES both guards below —
+            // `last_agc` is only what we last WROTE and the rig's AGC moves without us (its
+            // front-panel knob, and the per-mode AGC memory it recalls when the app commands
+            // CW), so a re-pick of that same speed used to match the dedupe and reach nothing.
+            // It is a one-shot, so honouring it can never become a per-tick re-assert that
+            // fights the operator's knob between clicks. The `agc_giveup` leg is the other
+            // half: a step this rig REFUSES must stop being re-sent (a failed write leaves
+            // `last_agc` unchanged, so the plain change test alone re-sent it every 20 ms
+            // forever) — and must be said out loud rather than leaving the cockpit's chip
+            // claiming a speed the radio never took.
+            if let Some((a, picked)) = agc {
+                let refused = self.agc_giveup.as_deref() == Some(a.as_str());
+                if picked || (!refused && self.last_agc.as_deref() != Some(a.as_str())) {
+                    match rig.set_agc(agc_to_hamlib(&a)) {
+                        Ok(()) => {
+                            self.last_agc = Some(a);
+                            self.agc_giveup = None;
+                            let mut eng = engine_lock(engine);
+                            eng.set_rig_refused_agc(None);
+                        }
+                        Err(_) => {
+                            // Deliberately does NOT blame the rig's capability: `cat` reports a
+                            // refusal and a link fault the same way, and the mode-give-up note
+                            // learned that guessing sends operators chasing the wrong thing.
+                            let note = format!(
+                                "couldn't set AGC {a} — the rig didn't take it; set AGC on the radio"
+                            );
+                            self.agc_giveup = Some(a.clone());
+                            let ok = self.cat_ok;
+                            let mut eng = engine_lock(engine);
+                            eng.set_cat_status(ok, note);
+                            // …and let the cockpit's chip fall back to the rig's real speed
+                            // instead of lighting a step the radio never took.
+                            eng.set_rig_refused_agc(Some(a));
+                        }
+                    }
                 }
             }
         }
@@ -6928,6 +7067,10 @@ struct Transport {
     /// `cat_dtr_state`). Part of the transport because changing it has to relaunch rigctld —
     /// the states are `-C` flags on its command line, not something a running daemon re-reads.
     control_lines: crate::rigctld_proc::ControlLines,
+    /// The operator's "my interface keys PTT on the CAT port's RTS line" declaration
+    /// (`Settings::cat_rts_keys_ptt`). Part of the transport for the same reason as
+    /// `control_lines`: it changes rigctld's command line, so it needs a relaunch.
+    cat_rts_keys_ptt: bool,
     baud: u32,
     /// "network" → rigctld talks to `rig_addr` over TCP (Flex/SmartSDR); else serial.
     rig_conn: String,
@@ -6968,6 +7111,10 @@ impl Transport {
             // The startup seed is the SAFE state, not "no opinion": this is what the very
             // first rigctld of the session is launched with, before any settings tick.
             control_lines: crate::rigctld_proc::ControlLines::hold_low(),
+            // Seeded from the stored setting, NOT false: this is the very first rigctld of the
+            // session, and it is the launch itself that keys the rig on an undeclared cable —
+            // waiting for the first settings tick would be too late to help issue #44.
+            cat_rts_keys_ptt: c.cat_rts_keys_ptt,
             baud: c.baud,
             rig_conn: c.rig_conn.clone(),
             rig_addr: c.rig_addr.clone(),
@@ -7002,6 +7149,7 @@ impl Transport {
                 // and only where dropping the handshake is what makes `rts` above achievable.
                 handshake_none: false,
             },
+            cat_rts_keys_ptt: s.cat_rts_keys_ptt,
             baud: s.baud,
             icom_native_cat: s.icom_native_cat,
             rig_conn: s.rig_conn.clone(),
@@ -7129,6 +7277,42 @@ fn passband_for(md: &str) -> i32 {
     }
 }
 
+/// Are `a` and `b` (Hz) on the SAME NAMED amateur band — i.e. does a retune between them
+/// cross no band boundary?
+///
+/// ⚠️ `None == None` is NOT "in-band": two dials the band plan cannot name (47 GHz+, or one
+/// named and one not) may sit on different band registers inside the rig, and reading that
+/// equality as same-band is how a band-dependent correction gets skipped exactly where the
+/// rig's band memory is least predictable. Only two EQUAL NAMED bands count. A `0` — the
+/// "no dial pushed yet" sentinel — is unnamed, so it is never the same band as anything.
+fn same_named_band(a: u64, b: u64) -> bool {
+    let band_of = |hz: u64| tempo_app::bandplan::band_for_dial(hz as f64 / 1e6);
+    matches!((band_of(a), band_of(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The passband to send WITH the mode on an operator force retune: does this retune have to
+/// re-command the width, or may it leave the rig's filter where the operator put it?
+///
+/// THE BUG (#67). The force path sent [`passband_for`]'s width on EVERY retune — it consulted
+/// only "is `md` non-empty", never whether anything about the mode or the band had actually
+/// changed. So in FT8, where `passband_for` deliberately forces 3 kHz, every plain dial move
+/// (a spot click, a Needed pick, a section QSY) re-sent `M PKTUSB 3000`: a DATA-filter switch
+/// and a Width-display pop per QSY, on a rig that was already exactly where we wanted it.
+///
+/// The 3 kHz force itself is NOT removable and this must not be gated on `mode_changed` alone.
+/// It exists because a rig recalls a narrow per-band DATA filter — 600 Hz on the FTDX10 that
+/// prompted it, which clips FT8 — and it recalls it on a BAND change, which routinely arrives
+/// with the mode UNCHANGED. So the gate is "in-band, dial-only": send `-1`
+/// (`RIG_PASSBAND_NOCHANGE`) only when the mode did not change AND the band did not change;
+/// keep the width in every other case.
+fn retune_passband(md: &str, mode_changed: bool, prev_dial: u64, dial: u64) -> i32 {
+    if !mode_changed && same_named_band(prev_dial, dial) {
+        -1
+    } else {
+        passband_for(md)
+    }
+}
+
 /// The passband for attempt `prior_fails + 1` of the bounded mode-set retry — the middle
 /// rung of the resilience ladder. DATA modes start with the full 3 kHz passband
 /// ([`passband_for`]); once a run keeps failing past [`MODE_SET_PASSBAND0_AFTER`], later
@@ -7143,6 +7327,38 @@ fn retry_passband(md: &str, prior_fails: u32) -> i32 {
     } else {
         pb
     }
+}
+
+/// The mode has just been ACCEPTED on the filter-agnostic rung (`sent_pb == 0` —
+/// `RIG_PASSBAND_NORMAL`, i.e. "use YOUR own default width"). Put the width we actually
+/// wanted back, as its own `set_mode`, once. Returns the note to surface when the rig kept
+/// its own width; `None` when there is nothing to say (any other rung, or the width landed).
+///
+/// ISSUE #82 (ve3wej, Flex 6400): "the filter lands at 6000 Hz on a mode/band change." The
+/// escalation to passband 0 is deliberate and stays — it is what gets the MODE accepted from a
+/// backend that chokes on the width→DATA-filter mapping rather than on the mode, instead of
+/// riding the whole retry budget into a bogus "no such mode" give-up. But a rig's default
+/// width is whatever the rig feels like (6 kHz of SSB filter on a Flex), and FT8 never wants
+/// 6000. So the rung's two halves are separated: the MODE lands first (the thing it was
+/// protecting), then the width is attempted on its own terms.
+///
+/// This cannot re-open the give-up loop. It runs only in the success arm, after the counters
+/// are cleared and `last_mode` already holds `md`, so a refusal here changes no state and the
+/// next tick sees no mode change and sends nothing — one extra command, once, on the one tick
+/// the escalation fired.
+fn width_reassert_after_default_rung(rig: &mut Rig, md: &str, sent_pb: i32) -> Option<String> {
+    let want = passband_for(md);
+    if sent_pb != 0 || want <= 0 {
+        return None; // not the default-width rung — the operator's filter was never overridden
+    }
+    if rig.set_mode(md, want).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "set {md} but the rig kept its own filter width — it refused {want} Hz; set the rig's \
+         DATA filter to about {} kHz by hand (FT8 needs the full audio passband)",
+        want / 1000
+    ))
 }
 
 /// The plain sideband underneath a DATA/PKT submode — the LAST rung of the mode-set
@@ -8090,6 +8306,37 @@ mod tests {
         // width and pop the rig's Width display — the bug passband_for exists to avoid.
         assert_eq!(retry_passband("USB", 0), -1);
         assert_eq!(retry_passband("CW", MODE_SET_MAX_TRIES), -1);
+    }
+
+    /// #67 at the decision itself. The wire test pins the behaviour end to end; this pins the
+    /// three inputs the gate is made of, including the two that must NOT relax it.
+    #[test]
+    fn a_force_retune_re_commands_the_width_only_on_a_mode_or_band_change() {
+        const A: u64 = 14_074_000; // 20 m
+        const B: u64 = 14_090_000; // 20 m, a dial move away
+        const C: u64 = 21_074_000; // 15 m
+
+        // THE BUG: an in-band dial move with the mode unchanged used to re-send 3000.
+        assert_eq!(retune_passband("PKTUSB", false, A, B), -1);
+        assert_eq!(retune_passband("PKTUSB", false, A, A), -1);
+        // A mode change re-commands the width — the FTDX10 600 Hz DATA filter this exists for.
+        assert_eq!(retune_passband("PKTUSB", true, A, B), 3000);
+        // …and so does a BAND change with the mode UNCHANGED, which is the case a
+        // `mode_changed`-only gate would have missed: the rig recalls a per-band DATA filter.
+        assert_eq!(retune_passband("PKTUSB", false, A, C), 3000);
+        assert_eq!(retune_passband("PKTLSB", false, 3_580_000, 7_040_000), 3000);
+        // No dial pushed yet (the `last_dial` sentinel) is not "same band" — force the width.
+        assert_eq!(retune_passband("PKTUSB", false, 0, A), 3000);
+        // Two dials the band plan cannot name are NOT in-band together: they may sit on
+        // different band registers inside the rig. `None == None` must not relax the gate.
+        assert_eq!(
+            retune_passband("PKTUSB", false, 47_000_000_000, 47_100_000_000),
+            3000
+        );
+        // Voice/CW never had a width to re-command — every combination stays NOCHANGE.
+        for (changed, from, to) in [(false, A, B), (true, A, B), (false, A, C)] {
+            assert_eq!(retune_passband("USB", changed, from, to), -1);
+        }
     }
 
     #[test]
@@ -12534,6 +12781,173 @@ mod tests {
         (addr, log)
     }
 
+    /// A logging rigctld stub for a 20 m rig WITH a built-in ATU: it answers `u TUNER` with `1`
+    /// (tuner present and in-line) and `RPRT 0` to everything else, so the ATU probe finds a
+    /// tuner and every command the loop sends is on the record.
+    fn mock_rigctld_with_atu(dial_hz: u64) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log2 = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                });
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let l = line.trim().to_string();
+                    log2.lock().unwrap().push(l.clone());
+                    let dial = format!("{dial_hz}\n");
+                    let reply = if l == "f" {
+                        dial.as_str()
+                    } else if l == "u TUNER" {
+                        "1\n"
+                    } else {
+                        "RPRT 0\n"
+                    };
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// A 20 m Phone engine with TX armed and in privileges — the scene an ATU tune-up is
+    /// legitimate in.
+    fn atu_engine() -> Arc<Mutex<Engine>> {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.set_operating_mode("phone", false);
+            e.set_frequency(14.290, "20m", "USB");
+            assert!(
+                e.tx_enabled() && e.tx_allowed(),
+                "scene guard: armed + legal"
+            );
+        }
+        engine
+    }
+
+    /// Drive `n` heavy polls (the poll is due every tick).
+    fn run_heavy_polls(
+        engine: &Arc<Mutex<Engine>>,
+        state: &mut RadioLoop,
+        rig: &mut Rig,
+        backend: &mut MockBackend,
+        n: usize,
+    ) {
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut tick = 0.0f64;
+        for _ in 0..n {
+            state.last_rig_poll = tick - RIG_POLL_MS - 1.0;
+            tick += 400.0;
+            state
+                .step(
+                    engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    tick,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_rigs_own_atu_is_probed_then_fired_on_the_wire() {
+        // Discussion #19 (N8GB, FTdx10): Tune only emits a carrier; the operator wants the
+        // radio's OWN antenna tuner. Measured as the rigctld command log, because what matters
+        // is what the radio was actually told.
+        let engine = atu_engine();
+        let (addr, log) = mock_rigctld_with_atu(14_290_000);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state();
+
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 3);
+        assert!(
+            log.lock().unwrap().iter().any(|l| l == "u TUNER"),
+            "the loop asks the radio whether it HAS a tuner — saw {:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(
+            engine.lock().unwrap().snapshot().radio.atu,
+            Some(true),
+            "…and the snapshot carries the capability, so the cockpit can show the control"
+        );
+        assert!(
+            !log.lock().unwrap().iter().any(|l| l == "U TUNER 2"),
+            "PROBING MUST NOT TUNE: nothing keys until the operator asks — saw {:?}",
+            log.lock().unwrap()
+        );
+
+        engine.lock().unwrap().atu_tune().expect("the gate passes");
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 1);
+        assert!(
+            log.lock().unwrap().iter().any(|l| l == "U TUNER 2"),
+            "the operator's ATU press reaches the radio as a TUNE-UP (2 = Yaesu AC002), not as \
+             \"switch the tuner in\" (1 = AC001, the dead-button bug) — saw {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_atu_tune_up_never_reaches_the_wire_once_a_tx_gate_goes_down() {
+        // ⚠️ THE SAFETY CASE, and it is why the request is re-gated at the wire rather than
+        // trusted from the click: an ATU tune-up KEYS THE TRANSMITTER, and the operator's press
+        // is up to a poll old by the time the loop can send it. TX going off in that window (the
+        // TX-Off button, a watchdog trip, a radio handoff standing transmit down) must leave
+        // `U TUNER 2` unsent — a keying command may never outlive the state that allowed it.
+        let engine = atu_engine();
+        let (addr, log) = mock_rigctld_with_atu(14_290_000);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state();
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 3);
+
+        {
+            let mut e = engine.lock().unwrap();
+            e.atu_tune()
+                .expect("armed + legal at the moment of the press");
+            e.set_tx_enabled(false); // …and TX goes off before the loop can send it
+        }
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 3);
+        assert!(
+            !log.lock().unwrap().iter().any(|l| l == "U TUNER 2"),
+            "the ATU must NOT have been fired at the radio — saw {:?}",
+            log.lock().unwrap()
+        );
+
+        // POSITIVE CONTROL: the same scene with the gate still up DOES reach the wire, so the
+        // assertion above is measuring the gate and not a broken harness. Re-arming fires a
+        // retune, and a retune tick skips the poll block — so let it settle before pressing.
+        engine.lock().unwrap().set_tx_enabled(true);
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 2);
+        engine.lock().unwrap().atu_tune().unwrap();
+        run_heavy_polls(&engine, &mut state, &mut rig, &mut backend, 2);
+        assert!(
+            log.lock().unwrap().iter().any(|l| l == "U TUNER 2"),
+            "control: an ungated press DOES reach the radio — saw {:?}",
+            log.lock().unwrap()
+        );
+    }
+
     /// An engine parked on the 2 m SSTV calling channel in FM — the tester's exact setup
     /// (`sstv_tune` is what the channel pick calls). NO image queued: the send is a separate
     /// operator act in both tests below, made AFTER a settling tick, because that is the real
@@ -12846,6 +13260,7 @@ mod tests {
             rig_model: 1035,
             serial_port: "/dev/ttyUSB0".to_string(),
             ptt_serial_port: String::new(),
+            cat_rts_keys_ptt: false,
             control_lines: crate::rigctld_proc::ControlLines::hold_low(),
             baud: 38400,
             icom_native_cat: false,
@@ -14581,16 +14996,211 @@ mod tests {
         );
     }
 
+    // ---- the width the operator never asked for (issue #82, ve3wej, Flex 6400) ----
+
+    /// A rigctld that refuses a DATA mode-set carrying an explicit WIDTH (`M PKTUSB 3000`
+    /// → `RPRT -1`) but takes the filter-agnostic form (`M PKTUSB 0`) — the exact shape the
+    /// passband-0 rung of the ladder exists for, and the one that leaves a Flex sitting on
+    /// its own 6 kHz default filter. After `heal_after` width refusals it accepts the width
+    /// too: the TRANSIENT rig (settling, not incapable), where asserting the width again
+    /// actually lands it. `usize::MAX` never heals. Logs every command line, like
+    /// [`mock_pkt_rejecting_rigctld`].
+    fn mock_width_rejecting_rigctld(heal_after: usize) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log2 = Arc::clone(&log);
+        std::thread::spawn(move || {
+            let mut refused = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                });
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let l = line.trim().to_string();
+                    log2.lock().unwrap().push(l.clone());
+                    // Only a PKT mode-set with a real width is refused; `M PKTUSB 0` (the
+                    // rig's own default width) is fine, and so is everything else.
+                    let explicit_width = l.starts_with("M PKT")
+                        && l.split_whitespace()
+                            .nth(2)
+                            .and_then(|w| w.parse::<i32>().ok())
+                            .is_some_and(|w| w > 0);
+                    let refuse = explicit_width && refused < heal_after;
+                    if refuse {
+                        refused += 1;
+                    }
+                    let reply = if l == "f" {
+                        "14074000\n"
+                    } else if refuse {
+                        "RPRT -1\n"
+                    } else {
+                        "RPRT 0\n"
+                    };
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    #[test]
+    fn the_default_width_rung_puts_the_intended_width_back() {
+        // ISSUE #82 (ve3wej, Flex 6400): "the filter lands at 6000 Hz on a mode/band change."
+        // Rung 2 of the ladder commands `M PKTUSB 0` — RIG_PASSBAND_NORMAL, i.e. "use YOUR
+        // default width" — and a Flex's default is the full 6 kHz SSB filter. The rung is
+        // there to get the MODE accepted, and it must keep doing that; what it must not do is
+        // hand the operator a filter they never asked for. So once the mode is in, the
+        // intended 3 kHz is asserted again on its own. Here the rig was merely settling, so
+        // the width lands and the operator ends on PKTUSB at 3000 — never 6000.
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        let mut backend = MockBackend::new();
+        let (addr, log) = mock_width_rejecting_rigctld(MODE_SET_PASSBAND0_AFTER as usize);
+        let mut rig = Rig::rigctld(&addr);
+        let mut state = loop_state();
+        state.last_mode = String::new();
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        for i in 0..(MODE_SET_PASSBAND0_AFTER + 3) {
+            state
+                .step(
+                    &engine,
+                    &mut backend,
+                    &mut rig,
+                    &sinks,
+                    f64::from(i),
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        }
+
+        let cmds = log.lock().unwrap().clone();
+        let modes: Vec<String> = cmds
+            .iter()
+            .filter(|c| c.starts_with("M "))
+            .cloned()
+            .collect();
+        let rung2 = modes
+            .iter()
+            .position(|c| c == "M PKTUSB 0")
+            .unwrap_or_else(|| {
+                panic!("rung 2 (the filter-agnostic retry) must be reached: {modes:?}")
+            });
+        assert_eq!(
+            modes.get(rung2 + 1).map(String::as_str),
+            Some("M PKTUSB 3000"),
+            "the width the operator's mode needs is asserted again right after the mode \
+             landed at the rig's own default: {modes:?}"
+        );
+        assert_eq!(
+            modes.last().map(String::as_str),
+            Some("M PKTUSB 3000"),
+            "the rig is left on the intended width, not on its 6 kHz default: {modes:?}"
+        );
+        assert_eq!(state.last_mode, "PKTUSB", "the mode is applied");
+        assert_eq!(state.mode_giveup, None, "nothing was given up");
+        assert_eq!(
+            state.mode_fail_count, 0,
+            "the width re-assert must not re-enter the retry ladder"
+        );
+    }
+
+    #[test]
+    fn a_rig_that_keeps_refusing_the_width_is_told_on_once() {
+        // The other half: a rig that genuinely will not take the width→DATA-filter mapping.
+        // The mode still has to land (that is what the rung is for), the width is attempted
+        // ONCE — not on every tick — and the operator is TOLD, so a 6 kHz filter is
+        // explainable instead of mysterious.
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        let mut backend = MockBackend::new();
+        let (addr, log) = mock_width_rejecting_rigctld(usize::MAX);
+        let mut rig = Rig::rigctld(&addr);
+        let mut state = loop_state();
+        state.last_mode = String::new();
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut detail_after_rung2 = None;
+        for i in 0..(MODE_SET_PASSBAND0_AFTER + 6) {
+            state
+                .step(
+                    &engine,
+                    &mut backend,
+                    &mut rig,
+                    &sinks,
+                    f64::from(i),
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+            if state.last_mode == "PKTUSB" && detail_after_rung2.is_none() {
+                detail_after_rung2 = Some(engine.lock().unwrap().snapshot().radio.cat_detail);
+            }
+        }
+
+        let cmds = log.lock().unwrap().clone();
+        let modes: Vec<String> = cmds
+            .iter()
+            .filter(|c| c.starts_with("M "))
+            .cloned()
+            .collect();
+        let rung2 = modes
+            .iter()
+            .position(|c| c == "M PKTUSB 0")
+            .unwrap_or_else(|| {
+                panic!("rung 2 (the filter-agnostic retry) must be reached: {modes:?}")
+            });
+        let after: Vec<&String> = modes[rung2 + 1..].iter().collect();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|c| c.as_str() == "M PKTUSB 3000")
+                .count(),
+            1,
+            "the width is re-asserted exactly once — a refusal must not spam the CAT link \
+             every tick: {modes:?}"
+        );
+        let detail = detail_after_rung2.expect("the mode must land on the filter-agnostic rung");
+        assert!(
+            detail.contains("filter width") && detail.contains("3000"),
+            "the operator is told the rig kept its own filter width: {detail:?}"
+        );
+        assert_eq!(
+            state.last_mode, "PKTUSB",
+            "the mode still landed — the rung's whole purpose"
+        );
+        assert_eq!(
+            state.mode_giveup, None,
+            "a refused WIDTH is not a refused MODE: the give-up loop must not come back"
+        );
+    }
+
     // ---- the DX-spot click storm (operator report, FT-950, 2026-08-12) ----
 
-    /// A rigctld shaped like the FT-950: it has NO DATA-USB submode, so every `M PKT*` is
-    /// refused (`RPRT -1`) and the rig's live mode is left alone — but it answers `m` and
-    /// `f` TRUTHFULLY, which is what [`mock_pkt_rejecting_rigctld`] deliberately does not
-    /// (it replies `RPRT 0` to `m`, and the band-cross re-assert correctly reads that as
-    /// "no evidence" and stands down). A truthful `m` is the whole point here: it is what
-    /// lets `reassert_mode_after_band_cross` see a mode that disagrees with `md` and act
-    /// on it.
-    fn mock_pkt_rejecting_rig_with_mode_read(start_hz: u64) -> (String, Arc<Mutex<Vec<String>>>) {
+    /// A rigctld that REMEMBERS what it was told: `F` moves its dial, an accepted `M` moves
+    /// its mode, and `f`/`m` answer TRUTHFULLY — which is what [`mock_pkt_rejecting_rigctld`]
+    /// and [`mock_rigctld_on`] deliberately do not do (they reply `RPRT 0` to `m` and a fixed
+    /// dial to `f`). A truthful `m` is what lets `reassert_mode_after_band_cross` see a mode
+    /// that disagrees with `md`, and a truthful `f` is what stops the loop's own read-back
+    /// from adopting a stale dial as an operator knob QSY across a multi-QSY scene.
+    ///
+    /// `reject_pkt` shapes it like the FT-950: no DATA-USB submode, so every `M PKT*` is
+    /// refused (`RPRT -1`) and the live mode is left alone. `false` is an ordinary DATA-capable
+    /// radio that takes everything.
+    fn mock_stateful_rigctld(start_hz: u64, reject_pkt: bool) -> (String, Arc<Mutex<Vec<String>>>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -14612,7 +15222,7 @@ mod tests {
                     let reply: String = match p.next() {
                         Some("M") => {
                             let m = p.next().unwrap_or("USB");
-                            if m.starts_with("PKT") {
+                            if reject_pkt && m.starts_with("PKT") {
                                 // No DATA submode on this radio — refuse, mode unchanged.
                                 "RPRT -1\n".into()
                             } else {
@@ -14792,7 +15402,7 @@ mod tests {
             e.set_operating_mode("digital", true);
             e.set_frequency(14.074, "20m", "USB");
         }
-        let (addr, log) = mock_pkt_rejecting_rig_with_mode_read(14_074_000);
+        let (addr, log) = mock_stateful_rigctld(14_074_000, true);
         let mut rig = Rig::rigctld(&addr);
         let mut backend = MockBackend::new();
         let mut state = loop_state_for(&engine);
@@ -14844,6 +15454,352 @@ mod tests {
             "the band-cross re-assert must not re-ask for a mode this same tick already \
              proved the rig refuses — one attempt per tick, not two: {:?}",
             log.lock().unwrap()[mark..].to_vec()
+        );
+    }
+
+    // ---- CW cockpit AGC (operator report, 2026-08-13): "In CW mode, AGC changes for
+    //      F-M-S work slowly or not at all." ----
+
+    /// A [`mock_agc_rigctld`]: its address, the command lines it was sent, and its own AGC
+    /// register (the "front-panel knob" a test can twist behind the app's back).
+    type AgcRigctld = (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<u8>>);
+
+    /// A rigctld that REMEMBERS its AGC step and answers `l AGC` TRUTHFULLY — which no other
+    /// mock here does (they reply `RPRT 0` to every level read, so the loop's AGC read-back
+    /// never sees a value at all and the scene cannot express a divergence).
+    ///
+    /// The returned knob is the rig's own AGC register: a test can twist it BEHIND the app's
+    /// back, which is the whole point — the operator's front-panel AGC knob and the rig's own
+    /// per-mode AGC memory (recalled on entering CW) both move it with no command from us.
+    ///
+    /// `refuse` shapes it like a rig whose Hamlib backend lacks that AGC step (MEDIUM=5 is the
+    /// common one): that `L AGC` is answered `RPRT -1` and the register is left alone.
+    fn mock_agc_rigctld(start: u8, refuse: Option<u8>) -> AgcRigctld {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let knob = Arc::new(Mutex::new(start));
+        let rec = Arc::clone(&log);
+        let reg = Arc::clone(&knob);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut out = match stream.try_clone() {
+                    Ok(o) => o,
+                    Err(_) => return,
+                };
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    rec.lock().unwrap().push(line.clone());
+                    let mut p = line.split_whitespace();
+                    let reply: String = match (p.next(), p.next()) {
+                        (Some("L"), Some("AGC")) => {
+                            let v = p.next().and_then(|s| s.parse::<u8>().ok());
+                            match v {
+                                Some(v) if Some(v) != refuse => {
+                                    *reg.lock().unwrap() = v;
+                                    "RPRT 0\n".into()
+                                }
+                                // No such AGC step on this rig — refused, register untouched.
+                                _ => "RPRT -1\n".into(),
+                            }
+                        }
+                        (Some("l"), Some("AGC")) => format!("{}\n", *reg.lock().unwrap()),
+                        (Some("f"), _) => "14050000\n".into(),
+                        (Some("m"), _) => "CW\n500\n".into(),
+                        _ => "RPRT 0\n".into(),
+                    };
+                    if out.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log, knob)
+    }
+
+    /// Drive `step` on the real 20 ms tick for `ticks` iterations, advancing `t`.
+    fn run_ticks(
+        state: &mut RadioLoop,
+        engine: &Arc<Mutex<Engine>>,
+        rig: &mut Rig,
+        backend: &mut MockBackend,
+        t: &mut f64,
+        ticks: usize,
+    ) {
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        for _ in 0..ticks {
+            state
+                .step(
+                    engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    *t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+            *t += 20.0;
+        }
+    }
+
+    fn cw_agc_engine() -> Arc<Mutex<Engine>> {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.set_operating_mode("cw", true);
+            e.set_frequency(14.050, "20m", "CW");
+        }
+        engine
+    }
+
+    /// ⭐ THE "OR NOT AT ALL" HALF. The radio loop dedupes the AGC write against `last_agc` —
+    /// *what we last wrote*, never what the radio is actually on. Those two part company
+    /// constantly, and CW is where it bites hardest: the operator's front-panel AGC knob moves
+    /// it, and so does the rig's own per-mode AGC memory the moment the app commands CW.
+    ///
+    /// Past that point the operator's chip is dead. They click Fast, the guard says "already
+    /// fast", and NOTHING goes on the wire — for the rest of the session, on that speed. This
+    /// is the same defect class as the rig-mode re-assert in `App.tsx` ("the guard ref drifts
+    /// out of sync with the real rig"), which is why that one asserts unconditionally.
+    ///
+    /// Measured at the wire and at the RADIO'S OWN REGISTER, not at `last_agc` — the cache is
+    /// the thing under suspicion, so asserting on it would prove nothing.
+    #[test]
+    fn a_reselected_agc_speed_reaches_a_rig_that_moved_on_its_own() {
+        let engine = cw_agc_engine();
+        let (addr, log, knob) = mock_agc_rigctld(2, None); // rig sitting on FAST
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let mut t = 0.0;
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 5);
+
+        // The operator picks Fast in the CW cockpit's AGC strip.
+        engine.lock().unwrap().set_agc("fast");
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 3);
+        // POSITIVE CONTROL for the mock and the counter: the click must reach the wire at all,
+        // or every "0 commands" below would read as a pass on a scene that never worked.
+        assert!(
+            count_from(&log, 0, "L AGC 2") > 0,
+            "control: the first pick must write AGC FAST: {:?}",
+            log.lock().unwrap()
+        );
+
+        // THE DIVERGENCE: the rig moves on its own — the front-panel AGC knob, or the rig
+        // recalling its per-mode AGC setting. No command from us; `last_agc` still says "fast".
+        *knob.lock().unwrap() = 3; // SLOW
+
+        // Two heavy polls' worth of ticks, so the loop's own read-back sees it.
+        let drift_mark = log.lock().unwrap().len();
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 90);
+        assert_eq!(
+            engine.lock().unwrap().snapshot().radio.agc.as_deref(),
+            Some("slow"),
+            "precondition: the app KNOWS the rig is on Slow — it read it back off the wire"
+        );
+        // THE OTHER DIRECTION, and it is why the pick is a ONE-SHOT rather than a re-assert:
+        // between clicks the operator's own AGC knob is theirs. Knowing the rig disagrees with
+        // the last commanded speed must NOT make the loop stomp it back — an unconditional
+        // re-assert, or one driven off the read-back, would fight the front panel every poll.
+        assert_eq!(
+            count_from(&log, drift_mark, "L AGC"),
+            0,
+            "the loop must not re-assert AGC on its own — the operator's knob wins between \
+             clicks: {:?}",
+            log.lock().unwrap()[drift_mark..].to_vec()
+        );
+
+        // THE CLICK THAT DOES NOTHING: the operator taps Fast to get back.
+        let mark = log.lock().unwrap().len();
+        engine.lock().unwrap().set_agc("fast");
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 5);
+
+        assert!(
+            count_from(&log, mark, "L AGC") > 0,
+            "re-picking an AGC speed must reach the radio even when the app last WROTE that \
+             same speed — the rig has moved since: {:?}",
+            log.lock().unwrap()[mark..].to_vec()
+        );
+        assert_eq!(
+            *knob.lock().unwrap(),
+            2,
+            "…and the radio must actually be back on Fast"
+        );
+    }
+
+    /// ⭐ THE "WORK SLOWLY" HALF. Hamlib carries AGC as an ENUM (OFF/SUPERFAST/FAST/SLOW/
+    /// USER/MEDIUM/AUTO) and not every backend implements every step — MEDIUM is the one
+    /// rigs commonly lack. A refused `L AGC` answers `RPRT -1`, so `set_agc().is_ok()` is
+    /// false, so `last_agc` is NOT updated — and the apply is unguarded by anything else, so
+    /// the loop re-sends the same doomed command on EVERY 20 ms tick, forever.
+    ///
+    /// That is the operator's "slowly": an extra CAT round-trip every tick starves the dial
+    /// mirror, the S-meter and the keyer behind it — the same shape as the FT-950 dial storm
+    /// (`a_given_up_mode_stops_the_per_tick_dial_storm`), which is why modes have
+    /// `MODE_SET_MAX_TRIES` and a give-up note. AGC has neither.
+    ///
+    /// And it must not end SILENTLY: a rig that refused the step must not leave the app
+    /// believing it applied.
+    #[test]
+    fn an_agc_step_the_rig_refuses_stops_being_re_sent_and_is_reported() {
+        let engine = cw_agc_engine();
+        // A rig with no MEDIUM step: `L AGC 5` → RPRT -1. It starts on FAST.
+        let (addr, log, knob) = mock_agc_rigctld(2, Some(5));
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let mut t = 0.0;
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 5);
+
+        // The operator picks Mid.
+        engine.lock().unwrap().set_agc("mid");
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 40);
+        // POSITIVE CONTROL: the pick must have been TRIED, or "it stops" is vacuous.
+        assert!(
+            count_from(&log, 0, "L AGC 5") > 0,
+            "control: the pick must be attempted at least once: {:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(
+            *knob.lock().unwrap(),
+            2,
+            "control: the rig really did refuse it — still on FAST"
+        );
+
+        // THE STEADY WINDOW: nothing changes, the operator is just sitting there.
+        let mark = log.lock().unwrap().len();
+        const STEADY_TICKS: usize = 100;
+        run_ticks(
+            &mut state,
+            &engine,
+            &mut rig,
+            &mut backend,
+            &mut t,
+            STEADY_TICKS,
+        );
+        let sends = count_from(&log, mark, "L AGC");
+        assert_eq!(
+            sends, 0,
+            "an AGC step the rig has REFUSED must stop being re-sent: {STEADY_TICKS} idle \
+             ticks sent it {sends} more times (pre-fix: one per tick, forever)"
+        );
+
+        // …and the operator must be TOLD, not left with a chip that claims it landed.
+        let snap = engine.lock().unwrap().snapshot();
+        assert!(
+            snap.radio.cat_detail.to_lowercase().contains("agc"),
+            "the refusal must be reported to the operator, not swallowed: {:?}",
+            snap.radio.cat_detail
+        );
+        assert_eq!(
+            snap.radio.refused_agc.as_deref(),
+            Some("mid"),
+            "the refused step must be NAMED in the snapshot, so the cockpit's optimistic chip \
+             falls back to the rig's real speed instead of claiming Mid"
+        );
+        assert_eq!(
+            snap.radio.agc.as_deref(),
+            Some("fast"),
+            "…and the rig's real speed is what the read-back says: Fast"
+        );
+
+        // THE OTHER DIRECTION: a step this rig DOES have must clear the refusal, or one bad
+        // pick would leave the cockpit permanently distrusting its own chip.
+        engine.lock().unwrap().set_agc("slow");
+        run_ticks(&mut state, &engine, &mut rig, &mut backend, &mut t, 90);
+        assert_eq!(*knob.lock().unwrap(), 3, "control: SLOW is accepted");
+        assert_eq!(
+            engine.lock().unwrap().snapshot().radio.refused_agc,
+            None,
+            "an accepted AGC write clears the refusal"
+        );
+    }
+
+    /// ⭐ ISSUE #67: *the rig's RX filter is re-commanded on every frequency change.*
+    ///
+    /// `passband_for` forces 3 kHz on the DATA submodes on purpose (an FTDX10 recalls a
+    /// 600 Hz DATA filter and clips FT8), but the force retune sent that width on EVERY
+    /// retune — gated on nothing but "the mode word is non-empty". In FT8 the mode word never
+    /// changes, so every spot click, Needed pick and in-band QSY re-commanded the filter:
+    /// a DATA-filter switch and a Width-display pop per frequency change, on a radio already
+    /// set exactly the way the operator set it.
+    ///
+    /// Measured as the `M` lines WITH their passband, because the width IS the subject —
+    /// asserting mode words alone would pass either way.
+    ///
+    /// The band-crossing leg is not decoration, it is why this is NOT gated on `mode_changed`
+    /// alone: a band change routinely arrives with the mode unchanged, and a band change is
+    /// exactly when the rig recalls its narrow per-band DATA filter. Drop that leg and the
+    /// FT8-clipping bug the 3 kHz force exists for comes straight back.
+    #[test]
+    fn an_in_band_qsy_leaves_the_rig_filter_alone_but_a_band_change_still_forces_3_khz() {
+        let engine = Arc::new(Mutex::new(Engine::new("W9XYZ", "EN37", 0)));
+        {
+            let mut e = engine.lock().unwrap();
+            e.set_license_class("extra");
+            e.set_operating_mode("digital", true);
+            e.set_frequency(14.074, "20m", "USB");
+        }
+        // A DATA-capable radio that takes PKTUSB and remembers its dial, so the loop's own
+        // read-back never mistakes a stale `f` for an operator knob QSY mid-scene.
+        let (addr, log) = mock_stateful_rigctld(14_074_000, false);
+        let mut rig = Rig::rigctld(&addr);
+        let mut backend = MockBackend::new();
+        let mut state = loop_state_for(&engine);
+        let (sinks, mut ra, mut rr) = (no_sinks(), mock_reopen_audio(), mock_reopen_rig());
+        let mut station = StationSinks::new();
+        let mut t = 0.0;
+        let mut run = |state: &mut RadioLoop, rig: &mut Rig, backend: &mut MockBackend, t: f64| {
+            state
+                .step(
+                    &engine,
+                    backend,
+                    rig,
+                    &sinks,
+                    t,
+                    &mut ra,
+                    &mut rr,
+                    &mut station,
+                )
+                .unwrap();
+        };
+
+        // Settle onto the digital section: the mode really does change here (the loop opens
+        // on plain USB), so the width must go out.
+        run(&mut state, &mut rig, &mut backend, t);
+        // Two in-band QSYs — a spot click and a Needed pick inside 20 m. Same mode, same band.
+        for hz in [14.080, 14.090] {
+            t += 20.0;
+            engine.lock().unwrap().set_frequency(hz, "20m", "USB");
+            run(&mut state, &mut rig, &mut backend, t);
+        }
+        // …then 20 m → 15 m with the mode UNCHANGED: the band-stack case the force exists for.
+        t += 20.0;
+        engine.lock().unwrap().set_frequency(21.074, "15m", "USB");
+        run(&mut state, &mut rig, &mut backend, t);
+
+        let modes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("M "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                "M PKTUSB 3000", // the mode change onto the digital section
+                "M PKTUSB -1",   // in-band dial move — NOCHANGE, hands off the operator's filter
+                "M PKTUSB -1",
+                "M PKTUSB 3000", // band change: the rig may have just recalled a 600 Hz DATA filter
+            ],
+            "the width may only be re-commanded when the mode or the band moved"
         );
     }
 

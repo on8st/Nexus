@@ -1356,6 +1356,12 @@ export async function setTune(on: boolean): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('set_tune', { on })
 }
 
+/** Run the radio's OWN built-in antenna tuner. Rejects with the reason when the rig has no ATU or
+ * a TX gate is down (TX off, outside privileges, transmitter busy) — it keys the transmitter. */
+export async function atuTune(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('atu_tune')
+}
+
 /** Emergency stop: halt any transmit immediately. Returns the fresh snapshot. */
 export async function haltTx(): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('halt_tx')
@@ -1845,6 +1851,15 @@ export async function setBlockedCalls(calls: string[]): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('set_blocked_calls', { calls })
 }
 
+/** Set (or clear, with '') who is at the key — the ONE write path for the seat-swap chip,
+ * the Field Day panel's Operator field and the pop-out scoreboard. Narrow write: never the
+ * heavyweight settings save, which resets the mode, clears the TX queue and re-derives the
+ * TX cycle from the struct the caller happened to be holding (#54). A seat swap is a
+ * mid-QSO act by definition. The engine trims + uppercases. */
+export async function setFdOperator(call: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_fd_operator', { call })
+}
+
 /** Load persisted operator + radio settings. */
 export async function getSettings(): Promise<Settings> {
   return invoke<Settings>('get_settings')
@@ -2039,6 +2054,39 @@ export function subscribeSnapshot(fn: (snap: AppSnapshot) => void): () => void {
 export async function getSpectrumRow(_transmitting: boolean): Promise<Spectrum> {
   return invoke<Spectrum>('get_spectrum_row')
 }
+
+/**
+ * Fetch one RIG SCOPE row, spread across the window the scope is actually drawing.
+ *
+ * Same 512 bins as `getSpectrumRow`, same bytes on the wire — but over `loHz..hiHz` instead of
+ * the full 0-4000 Hz capture, so the CW cockpit's 300-1100 Hz view gets 1.5625 Hz bins rather
+ * than 7.8125. The span request rides this call; there is nothing to set up and nothing to tear
+ * down. Ask for a span the backend cannot honour (a native RF panadapter is live, or the numbers
+ * are not a sane audio window) and it returns exactly what `getSpectrumRow` would have — so a
+ * caller never has to branch on which row it got, only read the `loHz`/`hiHz` it came back with.
+ */
+export async function getScopeRow(
+  _transmitting: boolean,
+  loHz: number,
+  hiHz: number,
+  window?: ScopeWindow,
+): Promise<Spectrum> {
+  return invoke<Spectrum>('get_scope_row', { loHz, hiHz, window })
+}
+
+/**
+ * Analysis window length for the rig scope — a genuine time-versus-frequency trade, and the one
+ * scope control with no right answer for everybody.
+ *
+ *   fast     1024 —  85 ms — 46.9 Hz lobe — 25 WPM keying is VISIBLE
+ *   balanced 2048 — 171 ms — 23.4 Hz lobe — the shipped default; dits are never resolved
+ *   sharp    4096 — 341 ms — 11.7 Hz lobe — half the width, double the smear
+ *
+ * ⚠️ Mirrors `tempo_core::spectrum::WindowN` — the tags are the wire contract and an unknown one
+ * is treated as `balanced` by the backend, so an out-of-step UI degrades to today's picture
+ * rather than to a blank scope.
+ */
+export type ScopeWindow = 'fast' | 'balanced' | 'sharp'
 
 /** Fetch the live meters (RX audio level + CAT S-meter). Lock-free backend-side (no engine
  * mutex), so it is safe to poll fast and a CAT stall cannot freeze it — one shared ~100 ms

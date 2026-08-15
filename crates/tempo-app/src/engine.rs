@@ -39,6 +39,31 @@ use tempo_core::{channel, spectrum, tempo_fast, tx};
 struct FeedRows {
     audio: Option<RowAverage>,
     rf: Option<(Spectrum, Instant)>,
+    /// The span the on-screen rig scope is actually showing, and the row computed over it.
+    /// See [`SpectrumFeed::scope_row`] — this is the second slot, not a second feed.
+    scope_req: Option<ScopeReq>,
+    scope: Option<RowAverage>,
+    /// The window length the rows in `scope` were computed at. Tracked SEPARATELY from
+    /// `scope_req` because the request expires and this must not: a scope that goes away at
+    /// Balanced and comes back at Sharp would otherwise find no request to compare against, and
+    /// fold the new rows into the old window's average. (The 500 ms gap-restart in
+    /// `RowAverage::push` would usually cover it, but that is a coincidence of two timeouts, not
+    /// a guarantee — and coincidences are what this file keeps getting bitten by.)
+    scope_win: spectrum::WindowN,
+}
+
+/// A standing request from the rig scope for a row over ITS window rather than the full
+/// capture. Carries its own timestamp because the request must EXPIRE: the producer would
+/// otherwise keep computing a second FFT forever after the last scope left the screen.
+#[derive(Clone, Copy)]
+struct ScopeReq {
+    lo: f32,
+    hi: f32,
+    /// Analysis window length. ⚠️ A change here is NOT visible to `RowAverage::push`, which
+    /// restarts on span / bin-count / source changes only — two window lengths have all three
+    /// in common. `scope_row` therefore clears the slot itself when this moves; see there.
+    win: spectrum::WindowN,
+    at: Instant,
 }
 
 /// The audio slot: the running POWER mean of every frame published since the last read.
@@ -220,6 +245,119 @@ impl SpectrumFeed {
             hi_hz: audio.mean.hi_hz,
             source: audio.mean.source.clone(),
         })
+    }
+
+    /// How long a scope-span request stands after the last poll that renewed it.
+    ///
+    /// The request rides the READ (`scope_row`), so it renews itself for as long as a scope is
+    /// on screen and lapses on its own when one is not — no unmount hook to forget, and a
+    /// crashed or hidden window cannot leave the producer doing work for nobody. Two seconds is
+    /// far longer than any scope's poll period (50 ms today, 120 ms under reduced motion) and
+    /// far shorter than a person would notice.
+    const SCOPE_REQ_TTL: Duration = Duration::from_secs(2);
+    /// Widest span worth answering with a narrow row, and the narrowest.
+    ///
+    /// The upper bound is a SANITY GATE, not a preference: the rig scope's view props carry
+    /// ABSOLUTE RF Hz when a native panadapter is the source (the cockpit passes `rfSpan`), and
+    /// a 14 MHz "audio span" must degrade to the full row rather than compute a spectrum of
+    /// nothing. The lower bound stops a degenerate drag from asking for a span with no bins in
+    /// it.
+    const SCOPE_MAX_HZ: f32 = 6000.0;
+    const SCOPE_MIN_SPAN_HZ: f32 = 50.0;
+
+    /// The span the rig scope wants a row over, or `None` if nobody is asking.
+    ///
+    /// Read by the rx-dsp thread once per tick. `None` is the normal state — no scope on
+    /// screen, a native RF row winning, or a request that has aged out — and it costs the
+    /// producer exactly one mutex read.
+    pub fn scope_request(&self) -> Option<(f32, f32, spectrum::WindowN)> {
+        let g = self.rows.lock().ok()?;
+        let req = g.scope_req?;
+        (req.at.elapsed() < Self::SCOPE_REQ_TTL).then_some((req.lo, req.hi, req.win))
+    }
+
+    /// Publish a row computed over the scope's own span (the rx-dsp thread).
+    ///
+    /// Averaged exactly like the audio slot, and for the same reason — the producer runs at
+    /// 20 ms and the scope reads at 50, so a latest-value slot would throw away three frames in
+    /// five and grain the noise floor. `RowAverage::push` already restarts on a span change, so
+    /// a zoom or a cockpit swap can never blend two windows into one picture.
+    pub fn publish_scope(&self, row: Spectrum) {
+        if let Ok(mut g) = self.rows.lock() {
+            match g.scope.as_mut() {
+                Some(avg) => avg.push(row),
+                None => g.scope = Some(RowAverage::start(row)),
+            }
+        }
+    }
+
+    /// The row for a rig scope showing `lo_hz..hi_hz` of audio — and, in the same call, the
+    /// standing request that makes that row exist.
+    ///
+    /// ONE COMMAND, deliberately. A separate `set_span` would need the UI to sequence two calls
+    /// and to decide what to draw in between; riding the request on the poll means the fallback
+    /// is structural instead of stated: the first poll after a span change asks and is answered
+    /// from the full row, and the next one (20 ms later) gets the narrow row. There is no state
+    /// machine in the UI and no window where it can draw the wrong span.
+    ///
+    /// Precedence is [`Self::row`]'s, with the narrow row inserted between the native RF row and
+    /// the full audio row:
+    /// - a fresh NATIVE RF row still wins outright, and no narrow row is even requested for it
+    ///   (the caller maps its view onto RF itself; an audio FFT is not that picture);
+    /// - else the narrow row, if it is fresh AND was computed over the span being asked for
+    ///   now — a mismatch means the request just changed, so it falls through rather than
+    ///   drawing the old window's frequencies under the new window's labels;
+    /// - else the full audio row, exactly as before.
+    pub fn scope_row(&self, lo_hz: f32, hi_hz: f32, win: spectrum::WindowN) -> Option<Spectrum> {
+        let sane = hi_hz > lo_hz
+            && lo_hz >= 0.0
+            && hi_hz <= Self::SCOPE_MAX_HZ
+            && hi_hz - lo_hz >= Self::SCOPE_MIN_SPAN_HZ;
+        {
+            let mut g = self.rows.lock().ok()?;
+            // A live native row means the scope is not drawing the audio FFT at all — drop the
+            // request so the producer stops paying for a row nobody will show.
+            let rf_live = g
+                .rf
+                .as_ref()
+                .is_some_and(|(s, at)| at.elapsed() < Duration::from_secs(1) && !s.row.is_empty());
+            // A WINDOW-LENGTH CHANGE MUST DROP THE ACCUMULATED AVERAGE. `RowAverage::push`
+            // restarts on span, bin count and source; two window lengths share all three, so
+            // without this a Fast->Sharp switch would fold an 85 ms picture and a 341 ms one
+            // into the same drawn row — plausible-looking and wrong, exactly the failure the
+            // restart rules exist to prevent.
+            if g.scope_win != win {
+                g.scope = None;
+                g.scope_win = win;
+            }
+            g.scope_req = (sane && !rf_live).then_some(ScopeReq {
+                lo: lo_hz,
+                hi: hi_hz,
+                win,
+                at: Instant::now(),
+            });
+            if !rf_live && sane {
+                if let Some(avg) = g.scope.as_mut() {
+                    let matches = f64::from(lo_hz) == avg.mean.lo_hz
+                        && f64::from(hi_hz) == avg.mean.hi_hz
+                        && !avg.mean.row.is_empty();
+                    if matches && avg.at.elapsed() < Duration::from_secs(2) {
+                        return Some(avg.take());
+                    }
+                }
+            }
+        }
+        self.row()
+    }
+
+    /// Test-only: age the standing scope request to simulate a scope that stopped polling.
+    #[cfg(test)]
+    pub fn backdate_scope_req_for_test(&self, by: Duration) {
+        if let Ok(mut g) = self.rows.lock() {
+            if let Some(req) = g.scope_req.as_mut() {
+                req.at = Instant::now() - by;
+            }
+        }
     }
 
     /// Test-only: backdate the audio stamp to simulate a capture stream that went silent.
@@ -1559,6 +1697,14 @@ pub struct Engine {
     /// rig's value). Commanded until the poll confirms; `None` when the rig doesn't report it.
     agc: Option<String>,
     rig_agc: Option<String>,
+    /// The operator just PICKED an AGC speed — a one-shot force for the radio loop, consumed
+    /// by [`Self::agc_to_command`]. See that method for why the pick cannot ride the loop's
+    /// change-detection alone.
+    agc_picked: bool,
+    /// The AGC speed the rig REFUSED, from the radio loop's write. Feeds the snapshot so the
+    /// cockpit's optimistic chip falls back to the rig's truth instead of claiming a step the
+    /// radio never took. Cleared by the next accepted write.
+    rig_refused_agc: Option<String>,
     /// Rig CAT S-meter (dB relative to S9) from the radio-loop poll; `None` when the
     /// rig doesn't report STRENGTH. Observed-only, RX-only.
     rig_smeter_db: Option<i32>,
@@ -1583,6 +1729,20 @@ pub struct Engine {
     /// Pending func toggles from the UI, per the same `[nb, nr, notch, comp, vox]` order; the
     /// radio loop drains + applies them next cycle (mirrors the split-request seam). Off the TCP path.
     pending_func: [Option<bool>; 5],
+    /// Whether the radio reports a built-in antenna tuner (Hamlib `RIG_FUNC_TUNER`) and, if so,
+    /// whether it is currently switched in-line. `None` = the rig never answered the func, so no
+    /// ATU control is offered at all — an ATU button on a radio that has no ATU is worse than no
+    /// button. Observed-only, same `None = can't do it` idiom as [`Self::rig_funcs`].
+    ///
+    /// ⚠️ DELIBERATELY NOT A SIXTH `rig_funcs` SLOT. Those five are receive-side DSP toggles the
+    /// UI may set through the generic `set_rig_func` command, which has no transmit gate on it
+    /// (it doesn't need one). Running the tuner KEYS THE TRANSMITTER, so it gets its own request
+    /// path behind [`Self::atu_tune_gate`] and must never become reachable from that generic one.
+    rig_tuner: Option<bool>,
+    /// A pending "run the rig's own ATU tune-up" request from the operator — the Unix second it
+    /// was pressed. Drained by the radio loop via [`Self::take_atu_tune`], which RE-RUNS the TX
+    /// gate and enforces [`ATU_REQUEST_MAX_AGE_SECS`] before anything keys.
+    pending_atu_tune: Option<u64>,
     /// Rig RX passband width (Hz) from the poll; `None` = unknown / rig default. Observed-only.
     rig_passband: Option<u32>,
     /// The radio's RECEIVE frequency ranges (Hz, inclusive), read once per CAT confirmation from
@@ -2455,6 +2615,11 @@ pub(crate) const SSTV_GALLERY_CAP: usize = 200;
 /// longest legitimate mode (PD290) is ~295 s; anything past this is a bug/abuse and is
 /// refused before keying — defense-in-depth above the per-send TX-watchdog budget.
 const SSTV_MAX_TX_SECS: f64 = 330.0;
+/// How long an operator's ATU-tune press stays actionable (seconds). The radio loop's poll block
+/// that drains it is skipped while the transmitter is up, so without an expiry a press made just
+/// before the operator keyed the mic would fire when they unkeyed — see [`Engine::take_atu_tune`].
+/// Generous next to the ~750 ms poll it normally waits on, tight next to any real over.
+const ATU_REQUEST_MAX_AGE_SECS: u64 = 5;
 
 /// What the SSTV RX decoder is actually HEARING — the readout that tells a
 /// picture-less screen apart from a picture-less band.
@@ -3108,6 +3273,8 @@ impl Engine {
             rig_nr_level: None,
             agc: None,
             rig_agc: None,
+            agc_picked: false,
+            rig_refused_agc: None,
             rig_smeter_db: None,
             rig_keyed: false,
             rig_tx_swr: None,
@@ -3119,6 +3286,8 @@ impl Engine {
             rig_rx_ranges: None,
             rig_refused_dial_mhz: None,
             pending_func: [None; 5],
+            rig_tuner: None,
+            pending_atu_tune: None,
             rig_passband: None,
             pending_passband: None,
             pending_scope_span: None,
@@ -3653,6 +3822,21 @@ impl Engine {
     /// above — never `apply_settings` for one field.
     pub fn set_lotw_auto_upload_cursor(&mut self, unix: u64) {
         self.settings.lotw_last_auto_upload_unix = unix;
+    }
+
+    /// Set (or clear, with an empty string) who is at the key — the Field Day operator,
+    /// read by `log_qso` for the ADIF `OPERATOR` field and by the N3FJP push. A NARROW
+    /// write, and the #54 lesson again: the seat-swap chip, the FD panel's Operator field
+    /// and the pop-out scoreboard all patched a whole `Settings` and saved it, so handing
+    /// the key over mid-QSO reset the mode to Chat, cleared the TX queue, and re-derived
+    /// the TX parity from the form's `tx_even` — a panel's struct is a snapshot from
+    /// whenever it loaded, so that last one put the next over on the DX's own period.
+    /// A seat swap changes who is logged, nothing else. Normalizes (trim + uppercase) so
+    /// the three callers cannot disagree about the stored shape; returns the updated
+    /// [`Settings`] for the caller to persist.
+    pub fn set_fd_operator(&mut self, call: String) -> Settings {
+        self.settings.fd_operator = call.trim().to_ascii_uppercase();
+        self.settings.clone()
     }
 
     /// Replace the blocked-callsigns list — a NARROW write for the Alt-double-click
@@ -5743,19 +5927,42 @@ impl Engine {
         }
     }
 
-    /// Set desired AGC speed ("fast"|"mid"|"slow"); the radio loop applies it on change.
+    /// Set desired AGC speed ("fast"|"mid"|"slow") — an OPERATOR PICK, which the radio loop
+    /// honours even when it is the speed the loop last wrote (see [`Self::agc_to_command`]).
     pub fn set_agc(&mut self, speed: &str) {
         if matches!(speed, "fast" | "mid" | "slow") {
             self.agc = Some(speed.to_string());
+            self.agc_picked = true;
         }
     }
-    pub fn agc(&self) -> Option<String> {
-        self.agc.clone()
+    /// The AGC speed for the radio loop to apply, and whether the operator just PICKED it.
+    ///
+    /// The force flag is load-bearing, not belt-and-braces. The loop dedupes its AGC write
+    /// against what it last WROTE, and the rig's AGC moves without us — the front-panel knob
+    /// does it, and so does the rig's own per-mode AGC memory the moment the app commands CW.
+    /// Once the two part company, a re-pick of that same speed matched the dedupe and never
+    /// reached the radio: the operator's Fast/Mid/Slow chips were dead for the rest of the
+    /// session. (Same defect class as the rig-mode re-assert in `App.tsx`, whose comment says
+    /// why it asserts unconditionally.)
+    ///
+    /// A ONE-SHOT, consumed here, is the whole design: re-asserting on every tick instead
+    /// would fight the operator's own AGC knob between clicks — worse than a dead chip — and
+    /// re-asserting from the read-back would do the same, one heavy poll later. One click is
+    /// one command.
+    pub fn agc_to_command(&mut self) -> Option<(String, bool)> {
+        let speed = self.agc.clone()?;
+        Some((speed, std::mem::take(&mut self.agc_picked)))
     }
     pub fn observe_rig_agc(&mut self, speed: String) {
         if matches!(speed.as_str(), "fast" | "mid" | "slow") {
             self.rig_agc = Some(speed);
         }
+    }
+    /// Record (`Some`) or clear (`None`) the AGC speed the rig refused — the radio loop's
+    /// verdict on its own write. Same shape as [`Self::set_rig_refused_dial`], and for the same
+    /// reason: a control the radio said no to must not keep reading as applied.
+    pub fn set_rig_refused_agc(&mut self, speed: Option<String>) {
+        self.rig_refused_agc = speed;
     }
 
     /// Adopt the rig's reported S-meter (dB relative to S9), from the radio-loop poll.
@@ -5896,6 +6103,79 @@ impl Engine {
     /// each `Some(on)` to apply then cleared. Mirrors `take_split_request`.
     pub fn take_func_requests(&mut self) -> [Option<bool>; 5] {
         std::mem::take(&mut self.pending_func)
+    }
+
+    /// Adopt the radio's antenna-tuner capability + state from the loop's probe (`None` = the rig
+    /// does not report `TUNER`, so the ATU control disappears).
+    pub fn observe_rig_tuner(&mut self, state: Option<bool>) {
+        self.rig_tuner = state;
+    }
+
+    /// Drop the tuner capability (→ the ATU control hides) on a breaker trip — the same reason as
+    /// [`Self::clear_rig_funcs`]: a half-open CAT link must never leave a stale capability behind,
+    /// and this one offers the operator a button that keys their transmitter.
+    pub fn clear_rig_tuner(&mut self) {
+        self.rig_tuner = None;
+    }
+
+    /// ⚠️ THE ATU TX GATE. Running the radio's built-in antenna tuner **KEYS THE TRANSMITTER** —
+    /// the rig puts its own carrier into the tuner for a second or two. It is a transmit action,
+    /// not a receive-side DSP toggle like NB/NR/Notch, so it asks exactly what the other keying
+    /// gates ask ([`Self::aprs_tx_gate`], [`Self::rtty_tx_gate`], [`Self::sstv_tx_gate`]), in the
+    /// same order, plus the capability — a rig with no tuner has nothing to run.
+    ///
+    /// The Enable-TX latch is in here even though the TUNE CARRIER does not consult it: that latch
+    /// is also the receive-only-tier backstop ([`Self::set_tx_enabled`] is the one funnel that
+    /// refuses to arm on a tier that must not key), and an ATU cycle is the rig transmitting with
+    /// no hand on a control. Where the two existing gates differ, this takes the STRICTER one.
+    pub fn atu_tune_gate(&self) -> Result<(), String> {
+        if self.rig_tuner.is_none() {
+            return Err(
+                "This radio doesn't report an antenna tuner over CAT — nothing to run".to_string(),
+            );
+        }
+        if !self.tx_enabled {
+            return Err("TX is off — enable TX first".to_string());
+        }
+        if !self.tx_allowed() {
+            return Err(
+                "TX locked — this frequency is outside your license privileges".to_string(),
+            );
+        }
+        if let Some(owner) = self.tx_owner() {
+            return Err(owner.busy_reason());
+        }
+        Ok(())
+    }
+
+    /// Ask the radio to run its own ATU tune-up. Refused — WITH THE REASON, never silently — by
+    /// [`Self::atu_tune_gate`]; on accept the request is queued for the radio loop, which re-runs
+    /// the gate before anything reaches the wire.
+    pub fn atu_tune(&mut self) -> Result<(), String> {
+        self.atu_tune_gate()?;
+        self.pending_atu_tune = Some(now_unix_secs());
+        Ok(())
+    }
+
+    /// Drain a pending ATU tune-up for the radio loop — `true` only while EVERY gate STILL passes
+    /// AND the press is still fresh. Consumed unconditionally: a press the loop cannot act on is
+    /// DROPPED, never held.
+    ///
+    /// Two guards, and both are about the gap between the click and the wire:
+    ///  * the gate is re-run HERE, because inside that gap the dial can move out of privileges,
+    ///    TX can be disarmed, or another keying source can take the transmitter — masked on read
+    ///    for the same reason [`Self::tuning`] is;
+    ///  * the press EXPIRES ([`ATU_REQUEST_MAX_AGE_SECS`]), because the poll block that drains it
+    ///    is skipped while the transmitter is up. Without an expiry, an ATU pressed a moment
+    ///    before the operator keyed the mic would fire when they unkeyed — legal by every gate,
+    ///    and still a transmission nobody asked for at that moment. An ATU tune-up is a
+    ///    here-and-now act, not a standing order to key later.
+    pub fn take_atu_tune(&mut self) -> bool {
+        let Some(at) = self.pending_atu_tune.take() else {
+            return false;
+        };
+        now_unix_secs().saturating_sub(at) <= ATU_REQUEST_MAX_AGE_SECS
+            && self.atu_tune_gate().is_ok()
     }
 
     /// Adopt the rig's RX passband width (Hz) from the poll. `None` (a split `m` read) keeps the
@@ -11780,6 +12060,12 @@ impl Engine {
             }
             st.grid_rarity = self.station.rarity_of(st.grid.as_deref());
             st.lotw_user = self.station.lotw_user(Some(st.call.as_str()));
+            // Same (call, heard grid) inputs the needed board resolves with, so the roster's
+            // State column and a NewState pill can never name different states. The resolver
+            // also answers with a Canadian province, which no WAS state code can collide with.
+            if let Some(resolve) = &self.station.state_resolve {
+                st.state = resolve(&st.call, st.grid.as_deref());
+            }
         }
         // Reflect transmit-enable / tuning / watchdog and the DT-derived
         // time-sync health into the radio status the UI renders.
@@ -11857,6 +12143,7 @@ impl Engine {
         s.radio.mic_gain = self.rig_mic_gain.or(self.mic_gain);
         s.radio.nr_level = self.rig_nr_level.or(self.nr_level);
         s.radio.agc = self.rig_agc.clone().or_else(|| self.agc.clone());
+        s.radio.refused_agc = self.rig_refused_agc.clone();
         s.radio.smeter_db = self.rig_smeter_db;
         s.radio.tx_swr = self.rig_tx_swr;
         s.radio.tx_alc = self.rig_tx_alc;
@@ -11877,6 +12164,8 @@ impl Engine {
         s.radio.notch = self.rig_funcs[2];
         s.radio.comp = self.rig_funcs[3];
         s.radio.vox = self.rig_funcs[4];
+        // The rig's own ATU: None = no tuner reported → the UI offers no ATU control at all.
+        s.radio.atu = self.rig_tuner;
         s.radio.filter_width_hz = self.rig_passband;
         s.radio.rit_hz = self.rit_hz;
         s.radio.xit_hz = self.xit_hz;
@@ -13814,6 +14103,21 @@ impl Engine {
         dxgrid: Option<String>,
         rx_report: Option<i32>,
     ) -> QsoRecord {
+        // ⚠️ THE HASHED-CALL BRACKETS COME OFF HERE, AT THE RECORD BOUNDARY (issue #84).
+        //
+        // FT8's 77-bit protocol sends a compound call as `<DX1ABC>` when the message will not
+        // otherwise fit, and the decoded token keeps its brackets through the whole sequencer.
+        // A DXpedition then logged as `<...>`: a different station from every other QSO with
+        // the same operator, and no award credit either, because `dxcc::resolve` cannot match
+        // a call containing a character `cty.dat` has never heard of.
+        //
+        // NOT STRIPPED IN THE SEQUENCER, deliberately. `Station::dxcall` also builds the
+        // OUTGOING message, and there the hashed form is what the protocol REQUIRES — a bare
+        // compound call does not fit the frame that form exists to make room for. This
+        // function is where a live station becomes a log entry, so a log-shaped rule belongs
+        // here and nowhere earlier. WSJT-X draws the same line: it strips `<`/`>` at every
+        // point it consumes a call for logging or display.
+        let dxcall = tempo_core::message::unhash_call(&dxcall).to_string();
         // ADIF mode must reflect the tier actually used — FT8/FT4 contacts log as
         // FT8/FT4 (award eligibility depends on it), not the native FT1 path.
         let mode = match self.app.tier() {
@@ -13865,9 +14169,16 @@ impl Engine {
             band: self.settings.band.clone(),
             freq_mhz,
             mode,
-            // Digital dB SNR reports → ADIF string form ("-12").
-            rst_sent: self.qso_report_sent.map(|v| v.to_string()),
-            rst_rcvd: rx_report.map(|v| v.to_string()),
+            // Digital dB SNR reports → the form that WENT ON THE AIR: sign + two digits
+            // ("-07", "+03"). `fmt_report` is the packer's own formatter, so the logged
+            // report is byte-identical to the report in the message — which is also how
+            // WSJT-X logs it (it slices the report out of the message text itself,
+            // `mainwindow.cpp:4767`). A bare `to_string()` wrote "-7", and for a strong
+            // signal "3" — no sign at all, which is not a signal report any consumer can
+            // read. That reached the logbook, the ADIF export, LoTW, QRZ and the WSJT-X
+            // type 5 datagram loggers log from (the blank RST_SENT/RST_RCVD in Log4OM).
+            rst_sent: self.qso_report_sent.map(tempo_core::message::fmt_report),
+            rst_rcvd: rx_report.map(tempo_core::message::fmt_report),
             name: None,
             qth: None,
             comment: None,
@@ -16048,6 +16359,163 @@ mod tests {
         // A PD290-sized image (~290 s) fits under a generous watchdog → accepted.
         let pd290 = vec![0.0f32; 290 * 12_000];
         e.sstv_send(pd290, "PD-290".into()).unwrap();
+    }
+
+    /// A Phone-armed engine whose radio reports a built-in ATU switched in-line — the scene the
+    /// ATU button is offered in.
+    fn atu_engine() -> Engine {
+        let mut e = phone_armed_engine();
+        e.observe_rig_tuner(Some(true));
+        e.atu_tune_gate()
+            .expect("scene guard: an armed, in-privileges, idle rig with a tuner may run it");
+        e
+    }
+
+    #[test]
+    fn the_atu_is_offered_only_by_a_radio_that_reports_one() {
+        // Offering an ATU button to a radio with no ATU is worse than not having the button, so
+        // the capability is the FIRST thing the gate asks — and the snapshot the UI hides on is
+        // the same value, not a second opinion.
+        let mut e = phone_armed_engine();
+        assert!(
+            e.snapshot().radio.atu.is_none(),
+            "unprobed / no tuner → the UI must see nothing to show"
+        );
+        let err = e
+            .atu_tune()
+            .expect_err("a radio with no tuner has nothing to run");
+        assert!(
+            err.contains("antenna tuner"),
+            "the refusal must say the radio has no tuner, got: {err}"
+        );
+
+        e.observe_rig_tuner(Some(false));
+        assert_eq!(
+            e.snapshot().radio.atu,
+            Some(false),
+            "a rig that answers TUNER shows the control (here: bypassed)"
+        );
+        e.atu_tune().expect("…and may be asked to run it");
+
+        // A breaker trip must take the capability with it — a half-open link may not leave an
+        // ATU button standing.
+        e.clear_rig_tuner();
+        assert!(e.snapshot().radio.atu.is_none());
+        assert!(e.atu_tune().is_err());
+    }
+
+    #[test]
+    fn the_atu_honours_every_gate_the_tune_carrier_honours() {
+        // ⚠️ AN ATU TUNE-UP KEYS THE TRANSMITTER — the rig puts its own carrier into the tuner.
+        // It is NOT a receive-side toggle like NB/NR/Notch, so it answers to the same gates as
+        // every other keying path, and each refusal has to SAY WHY (the operator never gets
+        // silence).
+
+        // 1. TX disarmed. (This is also the receive-only-tier backstop: `set_tx_enabled` is the
+        //    one funnel that refuses to arm a tier that must not key.)
+        let mut e = atu_engine();
+        e.set_tx_enabled(false);
+        let err = e.atu_tune().expect_err("TX off must refuse an ATU tune-up");
+        assert!(err.contains("TX is off"), "got: {err}");
+        e.set_tx_enabled(true);
+
+        // 2. Outside the operator's privileges — the licence gate the tune carrier keys on.
+        let mut e = atu_engine();
+        e.set_license_class("technician");
+        e.set_frequency(14.290, "20m", "USB"); // no Technician phone privilege here
+        assert!(!e.tx_allowed(), "scene guard: the licence gate is down");
+        let err = e
+            .atu_tune()
+            .expect_err("outside privileges must refuse an ATU tune-up");
+        assert!(err.contains("privileges"), "got: {err}");
+
+        // 3. Something else already owns the transmitter — every owner, from the ONE arbiter.
+        //    The tune carrier itself is one of them: an ATU cycle on top of a held carrier is
+        //    two transmitters' worth of intent on one radio.
+        let mut e = atu_engine();
+        e.set_tune(true);
+        assert!(e.tuning(), "scene guard: the tune carrier is up");
+        assert!(
+            e.atu_tune().is_err(),
+            "an ATU tune-up must not start under a held tune carrier"
+        );
+        e.set_tune(false);
+
+        e.set_ptt(true);
+        let err = e
+            .atu_tune()
+            .expect_err("a held mic key must refuse an ATU tune-up");
+        assert!(err.contains("PTT"), "got: {err}");
+        e.set_ptt(false);
+
+        e.send_voice(vec![0.1; 100]);
+        assert!(
+            e.atu_tune().is_err(),
+            "a queued voice message must refuse an ATU tune-up"
+        );
+        e.stop_voice();
+
+        // All clear → accepted.
+        e.atu_tune()
+            .expect("an idle, armed, in-privileges rig runs its tuner");
+    }
+
+    #[test]
+    fn a_queued_atu_tune_up_is_re_gated_at_the_wire() {
+        // The click and the moment the radio loop puts `U TUNER 1` on the wire are up to a poll
+        // apart, and `atu_tune`'s answer is stale by then: in that window the dial can move out
+        // of privileges, TX can be disarmed, or another keying source can take the transmitter.
+        // `take_atu_tune` re-runs the gate, exactly as `Engine::tuning` masks the tune carrier on
+        // READ rather than trusting what `set_tune` decided.
+        let mut e = atu_engine();
+        e.atu_tune().unwrap();
+        e.set_tx_enabled(false);
+        assert!(
+            !e.take_atu_tune(),
+            "TX went off between the click and the wire — the ATU must not fire"
+        );
+
+        let mut e = atu_engine();
+        e.atu_tune().unwrap();
+        e.set_license_class("technician");
+        e.set_frequency(14.290, "20m", "USB");
+        assert!(
+            !e.take_atu_tune(),
+            "the dial left the operator's privileges — the ATU must not fire"
+        );
+
+        let mut e = atu_engine();
+        e.atu_tune().unwrap();
+        e.set_ptt(true);
+        assert!(
+            !e.take_atu_tune(),
+            "the transmitter changed hands — the ATU must not fire"
+        );
+
+        // …and the ordinary path still fires, exactly once.
+        let mut e = atu_engine();
+        e.atu_tune().unwrap();
+        assert!(e.take_atu_tune(), "the gate still passes — fire it");
+        assert!(!e.take_atu_tune(), "one click is one tune-up, not a latch");
+    }
+
+    #[test]
+    fn a_stale_atu_press_expires_instead_of_keying_late() {
+        // The radio loop's poll block that drains this is SKIPPED while the transmitter is up, so
+        // a press made a moment before the operator keyed the mic would otherwise sit there and
+        // fire when they unkeyed — legal by every gate above, and still a transmission nobody
+        // asked for at that moment.
+        let mut e = atu_engine();
+        e.atu_tune().unwrap();
+        e.pending_atu_tune = Some(now_unix_secs().saturating_sub(ATU_REQUEST_MAX_AGE_SECS + 1));
+        assert!(
+            !e.take_atu_tune(),
+            "a press older than the freshness window must not key the rig"
+        );
+        assert!(
+            e.pending_atu_tune.is_none(),
+            "…and it is consumed, not left to key on the next poll"
+        );
     }
 
     #[test]
@@ -19352,6 +19820,71 @@ mod tests {
         );
     }
 
+    /// The Field Day operator swap — the seat-swap chip (#25), the FD panel's Operator
+    /// field and the pop-out scoreboard — persists ONE field. All three patched a whole
+    /// `Settings` and saved it, so swapping seats mid-QSO ran the heavyweight teardown
+    /// (#54): mode back to Chat, TX queue dropped, and the TX parity re-derived from the
+    /// form's `tx_even` — which, on a struct the panel loaded before the answer picked a
+    /// cycle, puts the next over on the DX's own period. CONTROL first (the old path must
+    /// still tear all three down, or this test cannot tell the fix from the bug), then the
+    /// narrow setter, which touches none of them.
+    #[test]
+    fn the_fd_operator_swap_keeps_the_qso_the_queue_and_the_cycle() {
+        let mut e = Engine::new("W9XYZ", "EN37", 0);
+        // The struct a panel loaded BEFORE the QSO started — what all three writers
+        // spread-patched. Its `tx_even` is still the pre-answer default.
+        let stale_form = e.settings().clone();
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 5);
+        e.call_station("PJ4DX");
+        assert!(e.snapshot().qso.is_some(), "harness: a QSO is in flight");
+        // The radio loop fills this each slot; queue it directly so the state is definite.
+        e.tx_queue.push_back("PJ4DX W9XYZ -10".into());
+        assert_eq!(
+            e.tx_parity, 1,
+            "harness: answering a slot-5 decode took the odd cycle"
+        );
+
+        // Control: the old path really does tear all three down.
+        let mut patched = stale_form.clone();
+        patched.fd_operator = "W1ABC".into();
+        e.apply_settings(patched);
+        assert!(
+            e.snapshot().qso.is_none(),
+            "control: apply_settings resets the mode"
+        );
+        assert!(
+            e.tx_queue.is_empty(),
+            "control: apply_settings drops the TX queue"
+        );
+        assert_eq!(
+            e.tx_parity, 0,
+            "control: apply_settings re-derives the cycle from the stale form"
+        );
+
+        // Re-arm, then the narrow path: the operator changes, nothing else does.
+        e.ingest_decodes_for_test(&[dec_snr("CQ PJ4DX FK52", -10)], 7);
+        e.call_station("PJ4DX");
+        assert!(e.snapshot().qso.is_some(), "harness: re-armed");
+        e.tx_queue.push_back("PJ4DX W9XYZ -10".into());
+        assert_eq!(e.tx_parity, 1, "harness: odd cycle again");
+
+        let saved = e.set_fd_operator(" w1abc ".into());
+        assert_eq!(
+            saved.fd_operator, "W1ABC",
+            "normalized once, in the engine — every writer sent a different shape"
+        );
+        assert_eq!(e.settings().fd_operator, "W1ABC");
+        assert!(
+            e.snapshot().qso.is_some(),
+            "a seat swap must not end the QSO in flight"
+        );
+        assert_eq!(e.tx_queue.len(), 1, "the queued over must survive the swap");
+        assert_eq!(
+            e.tx_parity, 1,
+            "the answering cycle must survive the swap — a flip transmits on the DX's period"
+        );
+    }
+
     /// Mode-matrix audit (2026-08-10): apply_settings adopted the form's operating_mode
     /// verbatim, so any whole-struct save carrying a snapshot loaded BEFORE a section
     /// switch silently reverted the section's mode — and the radio loop re-commanded the
@@ -19700,6 +20233,38 @@ mod tests {
         assert_eq!(e.last_decodes().len(), 1, "no split outside Hound mode");
     }
 
+    /// A HASHED (BRACKETED) CALL MUST NOT REACH THE LOG — issue #84.
+    ///
+    /// FT8's 77-bit protocol sends a compound call as `<DX1ABC>` when the message will not
+    /// otherwise fit, and the decoded token carries its brackets all the way through the
+    /// sequencer. The reporter worked a DXpedition and it logged as `<...>`: a different
+    /// station from the same operator's plain form, and no award credit, because the entity
+    /// lookup cannot match a call with angle brackets in it either.
+    ///
+    /// ⚠️ STRIPPED HERE, AT THE RECORD BOUNDARY, AND DELIBERATELY NOT IN THE SEQUENCER.
+    /// `Station::dxcall` also builds the OUTGOING message, where the hashed form is what the
+    /// protocol requires on the air — stripping it there would put a bare compound call into a
+    /// frame that cannot hold one. This function is where a live station becomes a log entry,
+    /// so it is the right place for a log-shaped rule.
+    ///
+    /// WSJT-X does the same thing everywhere it consumes a call for logging or display
+    /// (`.remove("<").remove(">")` throughout `widgets/mainwindow.cpp`), and its own decode
+    /// tokeniser cannot even capture a `<` into a callsign.
+    #[test]
+    fn a_hashed_dxpedition_call_logs_without_its_brackets() {
+        let e = Engine::new("KD9TAW", "EN52", 0);
+        let rec = e.qso_record("<KH8/W1AW>".into(), None, Some(-12));
+        assert_eq!(
+            rec.call, "KH8/W1AW",
+            "the log must carry the plain call — brackets make it a different station from \
+             every other QSO with the same operator, and break the award check"
+        );
+        // CONTROL: an ordinary call is untouched by the strip, so this is not just blanket
+        // rewriting of whatever it is handed.
+        let plain = e.qso_record("W9XYZ".into(), None, Some(-12));
+        assert_eq!(plain.call, "W9XYZ");
+    }
+
     #[test]
     fn hunt_target_tags_only_the_matching_qso() {
         // One-click hunt: the NEXT logged QSO with the activator's call gets
@@ -19959,7 +20524,7 @@ mod tests {
         assert_eq!(log.len(), 1, "the QSO auto-logged");
         assert_eq!(
             log[0].rst_sent.as_deref(),
-            Some("-7"),
+            Some("-07"),
             "RST_SENT survives working a station that answered our CQ"
         );
     }
@@ -20129,6 +20694,34 @@ mod tests {
             e.get_log()
         );
         assert!(!e.log_current_qso(), "…and Log QSO refuses it too");
+    }
+
+    /// Feature #40 — the Call Roster's Calling and State columns. Both facts already existed
+    /// (`Msg::addressee()` on the way in, the injected US-state resolver beside country/rarity);
+    /// the roster projection simply dropped them, so the UI had nothing to render.
+    #[test]
+    fn roster_stations_carry_who_they_call_and_their_state() {
+        let mut e = Engine::new("K2DEF", "FN31", 0);
+        e.set_tier(Tier::Ft8);
+        e.set_state_resolver(|call, _grid| (call == "W9XYZ").then(|| "VT".to_string()));
+        e.ingest_decodes_for_test(&[dec_snr("W1ABC W9XYZ EM48", -7)], 1);
+
+        let snap = e.snapshot();
+        let st = snap
+            .stations
+            .iter()
+            .find(|s| s.call == "W9XYZ")
+            .expect("the decoded station is in the roster");
+        assert_eq!(
+            st.calling.as_deref(),
+            Some("W1ABC"),
+            "the roster row must say who the station is working"
+        );
+        assert_eq!(
+            st.state.as_deref(),
+            Some("VT"),
+            "state is stamped from the SAME resolver the needed board uses — no lookup here"
+        );
     }
 
     #[test]
@@ -20502,7 +21095,7 @@ mod tests {
             Some("-10"),
             "report received about our signal"
         );
-        assert_eq!(r.rst_sent.as_deref(), Some("-7"), "report we sent the DX");
+        assert_eq!(r.rst_sent.as_deref(), Some("-07"), "report we sent the DX");
 
         // worked_before now true (reflected in the snapshot's worked flag).
         let snap = e.snapshot();
@@ -20730,6 +21323,84 @@ mod tests {
             e.take_pending_udp_qsos().is_empty(),
             "a drained contact must not be emitted twice"
         );
+    }
+
+    /// A LOGGED digital report is the report that went ON THE AIR — sign + two digits.
+    ///
+    /// Operator report (Log4OM, 2026-08): "when making a qso I get all the information on the
+    /// main screen of log4om but I don't get the send receive report." Every other field in the
+    /// WSJT-X type 5 `QSOLogged` datagram arrived; only the two reports did not.
+    ///
+    /// The datagram was never the problem — WSJT-X's own Qt `MessageServer` reads Nexus's type 5
+    /// back field-for-field — and the sequencer captures both reports. What Nexus wrote INTO them
+    /// was `i32::to_string()`: `-7`, where the same contact's on-air message said `-07` and where
+    /// WSJT-X logs `-07` (it slices the report straight out of the message text,
+    /// `mainwindow.cpp:4767`). `tempo_core::message::fmt_report` has formatted reports "the way
+    /// WSJT-X does" since the message packer was written; this one path bypassed it, so the
+    /// contact went out on the air in one format and into the log, the ADIF export, LoTW, QRZ and
+    /// the logger datagram in another.
+    ///
+    /// Pinned on BOTH sides of the exchange and at BOTH ends of the write: the record the
+    /// logbook keeps and the record the WSJT-X UDP sink emits are the same bytes.
+    #[test]
+    fn a_logged_digital_report_is_the_report_that_went_on_the_air() {
+        let mut e = Engine::new("K2DEF", "FN31", 0);
+        e.set_tier(Tier::Ft8);
+        // Their CQ decodes at -5 in slot 1; we double-click it (S&P — the ordinary FT8 QSO).
+        e.ingest_decodes_for_test(&[dec_snr("CQ W1AW FN42", -5)], 1);
+        e.call_station("W1AW");
+        key_one_over(&mut e, 2); // our Tx1 (grid)
+                                 // They answer with OUR report; we owe them -07, the SNR we decoded them at.
+        e.ingest_decodes_for_test(&[dec_snr("K2DEF W1AW -05", -7)], 3);
+        let on_air = e
+            .snapshot()
+            .qso
+            .as_ref()
+            .and_then(|q| q.tx_now.clone())
+            .expect("our R-report over is queued");
+        assert_eq!(
+            on_air, "W1AW K2DEF R-07",
+            "precondition: the packer already sends the two-digit form"
+        );
+        key_one_over(&mut e, 4);
+        e.ingest_decodes_for_test(&[dec_snr("K2DEF W1AW RR73", -7)], 5);
+
+        let log = e.get_log();
+        assert_eq!(log.len(), 1, "the QSO auto-logged: {log:?}");
+        assert_eq!(
+            log[0].rst_sent.as_deref(),
+            Some("-07"),
+            "RST_SENT is the report we actually transmitted, not a bare integer"
+        );
+        assert_eq!(
+            log[0].rst_rcvd.as_deref(),
+            Some("-05"),
+            "RST_RCVD is the report they actually transmitted"
+        );
+
+        // …and the WSJT-X UDP sink (the datagram Log4OM/N1MM+/HRD log from) carries the same.
+        let queued = e.take_pending_udp_qsos();
+        assert_eq!(queued.len(), 1, "the contact reached the WSJT-X sink");
+        assert_eq!(queued[0].rst_sent.as_deref(), Some("-07"));
+        assert_eq!(queued[0].rst_rcvd.as_deref(), Some("-05"));
+    }
+
+    /// The positive-signed half, which `{:+03}` gets right and `to_string()` gets wrong in a
+    /// second way: a strong signal logs `+03`, never `3`. Same QSO shape, other sign.
+    #[test]
+    fn a_positive_digital_report_logs_with_its_sign_and_two_digits() {
+        let mut e = Engine::new("K2DEF", "FN31", 0);
+        e.set_tier(Tier::Ft8);
+        e.ingest_decodes_for_test(&[dec_snr("CQ W1AW FN42", 3)], 1);
+        e.call_station("W1AW");
+        key_one_over(&mut e, 2);
+        e.ingest_decodes_for_test(&[dec_snr("K2DEF W1AW +03", 3)], 3);
+        key_one_over(&mut e, 4);
+        e.ingest_decodes_for_test(&[dec_snr("K2DEF W1AW RR73", 3)], 5);
+        let log = e.get_log();
+        assert_eq!(log.len(), 1, "the QSO auto-logged: {log:?}");
+        assert_eq!(log[0].rst_sent.as_deref(), Some("+03"));
+        assert_eq!(log[0].rst_rcvd.as_deref(), Some("+03"));
     }
 
     #[test]
@@ -23192,6 +23863,161 @@ mod tests {
             "the row after a stall must be the post-stall frame alone, not blended with the \
              four loud frames from before it: got {got}, want {post} (a blend reads {})",
             power_mean(&[pre, pre, pre, pre, post]),
+        );
+    }
+
+    fn spec(lo: f64, hi: f64, src: &str) -> Spectrum {
+        Spectrum {
+            row: vec![0.5; 512],
+            lo_hz: lo,
+            hi_hz: hi,
+            source: src.into(),
+        }
+    }
+
+    /// The rig-scope slot's precedence, and the three ways a request is refused.
+    ///
+    /// Every refusal must land on the SAME answer `get_spectrum_row` would have given, because
+    /// the UI does not branch on which row it got — it reads the `lo_hz`/`hi_hz` that came back.
+    /// A refusal that returned `None`, or an unrequested span, would draw one window's
+    /// frequencies under another window's labels.
+    #[test]
+    fn a_scope_request_is_refused_to_the_full_row_never_to_nothing() {
+        let feed = SpectrumFeed::default();
+        feed.publish_audio(spec(0.0, 4000.0, "audio"));
+
+        // 1. NOT YET PRODUCED. The first poll registers the request and is answered wide.
+        let first = feed
+            .scope_row(300.0, 1100.0, spectrum::WindowN::Balanced)
+            .expect("a row either way");
+        assert_eq!(
+            first.hi_hz, 4000.0,
+            "unanswered request falls back to the full row"
+        );
+        assert_eq!(
+            feed.scope_request(),
+            Some((300.0, 1100.0, spectrum::WindowN::Balanced)),
+            "and the request now stands, so the producer will answer it next tick"
+        );
+
+        // Produce it, and confirm the honoured path really does hand back the narrow row —
+        // the positive control for the three refusals below.
+        feed.publish_scope(spec(300.0, 1100.0, "audio"));
+        let got = feed
+            .scope_row(300.0, 1100.0, spectrum::WindowN::Balanced)
+            .expect("narrow row");
+        assert_eq!(
+            (got.lo_hz, got.hi_hz),
+            (300.0, 1100.0),
+            "control: an honoured request must actually return the narrow row, or the \
+             assertions below prove nothing"
+        );
+
+        // 2. AN INSANE SPAN. The cockpit passes ABSOLUTE RF Hz when a native panadapter is the
+        // source, so this is the real shape of the bad input, not a hypothetical one.
+        let rf_span = feed
+            .scope_row(14_073_000.0, 14_076_000.0, spectrum::WindowN::Balanced)
+            .expect("a row either way");
+        assert_eq!(
+            rf_span.hi_hz, 4000.0,
+            "an RF span is not an audio window — answer wide"
+        );
+        assert_eq!(
+            feed.scope_request(),
+            None,
+            "and drop the request, don't compute for nobody"
+        );
+
+        // 3. A LIVE NATIVE ROW. The scope is not drawing the audio FFT at all.
+        feed.publish_scope(spec(300.0, 1100.0, "audio"));
+        feed.publish_rf(spec(0.0, 4000.0, "flex"));
+        let rf = feed
+            .scope_row(300.0, 1100.0, spectrum::WindowN::Balanced)
+            .expect("a row either way");
+        assert_eq!(rf.source, "flex", "a fresh native row still wins outright");
+        assert_eq!(
+            feed.scope_request(),
+            None,
+            "and no narrow row is requested for it — that FFT would be for a picture nobody shows"
+        );
+    }
+
+    /// A WINDOW-LENGTH CHANGE MUST DROP THE ACCUMULATED AVERAGE — and nothing else can catch it.
+    ///
+    /// `RowAverage::push` restarts on span, bin count, source and a publish gap. Two analysis
+    /// windows share the first three, so an 85 ms picture and a 341 ms one would fold into the
+    /// same drawn row: plausible-looking, wrong, and invisible. This also covers the case where
+    /// the request EXPIRED in between (scope hidden, then reopened at a different window), which
+    /// is why the window is tracked separately from the request.
+    #[test]
+    fn changing_the_window_length_drops_the_accumulated_average() {
+        let quiet = 0.10f32;
+        let loud = 0.90f32;
+        let at = |v: f32| Spectrum {
+            row: vec![v; 512],
+            lo_hz: 300.0,
+            hi_hz: 1100.0,
+            source: "audio".into(),
+        };
+        let feed = SpectrumFeed::default();
+        feed.publish_audio(spec(0.0, 4000.0, "audio"));
+
+        feed.scope_row(300.0, 1100.0, spectrum::WindowN::Balanced);
+        for _ in 0..4 {
+            feed.publish_scope(at(loud));
+        }
+        // CONTROL: without a window change those four DO average together, so the clear below is
+        // a real effect and not an artifact of the slot being empty anyway.
+        let same_window = feed
+            .scope_row(300.0, 1100.0, spectrum::WindowN::Balanced)
+            .expect("row")
+            .row[0];
+        assert!(
+            (same_window - loud).abs() < 1e-6,
+            "control: four identical frames must average to themselves, got {same_window}"
+        );
+
+        for _ in 0..4 {
+            feed.publish_scope(at(loud));
+        }
+        // Simulate the harder path: the scope went away long enough for the request to lapse,
+        // and came back at a different window.
+        feed.backdate_scope_req_for_test(SpectrumFeed::SCOPE_REQ_TTL + Duration::from_millis(50));
+        feed.scope_row(300.0, 1100.0, spectrum::WindowN::Sharp);
+        feed.publish_scope(at(quiet));
+
+        let got = feed
+            .scope_row(300.0, 1100.0, spectrum::WindowN::Sharp)
+            .expect("row")
+            .row[0];
+        assert!(
+            (got - quiet).abs() < 1e-6,
+            "the first frame at the new window must stand alone, not blend with the four loud \
+             frames from the old one: got {got}, want {quiet} (a blend reads {})",
+            power_mean(&[loud, loud, loud, loud, quiet]),
+        );
+    }
+
+    /// The request rides the READ, so it lapses on its own when the scope goes away.
+    ///
+    /// This is the whole reason there is no unmount hook to forget: a hidden window, a crashed
+    /// webview or a cockpit swap all stop polling, and the producer stops paying within TTL.
+    #[test]
+    fn a_scope_request_expires_when_nobody_is_polling() {
+        let feed = SpectrumFeed::default();
+        feed.publish_audio(spec(0.0, 4000.0, "audio"));
+        feed.scope_row(300.0, 1100.0, spectrum::WindowN::Balanced);
+        assert!(
+            feed.scope_request().is_some(),
+            "control: the request stands while polled"
+        );
+
+        feed.backdate_scope_req_for_test(SpectrumFeed::SCOPE_REQ_TTL + Duration::from_millis(50));
+        assert_eq!(
+            feed.scope_request(),
+            None,
+            "an unrenewed request must lapse — otherwise one scope that was once on screen \
+             costs an FFT per tick forever"
         );
     }
 

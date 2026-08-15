@@ -5,6 +5,201 @@ All notable changes to Nexus (formerly Tempo) are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-08-15
+
+### Fixed
+
+- **A radio that refuses the filter width no longer strands you on its widest one.** Reported on
+  a Flex 6400: the filter ends up at 6000 Hz after a mode or band change. In the data modes Nexus
+  sends the mode and a 3 kHz width in one command, so a radio recalling a narrow DATA filter
+  cannot clip FT8. If that command keeps being refused, Nexus retries a while and then sends the
+  mode with the width left to the radio's own default — otherwise a radio that objects only to
+  the width would end up with no mode set at all. On a Flex that default is the full 6 kHz SSB
+  filter, which is not a filter anyone wants for FT8, and nothing on screen said where it came
+  from. Nexus now asserts the 3 kHz again the moment the mode is in; if the radio refuses the
+  width as well, the CAT status says so and tells you to set the DATA filter on the radio, rather
+  than leaving you with a 6 kHz filter and no explanation. (#82)
+- **Signal reports are logged in the form they went out on the air.** Reported by an operator
+  running Log4OM: contacts arrived in Log4OM complete except for the sent and received reports,
+  which were blank. Nexus transmits `-07` and `+03` — the two-digit signed form every FT mode
+  puts in the message, and the form WSJT-X writes to its log — but recorded them as `-7` and,
+  worse, `3`, dropping the plus sign entirely. A report with no sign is not a signal report a
+  logging program can read, which is why the field came through empty. The report Nexus logs is
+  now byte-for-byte the report it transmitted, so it reads correctly in Log4OM and any other
+  logger on the WSJT-X link, and in your own logbook, ADIF exports and LoTW and QRZ uploads.
+  Contacts logged before this keep whatever they were written with; re-exporting does not change
+  them.
+- **The AGC Fast/Mid/Slow buttons reach the radio every time you press one.** Reported from CW:
+  "AGC changes for F-M-S work slowly or not at all." Two things were wrong. Nexus only sent an
+  AGC command when the speed differed from the one it had last sent — but your radio's AGC moves
+  without Nexus (the front-panel knob does it, and so does the radio recalling its own per-mode
+  AGC when Nexus puts it into CW), so once the two disagreed, pressing the speed Nexus thought
+  it had already set sent nothing at all, for the rest of the session. Pressing a button is now
+  always a command. And if the radio refuses a step — Hamlib's AGC is a fixed list and not every
+  radio has every entry, Mid least of all — Nexus used to re-send that rejected command every
+  20 ms forever, which is what made everything else on the CAT link feel sluggish. It now stops,
+  says so, and the highlighted button drops back to the speed the radio is actually on instead
+  of claiming one it never took.
+- **Push to Talk tells you when transmit is switched off instead of doing nothing.** Reported on
+  an FTdx10: clicking Push to Talk did not key the rig, and nothing on screen said why. Nexus
+  drops a mic key for two different reasons — you are outside your licence privileges, or
+  transmit is simply switched off — and the button only ever showed the first. With transmit off
+  (Stop TX, the transmit watchdog, or a logger sending Halt Tx all switch it off) the button
+  still read PUSH TO TALK, and pressing it turned the button red and said ON AIR over a rig that
+  was not keyed. From the operator's chair that is indistinguishable from a bad PTT cable. The
+  button now reads **■ TX OFF — CLICK TO ENABLE**, does not pretend to be on the air, and that
+  click turns transmit back on — press it again and you talk. The Phone screen had no other
+  transmit-enable control on it, so the only way out used to be leaving the screen and coming
+  back. The voice keyer's message says the same thing now. (#81)
+- **Hints in text boxes stop looking like settings you already entered.** Reported on dark mode:
+  the grey example text in an empty box — `127.0.0.1:5002`, `COM16`, `Radio name` — rendered at
+  nearly the brightness of a real entry, so a Settings page full of empty fields read as a page
+  full of configured ones. Every text box in the app now draws its hint in the same faint ink
+  the rest of the interface uses for secondary text, in all four themes, so an empty field looks
+  empty at a glance.
+- **Your RX filter stays where you put it when you change frequency.** In the data modes Nexus
+  sends the mode and a 3 kHz width together, so a rig that recalls a narrow DATA filter cannot
+  clip FT8. It was sending that width on *every* frequency change — so each spot click, Needed
+  pick or in-band QSY reset the filter and popped the rig's Width display, undoing anything you
+  had set by hand. Now the width only goes out when the mode or the band actually changed, which
+  is when the rig might have recalled a filter of its own. Move around inside a band and Nexus
+  leaves the filter alone. (#67)
+- **Changing the operator no longer drops you out of the QSO you are in.** Handing the key to
+  the next operator — the chip in the top bar, the Field Day panel's Operator field, or the
+  torn-off scoreboard — saved that one name by writing the whole settings file back, which
+  resets the app the way pressing Save in Settings does: back to Chat, anything queued to send
+  thrown away, and the transmit cycle reset to whatever it was when the panel was opened, so
+  the next over went out in the same period as the station you were working. Nothing on screen
+  said any of it had happened. A seat swap now writes only the operator's name; the contact in
+  progress, the queue and your cycle are left exactly as they were. (#54)
+- **4 m is in the SSB and CW band pickers now, not only in FT8.** The FT dropdown has carried
+  4 m for a while — 70.154 for FT8, plus the JT65, MSK144 and WSPR dials — but the Phone and CW
+  cockpits read a different band list, and that one had never heard of the band. So you could
+  work 4 m FT8 and then watch the band vanish from the dropdown the moment you switched to SSB
+  or CW. Both pickers offer it now: a phone pick parks on 70.100 and a CW pick on 70.200, the
+  Region 1 SSB/CW calling frequency, rather than the dead 70.000 band edge. 4 m stays a Region 1
+  band — there is no US allocation at any class, so it appears for the non-US (Open) class and
+  stays off a US-licensed operator's dropdown, exactly as the transmit lockout has always
+  treated it. National 4 m edges differ by tens of kHz inside 70.0–70.5; check yours before you
+  key.
+- **Opening POTA / SOTA no longer puts your radio into DATA.** Reported on an FT-991A and seen
+  again on a Flex 6400: clicking POTA / SOTA in the sidebar flipped the rig from SSB into
+  DATA-USB, on every band, since 1.0.0. The hunting board declares a workspace so it can borrow
+  the wide layout, and Nexus was reading "has a workspace" as "is an operating mode", then
+  falling back to digital for anything it did not recognise. A hunting board is not a mode — you
+  work a park on whatever the activator is running — so it no longer touches the radio at all.
+  Clicking HUNT still sets the frequency and mode of the spot you picked, which is the moment
+  that should move your rig. (#80)
+- **Signals rise and fall on the CW and Phone scope again.** Reported from an FTdx10: "I see big
+  vertical spikes where the voice is; on Nexus it seems like it's all smoothed out without the
+  aggressive peaks, the whole spectrum is up with minimal rises and falls." Two separate faults
+  made that picture. The scope set its top of scale from the loudest thing on screen, refitted
+  every row, so a signal 40 dB out of the noise drew at exactly the same height as one 12 dB
+  out — a signal could not get taller because it was already at the top. And it set the bottom
+  of scale from the quietest bins in view, which on an audio scope are the far side of the
+  radio's own filter, 40-odd dB below the band noise — so the noise floor itself was drawn near
+  the top of the panel with nothing left to rise above it. The scope now works the way a rig's
+  does: the noise sits at the bottom, the scale above it is fixed, and how tall a signal draws
+  is how strong it is. The readout beside the palette controls now shows how far the strongest
+  signal stands above the noise, which is the number worth watching.
+- **A carrier is a line on the scope, not a block.** Every scope in Nexus assigned the analysed
+  frequencies to display columns in a way that let neighbouring columns claim the same data, so
+  one carrier was painted into two or three columns at identical height — a flat-topped block
+  before anything was drawn. Carriers now land in one column with real shoulders either side.
+  The CW and Phone scope also asks for its detail across the span it is actually showing rather
+  than the whole receiver passband: on the CW cockpit's 800 Hz window that is five times finer,
+  for the same amount of data, so a signal is drawn as a shape instead of a spike stretched
+  across seventy pixels.
+- **CW keying is visible on the scope.** The trace held each peak for four tenths of a second
+  before letting it fall, which is right for speech and far too long for CW — at 25 WPM the gap
+  between two dits gave back a ninth of the height, so keying drew a solid bar. The CW cockpit
+  now uses a hold short enough to show the rhythm, and Phone keeps the longer one that stops a
+  voice flickering between syllables.
+- **The scope's paused scrollback can be zoomed out.** Pausing the CW or Phone scope lets you
+  wheel back through the band, but the stored history only ever covered the window that was on
+  screen when each line arrived — everything either side of it was discarded as it came in, so
+  widening the view while paused found nothing there. The scope now keeps the full width of what
+  it received, so scrollback can be widened after the fact.
+- **CW contacts carry the other station's grid square into your log.** Reported from CW: contacts
+  logged with the grid field empty. The grid is not a box you can type on the CW or Phone log
+  strip — it is filled in behind the scenes from the callbook — and that lookup only ever ran for
+  a callsign you had typed by hand. In CW you almost never type one: the decoder fills the call
+  in for you and the cursor jumps to the report. So the lookup never ran and every CW contact
+  logged without a grid, a state or a country. A call that arrives from the decoder or from
+  clicking a spot is now looked up like any other, once it is settled. The grid still depends on
+  your callbook account returning one.
+- **A DXpedition worked with a bracketed callsign logs as itself.** Reported by an operator
+  working a DXpedition on FT8. When a callsign will not fit in the message, the FT8 protocol
+  sends it wrapped in angle brackets, and Nexus was writing those brackets into the log. The
+  contact then read as a different station from every other one with that callsign, and it
+  counted for nothing on the awards board — the country lookup cannot match a callsign with
+  brackets in it, so a new country and a new band both came back false, silently. The brackets
+  are now removed where the contact is written and where it is scored, and left alone on the
+  air, where the protocol requires them. (#84)
+- **A station repeating their report gets answered instead of ignored.** Reported on FT8:
+  contacts closing early, with the other station still calling. When you have sent your final
+  roger and the other operator did not copy it, they send their report again — and Nexus had no
+  answer for that, so it went quiet at the exact moment they were asking it to speak, and moved
+  on. It now sends the roger again, which is what WSJT-X does in the same spot. (#59)
+- **A radio that keys the moment Nexus starts can be told why.** Reported on a Kenwood TS-2000
+  through a Digirig: the rig goes into transmit as the app launches, whatever the PTT setting
+  is. A one-cable interface keys the radio from the same serial line the CAT commands travel on,
+  and that line has to be held down or the radio reads it as a mic key. Nexus can only hold it
+  down for cables it recognises, and a Digirig reports itself to Windows with exactly the same
+  identity as several radios do — so it cannot be told apart from a rig that needs that line for
+  its own handshake, and guessing wrong the other way takes CAT away from Yaesu owners entirely.
+  So Settings ▸ Radio ▸ Rig & CAT now has **Interface keys RTS on the CAT port**. Tick it if your
+  radio transmits as soon as Nexus starts, and it will stop. Leave it alone otherwise — the
+  default is exactly the behaviour you have today. (#44)
+
+### Added
+
+- **A resolution control on the CW and Phone scope.** A button beside the palette controls that
+  steps between three analysis widths, labelled by how sharply the scope can separate two
+  signals: **23 Hz** is what Nexus has always used and stays the default, **12 Hz** halves the
+  width of a carrier for picking a weak one out of a crowded passband, and **47 Hz** goes the
+  other way. The last is worth knowing about if you work CW: at the default, the scope looks at
+  a longer slice of audio than a dit lasts at 25 WPM, so keying cannot be seen as keying no
+  matter how good the display is. On 47 Hz it can. Sharper costs response and faster costs
+  detail — there is no setting that is best at both, which is why it is a button rather than a
+  decision made for you. It highlights when you are off the default, and each scope remembers
+  its own.
+- **An ATU button that runs your radio's own antenna tuner.** Asked for in discussion #19: Tune
+  keys a steady carrier, which is what you want for setting drive or tuning an external ATU, but
+  it does nothing for the tuner built into the radio. There is now an **ATU** button beside Tune
+  in the Phone, CW and SSTV headers that tells the radio to run its own tune-up, the way a
+  right-click on Tune does in WSJT-X. It appears only on radios that report having a tuner over
+  CAT — if your rig has none, there is no button to press and no mystery about why nothing
+  happened. Because a tune-up makes the radio transmit, the button answers to the same rules as
+  every other transmit control in Nexus: transmit has to be on, the dial has to be inside your
+  licence privileges, and nothing else may be keying. When one of those is not true, Nexus says
+  which, instead of quietly doing nothing. **Not yet tested against a radio** — the tuner command
+  is Hamlib's standard one, and what each brand does with it is worth a report either way.
+- **The Call Roster shows who each station is calling, and what state or province they are in.**
+  Two more columns on the FT8/FT4 roster, sortable like the rest, as GridTracker has them.
+  **Calling** is the callsign from that station's last decode — who they are working right now —
+  or **CQ** when they are calling nobody, which is the row worth double-clicking. **State** is
+  the US state, read from the FCC callsign index or from the grid they sent when the index has
+  no record for them, and now the Canadian province too, read from the region number in the
+  call: VE3 is Ontario, VY2 is Prince Edward Island, and so on for all thirteen. It shows as a
+  pill, like the other badges on the row, so it reads at a glance down a busy column. It is the
+  same answer the Needed board uses to decide "new state", so the two can never disagree with
+  each other. Neither column is a callbook lookup: both come off decodes you have already heard,
+  so there is nothing to set up and nothing leaves the machine.
+  A Canadian station whose grid square straddles the border is no longer labelled with the state
+  on the American side of it — the call says which country, and the call is asked first. Because
+  the province is also the right value for the ADIF **STATE** field, Canadian contacts now carry
+  it into your log and your exports.
+- **The waterfall runs downward now, and you can put it back.** A **Scrolls up / Scrolls
+  down** button in the waterfall header. Scrolls down is the new default — the newest line
+  lands at the top and history slides downward, the way most rigs and a lot of other software
+  draw it — and Scrolls up is what Nexus did before, with the newest line arriving at the
+  bottom and the picture climbing. If you preferred the old direction it is one click away and
+  it stays clicked. The switch repaints the history you have already collected, so nothing tears, and
+  the paused scrollback wheel follows the same direction. Each waterfall remembers its own
+  setting, so a torn-off waterfall on a second monitor can run the opposite way to the docked
+  one. The 3D stacked view keeps its own front-to-back perspective either way.
+
 ## [1.3.0] — 2026-08-13
 
 ### Added

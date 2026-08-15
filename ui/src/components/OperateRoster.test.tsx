@@ -322,3 +322,64 @@ describe('the station being worked is visible in the roster', () => {
     expect(row('K1ABC').className).not.toContain('working')
   })
 })
+
+describe('the roster says who each station is calling, and what state they are in', () => {
+  // ISSUE #40: GridTracker's roster shows both, and an operator scanning a busy band wants to
+  // know who is already engaged (and with whom) before double-clicking a row. Both facts ride
+  // the decode itself — the addressee of the frame, and the FCC callsign→state hint the needed
+  // board already resolves. Neither is a callbook lookup.
+  const withCols = (extra: Partial<Station>[]) =>
+    render(
+      <OperateRoster
+        stations={extra.map((e, i) => ({ ...station(`W${i}CAL`, 100), ...e }))}
+        myGrid="EN52"
+        currentSlot={100}
+        needByCall={new Map()}
+        selectedCall={null}
+        onSelect={() => {}}
+        onCall={() => {}}
+      />,
+    )
+  const cell = (call: string, cls: string) =>
+    screen.getByRole('row', { name: new RegExp(`^${call}`) }).querySelector(cls)?.textContent
+
+  it('shows the call being worked, and CQ when the station is calling nobody', () => {
+    withCols([
+      { call: 'BUSY', calling: 'K1ABC' },
+      { call: 'FREE', calling: null },
+    ])
+    expect(cell('BUSY', '.or-calling')).toBe('K1ABC')
+    expect(cell('FREE', '.or-calling')).toBe('CQ')
+  })
+
+  it('shows the state OR province as a pill, and a bare em dash when there is neither', () => {
+    withCols([
+      { call: 'USSTA', state: 'VT' },
+      { call: 'CANSTA', state: 'ON' },
+      { call: 'DXSTA', state: null },
+    ])
+    // A PILL, not plain text (operator, 2026-08-14: "display the actual state or province as a
+    // pill icon like you do the rest of them"). The chip element itself carries the code, so a
+    // regression back to a bare text node fails here rather than passing on the cell's text.
+    expect(cell('USSTA', '.or-state .or-subdiv')).toBe('VT')
+    expect(cell('CANSTA', '.or-state .or-subdiv')).toBe('ON')
+    // Nothing to say → say nothing, quietly. A pill around an em dash would be chrome
+    // advertising an absence, on most rows of a DX-heavy roster.
+    expect(cell('DXSTA', '.or-state')).toBe('—')
+    expect(cell('DXSTA', '.or-state .or-subdiv')).toBeUndefined()
+  })
+
+  it('sorts by state, parking the state-less at the end', () => {
+    withCols([
+      { call: 'AAA', state: 'VT' },
+      { call: 'BBB', state: null },
+      { call: 'CCC', state: 'CT' },
+    ])
+    fireEvent.click(screen.getByRole('button', { name: /^State/ }))
+    const calls = screen
+      .getAllByRole('row')
+      .slice(1)
+      .map((r) => r.querySelector('.or-call')?.textContent?.replace('↗', ''))
+    expect(calls).toEqual(['CCC', 'AAA', 'BBB'])
+  })
+})

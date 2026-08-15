@@ -3320,6 +3320,27 @@ button {
   cursor: pointer;
 }
 
+/* A placeholder is a HINT, not a value (issue #76 — "placeholders read as entered values in
+   dark mode"). ::placeholder is a pseudo-element with its own cascade: given no rule of its
+   own it INHERITS `color` from the field, and Chromium derives its default placeholder ink
+   from that currentColor. Every input that sets `color: var(--text)` — `.settings-input` and
+   ~30 other classes, ~125 placeholder attributes — therefore drew its hint at very nearly the
+   brightness of a real entry, so "127.0.0.1:5002" read as a configured host on dark. One bare
+   selector fixes all of them at once; the two class-scoped placeholder rules further down
+   (.composer-input, .np-search input) are (0,1,1) and (0,1,2) against this (0,0,2), so they
+   still win and nothing they style changes.
+   Colour only, NO italic — deliberate: those two shipped rules set colour alone, so italic
+   here would restyle two working inputs for something nobody reported, and most of these
+   hints are literal machine text (COM16, 127.0.0.1:5002, W9XYZ-9) where italic at 11-14px
+   costs exactly the character-by-character legibility they exist to demonstrate.
+   `opacity: 1` because Firefox applies its own opacity to ::placeholder and would fade the
+   ink straight back out. Guard: styles-placeholder.test.tsx. */
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
 h2 {
   margin: 0;
   font-size: 13px;
@@ -8007,6 +8028,15 @@ button.recall-avatar:focus-visible .recall-avatar-qrz {
   background: var(--state-weak);
   border-color: var(--state-weak);
   box-shadow: 0 0 18px color-mix(in srgb, var(--state-weak) 60%, transparent);
+}
+/* TX switched off (#81): the button is still LIVE — clicking it turns transmit back on — but
+   it must not wear the accent, which is this cockpit's "ready to key" colour. An operator who
+   reads colour before text saw a ready button over a rig that could not be keyed. Not the
+   `:disabled` styling either: that says "there is nothing you can do here", and there is. */
+.ph-ptt.txoff {
+  color: var(--text);
+  background: var(--bg-elev-2);
+  border-color: var(--border);
 }
 .ph-lock {
   display: inline-flex;
@@ -13746,16 +13776,25 @@ button.cq-skiptx1.on {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* The row's column minimums are hard floors, and the pane above clips (`overflow: hidden`),
+     so this is the interposed scroller the layout contract requires: on a narrow pane the
+     rightmost columns become reachable instead of silently cut off. No scrollbar appears at
+     the widths the roster layout actually gets. */
+  overflow-x: auto;
   border-top: 1px solid var(--border);
 }
 .or-row {
   display: grid;
-  /* Call comes first (people scan by callsign), then the Need column — the "why work this station"
-     column carrying the need chips AND the rarity pill. Call is compact (callsigns are short; its
-     88px min still fits VE2OPR-length calls + the B4/L marks); Need is the WIDEST and flexible so it
-     has room for all the chips + a 💎 ULTRA pill without clipping. Anything past the (roomy) Need
-     cell is clipped by `.or-need` rather than bleeding into the next column. */
-  grid-template-columns: minmax(88px, 1fr) minmax(105px, 1.13fr) minmax(50px, 0.85fr) 54px 56px 48px 44px 48px;
+  /* Call comes first (people scan by callsign), then Calling — who they are working, the pair
+     read together as "K2DEF → W1ABC" — then the Need column, the "why work this station" column
+     carrying the need chips AND the rarity pill. Call is compact (callsigns are short; its
+     88px min still fits VE2OPR-length calls + the B4/L marks); Calling holds a bare callsign, so
+     it needs no room for marks; Need is the WIDEST and flexible so it has room for all the chips
+     + a 💎 ULTRA pill without clipping. Anything past the (roomy) Need cell is clipped by
+     `.or-need` rather than bleeding into the next column. State is a fixed two letters. */
+  grid-template-columns:
+    minmax(88px, 1fr) minmax(68px, 0.8fr) minmax(105px, 1.13fr) minmax(50px, 0.85fr)
+    40px 54px 56px 48px 44px 48px;
   align-items: center;
   gap: var(--space-2);
   /* Density-aware row packing (see .decode-row) — ×1 at 'standard'. */
@@ -13847,7 +13886,9 @@ button.cq-skiptx1.on {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.or-calling,
 .or-country,
+.or-state,
 .or-gridc,
 .or-dist,
 .or-brg,
@@ -13857,6 +13898,8 @@ button.cq-skiptx1.on {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.or-calling,
+.or-state,
 .or-gridc,
 .or-dist,
 .or-brg,
@@ -13864,6 +13907,46 @@ button.cq-skiptx1.on {
 .or-age {
   font-family: var(--font-mono);
   font-size: 0.78rem;
+}
+/* State / province pill. The operator asked for the subdivision "as a pill icon like you do
+   the rest of them", so it takes the roster's pill geometry verbatim from `.need-chip` —
+   999px, 10.5px/800, 0.04em, the same var(--space-2) side padding — and differs in exactly two
+   places, each for a reason:
+
+   VERTICAL PADDING is 1px, not the need chip's 2px (this is `.b4-chip`'s value, the roster's
+   other pill). 1px is what keeps the row the height it already was; 2px would add ~3px to every
+   state-bearing row and the pane would show fewer stations for no gain.
+
+   COLOUR is the neutral --text ink over a --text-dim wash, NOT a need colour. A teal chip here
+   would read as "you need this state" beside a state the operator already has — the need
+   palette is a claim about their log, and this is a fact about the station. Ink is --text
+   rather than the --text-dim the plain cell used because the pill is the reason he asked: a
+   column he scans has to carry at a glance. Both variables are defined in both themes, so this
+   needs no light-theme override (nor a high-contrast one).
+
+   THE COST IS ZERO, measured in Chrome against this exact CSS at the width that forces every
+   column onto its minimum: the row's min-content width is 681px with the pill and 681px with
+   the plain text it replaces, and the row is 22px tall either way. The pill measures 31.5px in
+   the unchanged 40px cell — 8.5px of headroom, and that is the WORST case in the --font-mono
+   stack (the generic fallback here is wider than Consolas or SF Mono). It holds because every
+   code this can render is two characters: 50 US states, 13 ADIF Canadian subdivisions. A
+   three-character subdivision would need the column widened, and the row is already at a hard
+   673px + padding inside a pane that clips. */
+.or-state .or-subdiv {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  padding: 1px var(--space-2);
+  color: var(--text);
+  background: color-mix(in srgb, var(--text-dim) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, transparent);
+}
+/* A station calling CQ is the one to work — say so quietly rather than with a chip;
+   --text is defined in both themes. */
+.or-calling.cq {
+  color: var(--text);
+  font-weight: 700;
 }
 .or-snr {
   font-weight: 700;
@@ -17619,6 +17702,15 @@ button.sat-chip:disabled {
   border-color: var(--state-weak, #e0a030);
 }
 .wf-dss.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* Scroll-direction toggle — a worded button, so it must not be squeezed to an ellipsis in the
+   narrow docked header (the header wraps instead; see .waterfall-wrap > .panel-header). */
+.wf-flow {
+  white-space: nowrap;
+}
+.wf-flow.on {
   color: var(--accent);
   border-color: var(--accent);
 }

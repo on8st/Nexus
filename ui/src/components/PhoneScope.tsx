@@ -1,8 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { getSpectrumRow } from '../api'
+import { getScopeRow, type ScopeWindow } from '../api'
 import { sampleLut } from '../colormaps'
 import {
-  agcRange,
   applyGainZero,
   bakeLut,
   dbToSpan,
@@ -10,8 +9,13 @@ import {
   isSymmetricMode,
   normalize,
   resolveColormap,
+  agcRange,
+  SCOPE_WINDOW_DB,
+  WF_FLOOR_PCT,
   scopeView,
   sidebandSign,
+  TRACE_HOLD_MS,
+  traceHoldDecay,
   // Aliased: this component already has a `spanDb` STATE variable (the Δ readout it renders),
   // which shadows a bare import everywhere inside the component — including the one call site
   // below, where it resolved to a number and failed to compile.
@@ -28,6 +32,46 @@ import { surfaceGet, surfaceSet } from '../features/windowScope'
  * so a popped-out cockpit keeps its own choice). Static literal — the storage-scope test
  * classifies surfaceGet/Set keys by matching this declaration. */
 const PHSCOPE_DSS_KEY = 'nexus.phonescope.dss'
+
+/** Persisted analysis-window choice for the rig scope. Static literal for the same reason as
+ * PHSCOPE_DSS_KEY — the storage-scope test matches this declaration. */
+const PHSCOPE_WIN_KEY = 'nexus.phonescope.win'
+
+/**
+ * The window-length control, in the order it cycles.
+ *
+ * THE OPERATOR'S TRADE, not ours, which is why this is a control and the trace hold is not: the
+ * trace hold follows from the signal, but time-versus-frequency has no right answer. A CW op
+ * chasing a weak carrier in a crowded passband wants `sharp`; one reading somebody's fist at
+ * 25 WPM wants `fast`, because at the default a 48 ms dit is inside a 171 ms window and keying
+ * simply is not there to see.
+ *
+ * The LABEL is the Hann main-lobe width, because that is the thing the operator is buying and it
+ * is legible at a glance on a rig display. The title carries the cost.
+ */
+const SCOPE_WINDOWS: ReadonlyArray<{ id: ScopeWindow; label: string; title: string }> = [
+  {
+    id: 'balanced',
+    label: '23 Hz',
+    title: 'Resolution: Balanced — 2048-point window, 171 ms. The default. A 25 WPM dit is shorter than this window, so CW keying reads as a solid bar. Click for sharper.',
+  },
+  {
+    id: 'sharp',
+    label: '12 Hz',
+    title: 'Resolution: Sharp — 4096-point window, 341 ms. Half the carrier width, at double the time smear. Best for picking a weak carrier out of a crowded passband. Click for faster.',
+  },
+  {
+    id: 'fast',
+    label: '47 Hz',
+    title: 'Resolution: Fast — 1024-point window, 85 ms. Carriers read twice as wide, but keying and speech onsets actually resolve. Click to return to the default.',
+  },
+]
+
+/** A stored value is only honoured if it is one we still ship — anything else is the default,
+ *  so a stale or foreign key can never leave the scope on a window this build does not have. */
+function resolveScopeWindow(stored: string | null): ScopeWindow {
+  return SCOPE_WINDOWS.some((w) => w.id === stored) ? (stored as ScopeWindow) : 'balanced'
+}
 
 interface Props {
   transmitting: boolean
@@ -78,6 +122,11 @@ interface Props {
   /** Master gate for click/drag tuning: the cockpit passes catOk && !transmitting &&
    * dial-known. False → no pointer capture, no box, no cursor affordance. */
   interactive?: boolean
+  /** Trace peak-hold time constant (ms) — how long a column's peak stands after the signal
+   * stops. See TRACE_HOLD_MS: the cockpit picks it, because the right answer depends on the
+   * SIGNAL, not on the operator. CW passes `fast` (48 ms dits have to be visible as keying);
+   * phone takes the `normal` default (a hold short enough for CW flickers on every syllable). */
+  traceHoldMs?: number
 }
 
 /**
@@ -123,6 +172,7 @@ export function PhoneScope({
   pitchHz = 600,
   cwPitchRefDial = true,
   interactive = false,
+  traceHoldMs = TRACE_HOLD_MS.normal,
 }: Props) {
   // Master palette shared with the FT8 waterfall + all scopes ('auto' = theme-driven).
   const [palette] = useWaterfallPalette()
@@ -153,6 +203,12 @@ export function PhoneScope({
   const [dss, setDss] = useState<boolean>(() => surfaceGet(PHSCOPE_DSS_KEY) === '1')
   const dssRef = useRef(dss)
   dssRef.current = dss
+
+  const [scopeWin, setScopeWin] = useState<ScopeWindow>(() =>
+    resolveScopeWindow(surfaceGet(PHSCOPE_WIN_KEY)),
+  )
+  const scopeWinRef = useRef(scopeWin)
+  scopeWinRef.current = scopeWin
   /** Scrollback offset in history rows while paused (0 = live tail). */
   const offsetRef = useRef(0)
   // Which scope feed is live: '' / 'audio' = soundcard FFT, 'flex'/'civ' = a native RF panadapter.
@@ -176,6 +232,7 @@ export function PhoneScope({
   const pitchRef = useRef(pitchHz)
   const cwPitchRefRef = useRef(cwPitchRefDial)
   const interactiveRef = useRef(interactive)
+  const traceHoldRef = useRef(traceHoldMs)
   const lastRowRef = useRef<{ row: number[]; rowLo: number; rowHi: number } | null>(null)
   const lastViewRef = useRef<{ lo: number; hi: number; rf: boolean } | null>(null)
   const boxRef = useRef<HTMLDivElement>(null)
@@ -219,6 +276,7 @@ export function PhoneScope({
   pitchRef.current = pitchHz
   cwPitchRefRef.current = cwPitchRefDial
   interactiveRef.current = interactive
+  traceHoldRef.current = traceHoldMs
 
   useLayoutEffect(() => {
     lutRef.current = bakeLut(resolveColormap(palette, theme))
@@ -255,12 +313,14 @@ export function PhoneScope({
     const AGC_ALPHA = 0.4 // snappy attack/release — a rig scope, not a slow FT8 noise floor
     const TRACE_FRAC = 0.45 // top fraction = panadapter trace; rest = waterfall
     // Trace persistence (fast attack / slow decay, the classic rig peak-hold): the trace
-    // column jumps up instantly with a signal but FADES over ~a second between syllables
-    // and key-ups instead of strobing at frame rate with every gap in a bursty voice/CW
-    // signal (the "flashing vertical line" report). Time-based so the fade speed is the
-    // same under reduced-motion's slower frame cadence. Waterfall rows stay raw — the
-    // scroll IS their history; only the instantaneous trace gets the hold.
-    const TRACE_FADE_TAU_MS = 400
+    // column jumps up instantly with a signal but FADES between syllables and key-ups instead
+    // of strobing at frame rate with every gap in a bursty voice/CW signal (the "flashing
+    // vertical line" report). Waterfall rows stay raw — the scroll IS their history; only the
+    // instantaneous trace gets the hold.
+    //
+    // The TIME CONSTANT is the cockpit's (traceHoldMs, read live from the ref so changing it
+    // never restarts the poll loop). It was one 400 ms constant for both, which is far too long
+    // for CW: a 25 WPM dit gap gave back 11% of the trace height, so keying drew a static bar.
 
     const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
     const reducedMotion = () =>
@@ -272,8 +332,23 @@ export function PhoneScope({
     let lastFeed = '' // last onFeed-reported "source:lo:hi" (fire only on change)
 
     let magBuf: Float32Array | null = null // reused per-column magnitudes (no per-tick garbage)
-    let holdBuf: Float32Array | null = null // per-column trace peak-hold (decays, see TRACE_FADE_TAU_MS)
+    let holdBuf: Float32Array | null = null // per-column trace peak-hold (decays, see traceHoldMs)
     let lastHoldTs = 0
+    // The AGC window, reused. `row.slice(vLo, vHi)` allocated a fresh array 20x/second for a
+    // read-only percentile scan. Float64Array, not Float32Array: `row` arrives from JSON as
+    // doubles and narrowing it would nudge the AGC floor for no benefit (see agcScratch).
+    let visBuf: Float64Array | null = null
+    // Normalized row bins for the history ring, reused (see the push below).
+    let binBuf: Float32Array | null = null
+    let binBufN = 0
+    // The trace's fill gradient, rebuilt only when the palette or the trace height changes —
+    // it was a `createLinearGradient` + 3 `sampleLut` + 3 colour-stop parses PER ROW for a
+    // value that changes on a theme switch or a splitter drag. The cache is effect-local on
+    // purpose: `ctx` is captured by this effect, and a CanvasGradient belongs to the context
+    // that made it, so a new canvas re-runs the effect and resets the cache with it.
+    let gradCache: CanvasGradient | null = null
+    let gradKey = ''
+    let traceStroke = '' // the bright line on top of the fill — same palette, same cache key
     let magBufW = 0
     // Retained RGBA buffer for the WATERFALL BAND only (Wd × wfHd, drawn at y=traceHd). The
     // trace region above it is redrawn each frame and is not part of this buffer.
@@ -365,7 +440,17 @@ export function PhoneScope({
     const drawRow = async () => {
       let spec
       try {
-        spec = await getSpectrumRow(txRef.current)
+        // Ask for the row over the window this scope is DRAWING, not the whole 0-4000 Hz
+        // capture. Same 512 bins, same bytes — 1.5625 Hz per bin on the CW cockpit's 300-1100
+        // view instead of 7.8125.
+        //
+        // The view props are passed RAW even though they carry ABSOLUTE RF Hz when a native
+        // panadapter is the source (the cockpit passes `rfSpan`). That is deliberate: the
+        // backend already has to reject an insane span, so letting it own the one rule beats
+        // duplicating the RF test here against a source we only learn from the PREVIOUS row.
+        // An unhonourable request returns exactly what `getSpectrumRow` would have, and the
+        // row's own loHz/hiHz below is what everything downstream reads anyway.
+        spec = await getScopeRow(txRef.current, viewLoRef.current, viewHiRef.current, scopeWinRef.current)
       } catch {
         return
       }
@@ -416,40 +501,65 @@ export function PhoneScope({
       const nb = row.length
       const vLo = Math.max(0, Math.floor(((view.loHz - rowLo) / span) * (nb - 1)))
       const vHi = Math.min(nb, Math.ceil(((view.hiHz - rowLo) / span) * (nb - 1)) + 1)
-      const visible = vHi - vLo >= 8 ? row.slice(vLo, vHi) : row
-      const { floor, ceil } = agcRange(visible)
+      let visible: ArrayLike<number> = row
+      if (vHi - vLo >= 8) {
+        const n = vHi - vLo
+        if (!visBuf || visBuf.length !== n) visBuf = new Float64Array(n)
+        for (let i = 0; i < n; i++) visBuf[i] = row[vLo + i]
+        visible = visBuf
+      }
+      // A FIXED WINDOW ABOVE THE NOISE — not a re-fit to this row's own peak.
+      //
+      // ⚠️ THIS IS WHAT MAKES A LOUD SIGNAL DRAW TALL (operator, 2026-08-15: "on my FTDX10 I see
+      // big vertical spikes where the voice is; on Nexus it seems like it's all smoothed out
+      // without the aggressive peaks"). It used to be `agcRange(visible)` — floor at the 5th
+      // percentile, ceiling at the 99.5th — which had two independent faults, both measured:
+      //   * the CEILING WAS THE SIGNAL, so every peak normalised to exactly 1.000 whether it was
+      //     12 dB or 40 dB out of the noise. A signal could not get taller; it was already at
+      //     the top, and the display just re-scaled around it every row.
+      //   * the FLOOR WAS THE LEFT TAIL, which on an audio row is the rig's SSB stopband — 42 dB
+      //     below the passband noise. So the noise floor itself rendered at 0.956 of full
+      //     height: the whole passband sat as a bright slab at the top with nowhere to rise.
+      // See `SCOPE_WINDOW_DB` and `scopeNoiseFloor` for the numbers and the reasoning.
+      //
+      // The floor still SMOOTHS (it is an estimate of a slowly-changing thing, and a jittering
+      // one would bounce the whole picture vertically); the ceiling no longer needs smoothing at
+      // all, because it is now the floor plus a constant and moves only when the floor does.
+      // WF_FLOOR_PCT (the MEDIAN), not agcRange's 5% default — see SCOPE_WINDOW_DB.
+      const floor = agcRange(visible, WF_FLOOR_PCT).floor
       if (!agcInit) {
         agcFloor = floor
-        agcCeil = ceil
         agcInit = true
       } else {
         agcFloor += (floor - agcFloor) * AGC_ALPHA
-        agcCeil += (ceil - agcCeil) * AGC_ALPHA
       }
-      // HONESTY CLAMP + operator Gain/Zero. A row with no strong signal has a tiny
-      // dynamic range; stretching it to the full palette painted stopband noise as
-      // full-width rainbow (the "stuff on the waterfall with a quiet band" report —
-      // CW and Phone both, this scope serves both cockpits). Enforce a 10 dB minimum
-      // visual span so noise-only rows sit dark at the palette bottom; rows with real
-      // signals span far more than 10 dB and render exactly as before. Gain/Zero then
-      // apply on top (same semantics as the FT8 waterfall's controls).
+      agcCeil = agcFloor + dbToSpan(SCOPE_WINDOW_DB)
+      // Operator Gain/Zero on top, same semantics as the FT8 waterfall's controls: G widens
+      // the window (2x at G-1) or tightens it (0.4x at G+1), Z trims the black point.
       //
-      // The clamp is ADDITIVE because the row's intensity axis is linear in dB
-      // (2026-08-04). It used to be `agcFloor * 3.16` — 10 dB as an amplitude RATIO, which
-      // on a dB axis is not 10 dB at all: it scales with where the floor happens to sit, so
-      // a quiet band (floor near 0) got almost no clamp at all and the rainbow came back,
-      // while a hot one got a wildly excessive one. This is the exact failure the sentinel
-      // rule warns about — arithmetic that still runs, and still looks plausible, on a wire
-      // whose meaning changed underneath it.
-      const MIN_DYN_DB = 10
+      // ⚠️ THE 10 dB MINIMUM-SPAN CLAMP THAT USED TO SIT HERE IS GONE, and it is worth saying
+      // why rather than leaving dead arithmetic that implies a constraint. It existed because
+      // the window was fitted to each row, so a row with no signal had a tiny span that got
+      // stretched across the whole palette — a quiet band rendered as full-width rainbow (the
+      // "stuff on the waterfall with a quiet band" report). The window is now a fixed
+      // SCOPE_WINDOW_DB above the noise and can never shrink, so that failure is
+      // unrepresentable rather than clamped. A quiet band sits dark at the palette bottom
+      // because there is genuinely nothing above the noise, which is the honest picture.
       const { floor: dispFloor, ceil: dispCeil } = applyGainZero(
         agcFloor,
-        Math.max(agcCeil, agcFloor + dbToSpan(MIN_DYN_DB)),
+        agcCeil,
         gainRef.current,
         zeroRef.current,
       )
-      // Live Δ-span honesty readout: how much real dynamic range this view holds.
-      const db = Math.round(rowSpanDb(agcFloor, agcCeil))
+      // Live readout: the strongest signal's height ABOVE THE NOISE FLOOR, in dB.
+      //
+      // It used to report the AGC window's own width, which was a real measurement while the
+      // window was fitted to the row — and is now a constant, so it would have read "Δ50 dB"
+      // forever. Peak-over-noise is the number that actually changes, and on a rig scope it is
+      // the more useful one anyway: it is what the operator is looking at the spikes FOR.
+      let peakDisp = 0
+      for (let i = 0; i < visible.length; i++) if (visible[i] > peakDisp) peakDisp = visible[i]
+      const db = Math.round(rowSpanDb(agcFloor, peakDisp))
       if (Number.isFinite(db) && db !== spanDbRef.current) {
         spanDbRef.current = db
         setSpanDb(db)
@@ -488,9 +598,27 @@ export function PhoneScope({
         mag[x] = t
       }
 
-      // Append this row to the retained history over its OWN view window (so a palette
-      // switch / resize re-renders accumulated history frequency-honestly).
-      historyRef.current.push(mag, lo, hi, Date.now())
+      // Append this row to the retained history as normalized intensities over the ROW's OWN
+      // span — the same contract the FT waterfall uses (Waterfall.tsx), and not what this
+      // scope used to do.
+      //
+      // ⚠️ IT USED TO PUSH `mag`: the row already interpolated to DEVICE COLUMNS, stamped with
+      // the VIEW's span. Three things followed, and the first is the bad one:
+      //   1. history was CLIPPED TO THE VIEW, permanently. Everything outside the drawn window
+      //      was not hidden, it was never stored — so the pause + wheel-scrollback below could
+      //      never widen, and no zoom-out could recover a band that had already gone past.
+      //   2. `push` then resampled device columns back onto its own grid, so every row was
+      //      resampled TWICE on the way in, neither pass reversible.
+      //   3. a resize re-rendered accumulated history at the OLD geometry's interpolation.
+      // `renderInto` maps each stored row from its own frame onto whatever view is asked for
+      // (and floors the pixels outside it), so storing the row is strictly more information
+      // for strictly less work.
+      if (binBufN !== nBins || !binBuf) {
+        binBuf = new Float32Array(nBins)
+        binBufN = nBins
+      }
+      for (let b = 0; b < nBins; b++) binBuf[b] = normalize(row[b], dispFloor, dispCeil)
+      historyRef.current.push(binBuf, rowLo, rowHi, Date.now())
 
       // PAUSED = review mode: history keeps filling (nothing is lost) but the scope is frozen;
       // the mouse wheel scrolls the band back via rebuildFromHistory. Skip the live draw.
@@ -524,11 +652,11 @@ export function PhoneScope({
       }
 
       // Fast-attack / slow-decay hold for the trace: a new signal jumps up instantly,
-      // a pause fades down over ~TRACE_FADE_TAU_MS instead of strobing per frame.
+      // a pause fades down over ~traceHoldMs instead of strobing per frame.
       const nowTs = performance.now()
       const dt = lastHoldTs > 0 ? nowTs - lastHoldTs : ROW_MS
       lastHoldTs = nowTs
-      const decay = Math.exp(-dt / TRACE_FADE_TAU_MS)
+      const decay = traceHoldDecay(dt, traceHoldRef.current)
       const hold = holdBuf
       for (let x = 0; x < Wd; x++) {
         const h = hold[x] * decay
@@ -539,13 +667,20 @@ export function PhoneScope({
       ctx.fillStyle = `rgb(${lut[0]},${lut[1]},${lut[2]})` // clear trace region to floor color
       ctx.fillRect(0, 0, Wd, traceHd)
       const name = resolveColormap(paletteRef.current, themeRef.current)
-      const c0 = sampleLut(name, 0.3)
-      const c1 = sampleLut(name, 0.7)
-      const c2 = sampleLut(name, 1.0)
-      const grad = ctx.createLinearGradient(0, traceHd, 0, 0)
-      grad.addColorStop(0, `rgba(${c0[0]},${c0[1]},${c0[2]},0.45)`)
-      grad.addColorStop(0.6, `rgba(${c1[0]},${c1[1]},${c1[2]},0.8)`)
-      grad.addColorStop(1, `rgba(${c2[0]},${c2[1]},${c2[2]},0.95)`)
+      const gk = `${name}:${traceHd}`
+      if (!gradCache || gk !== gradKey) {
+        const c0 = sampleLut(name, 0.3)
+        const c1 = sampleLut(name, 0.7)
+        const c2 = sampleLut(name, 1.0)
+        const g = ctx.createLinearGradient(0, traceHd, 0, 0)
+        g.addColorStop(0, `rgba(${c0[0]},${c0[1]},${c0[2]},0.45)`)
+        g.addColorStop(0.6, `rgba(${c1[0]},${c1[1]},${c1[2]},0.8)`)
+        g.addColorStop(1, `rgba(${c2[0]},${c2[1]},${c2[2]},0.95)`)
+        traceStroke = `rgb(${c2[0]},${c2[1]},${c2[2]})`
+        gradCache = g
+        gradKey = gk
+      }
+      const grad = gradCache
       const yFor = (t: number) => traceHd - t * (traceHd - 1)
       // filled area under the curve
       ctx.beginPath()
@@ -559,7 +694,7 @@ export function PhoneScope({
       ctx.beginPath()
       ctx.moveTo(0, yFor(hold[0]))
       for (let x = 1; x < Wd; x++) ctx.lineTo(x, yFor(hold[x]))
-      ctx.strokeStyle = `rgb(${c2[0]},${c2[1]},${c2[2]})`
+      ctx.strokeStyle = traceStroke
       ctx.lineWidth = Math.max(1, scaleY)
       ctx.stroke()
 
@@ -912,9 +1047,9 @@ export function PhoneScope({
         {spanDb != null && (
           <span
             className="ph-scope-dyn"
-            title="Real dynamic range in this view — a small Δ means the colors are mostly noise floor (a quiet band now renders dark instead of stretched rainbow)"
+            title="How far the strongest signal in this view stands above the noise floor. The scope's vertical scale is FIXED at 50 dB above the noise, so a louder signal really does draw a taller spike — use G to widen or tighten that window."
           >
-            Δ{spanDb} dB
+            ▲{spanDb} dB
           </span>
         )}
         <label className="ph-scope-gz" title="Visual gain — stretch (right) or flatten (left) the color contrast">
@@ -941,6 +1076,21 @@ export function PhoneScope({
             aria-label="Scope visual zero (floor)"
           />
         </label>
+        <button
+          type="button"
+          className={`ph-scope-btn${scopeWin !== 'balanced' ? ' on' : ''}`}
+          aria-label={`Scope resolution ${SCOPE_WINDOWS.find((w) => w.id === scopeWin)?.label} — click to change`}
+          title={SCOPE_WINDOWS.find((w) => w.id === scopeWin)?.title}
+          onClick={() => {
+            const i = SCOPE_WINDOWS.findIndex((w) => w.id === scopeWin)
+            const next = SCOPE_WINDOWS[(i + 1) % SCOPE_WINDOWS.length].id
+            setScopeWin(next)
+            scopeWinRef.current = next
+            surfaceSet(PHSCOPE_WIN_KEY, next)
+          }}
+        >
+          {SCOPE_WINDOWS.find((w) => w.id === scopeWin)?.label}
+        </button>
         <button
           type="button"
           className={`ph-scope-btn${dss ? ' on' : ''}`}

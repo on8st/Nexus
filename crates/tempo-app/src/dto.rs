@@ -78,6 +78,22 @@ pub struct Station {
     /// station is known only from free-text attribution.
     #[serde(default)]
     pub freq_hz: Option<i32>,
+    /// Who this station is calling — the addressee of its last structured frame. `None`
+    /// means it addressed nobody (a CQ), which the roster renders as "CQ". Lets the
+    /// operator see who is already engaged before double-clicking a row.
+    #[serde(default)]
+    pub calling: Option<String>,
+    /// Primary administrative subdivision — a US state or a Canadian province, as the ADIF
+    /// `STATE` code either way. From the callsign (the FCC index / the Canadian regional
+    /// numeral) or the heard grid: the SAME hint the needed board and WAS use, never a
+    /// callbook lookup. `None` for a station in neither country, or when no resolver is wired.
+    /// Stamped by the engine snapshot loop (the resolver lives there).
+    ///
+    /// Named `state` and not `us_state` because it stopped being US-only, and because ADIF's
+    /// own `STATE` means exactly this: a field whose name promises a country it no longer
+    /// keeps is how two readers end up guessing different things off one wire.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// A single decoded signal from the most recent RX slot, for the live decode
@@ -595,6 +611,13 @@ pub struct RadioStatus {
     pub comp: Option<bool>,
     #[serde(default)]
     pub vox: Option<bool>,
+    /// The rig's BUILT-IN ANTENNA TUNER (Hamlib `RIG_FUNC_TUNER`): `None` = the radio doesn't
+    /// report one, so no ATU control is offered at all; `Some(bool)` = it has one, and the bool is
+    /// whether the tuner is currently switched in-line. Same `None = can't do it` idiom as the DSP
+    /// funcs above — but NOT one of them: running the tuner keys the transmitter, so it rides its
+    /// own gated command (`atu_tune`), never the generic `set_rig_func`.
+    #[serde(default)]
+    pub atu: Option<bool>,
     /// Rig RX passband / filter width in Hz from CAT; `None` = unknown or the rig's own default.
     #[serde(default)]
     pub filter_width_hz: Option<u32>,
@@ -670,6 +693,12 @@ pub struct RadioStatus {
     /// The dial (MHz) the radio most recently REFUSED, so the UI can name it. `None` = none.
     #[serde(default)]
     pub refused_dial_mhz: Option<f64>,
+    /// The AGC speed ("fast"|"mid"|"slow") the radio most recently REFUSED — Hamlib's AGC is an
+    /// enum and backends do not all implement every step, MEDIUM least of all. The cockpit's
+    /// segmented chip is optimistic (the rig read-back lags a poll), so without this it would
+    /// keep claiming a speed the radio never took. `None` = the last AGC write was accepted.
+    #[serde(default)]
+    pub refused_agc: Option<String>,
     /// The CW keyer backend: "cat" (the rig generates CW → rig in CW mode) or "soundcard"
     /// (a keyed audio tone → rig deliberately in USB/LSB). Surfaced so the CW cockpit's
     /// toggle reflects the ACTUAL backend setting instead of a stale local default — that
