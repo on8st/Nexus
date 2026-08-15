@@ -7,6 +7,7 @@
 // model and audio devices onto radio 1's profile, persisted. Operator report, 2026-07-25: with
 // two radios configured, both ended up on one set of comm ports.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { confirmDialog } from '../confirm'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { SettingsPanel } from './SettingsPanel'
 import type { FeaturesApi } from '../useFeatures'
@@ -26,6 +27,14 @@ const api = vi.hoisted(() => {
 // Mock EVERY export of `../api`, derived from the real module rather than a hand-kept list.
 // A verb missing from a literal list makes the panel THROW ON MOUNT, which reads as a behaviour
 // regression rather than the out-of-date mock it is.
+// window.confirm is INERT in the Tauri webview, so destructive actions now go through the
+// in-app dialog (src/confirm.tsx). Mock THAT -- mocking window.confirm tested a dialog the real
+// app never shows, which is exactly how the dead-confirm bug survived a green suite.
+vi.mock('../confirm', () => ({
+  confirmDialog: vi.fn(() => Promise.resolve(true)),
+  ConfirmHost: () => null,
+}))
+
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   const mod: Record<string, unknown> = {}
@@ -166,38 +175,36 @@ describe('Config tab: backup, restore and reset', () => {
   })
 
   it('Reset asks first, and does nothing when declined', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const confirmSpy = vi.mocked(confirmDialog).mockResolvedValue(false)
     renderPanel()
     await openTab()
     fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
     await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
     expect(api.get('resetSettings')).not.toHaveBeenCalled()
-    confirmSpy.mockRestore()
   })
 
   it('the confirmation states what survives — the logbook and the keychain', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const confirmSpy = vi.mocked(confirmDialog).mockResolvedValue(false)
     renderPanel()
     await openTab()
     fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
     await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
     // "Reset" is the word an operator fears for their QSOs. The prompt must answer that before
     // they have to wonder.
-    const msg = String(confirmSpy.mock.calls[0]?.[0] ?? '')
+    const call = confirmSpy.mock.calls[0]?.[0]
+    const msg = `${call?.title ?? ''} ${call?.body ?? ''}`
     expect(msg).toMatch(/LOGBOOK is not touched/i)
     expect(msg).toMatch(/keychain/i)
     expect(msg).toMatch(/cannot be undone/i)
-    confirmSpy.mockRestore()
   })
 
   it('accepted, it resets through the backend verb', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(confirmDialog).mockResolvedValue(true)
     renderPanel()
     await openTab()
     fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
     await waitFor(() => expect(api.get('resetSettings')).toHaveBeenCalled())
     // Never by deleting the settings file: a running app holds the old config in memory and
     // writes it straight back, so a file-delete "reset" silently un-resets itself.
-    confirmSpy.mockRestore()
   })
 })

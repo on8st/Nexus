@@ -68,6 +68,7 @@ import {
   n3fjpTestConnection,
 } from '../api'
 import { pushToast, withErrorToast } from '../toast'
+import { confirmDialog } from '../confirm'
 import { loadProfiles, mergeProfile, saveProfile, deleteProfile, type Profile } from '../profiles'
 import {
   getAssistanceJournal,
@@ -542,11 +543,14 @@ export function SettingsPanel({
     // Destructive and not undoable, so it asks — and names what goes, because "restore" sounds
     // additive and is not.
     if (
-      !window.confirm(
-        `Replace your current setup with ${f.name}?\n\nYour radios, preferences, memory ` +
-          `channels, watchlist and chase sets will be replaced. Your contact log is not ` +
-          `affected. This cannot be undone.`,
-      )
+      !(await confirmDialog({
+        title: `Replace your current setup with ${f.name}?`,
+        body:
+          'Your radios, preferences, memory channels, watchlist and chase sets will be replaced. ' +
+          'Your contact log is not affected. This cannot be undone.',
+        confirmLabel: 'Restore',
+        danger: true,
+      }))
     ) {
       return
     }
@@ -1248,10 +1252,15 @@ export function SettingsPanel({
     )
   }
 
-  const resetOverrides = () => {
+  const resetOverrides = async () => {
     if (
       (form?.workingFrequencies?.length ?? 0) > 0 &&
-      !window.confirm('Clear all working-frequency overrides and go back to the stock WSJT-X table?')
+      !(await confirmDialog({
+        title: 'Clear all working-frequency overrides?',
+        body: 'The stock WSJT-X frequency table is restored.',
+        confirmLabel: 'Clear overrides',
+        danger: true,
+      }))
     ) {
       return
     }
@@ -1316,11 +1325,18 @@ export function SettingsPanel({
       if (added) setEditingRadioId(added.id)
     })
   }
-  const handleRemoveRadio = (id: number) => {
+  const handleRemoveRadio = async (id: number) => {
     // Destructive + immediate + unrecoverable (drops the radio's CAT/audio config, its unique
     // rigctld port, and band coverage) — confirm before removing.
     const r = form?.radios?.find((p) => p.id === id)
-    if (!window.confirm(`Remove ${r?.name ?? 'this radio'}? This deletes its CAT/audio config and can't be undone.`)) {
+    if (
+      !(await confirmDialog({
+        title: `Remove ${r?.name ?? 'this radio'}?`,
+        body: "This deletes its CAT/audio config, its rigctld port and its band coverage. Your contact log is not affected. This can't be undone.",
+        confirmLabel: 'Remove radio',
+        danger: true,
+      }))
+    ) {
       return
     }
     void withErrorToast(() => removeRadio(id), 'Could not remove the radio').then((s) => s && reloadRadios())
@@ -1391,9 +1407,17 @@ export function SettingsPanel({
   // EDIT a radio's config without touching what you're operating on: load that radio's profile
   // into the rig form LOCALLY (no backend call, no live rig swap, no dropped carrier). Save then
   // writes just this radio (via update_radio_profile) when it isn't the active one.
-  const handleConfigureRadio = (id: number) => {
+  const handleConfigureRadio = async (id: number) => {
     if (id === editingRadioId) return
-    if (dirtyRef.current && !window.confirm('Discard unsaved changes to the radio you were editing?')) {
+    if (
+      dirtyRef.current &&
+      !(await confirmDialog({
+        title: 'Discard unsaved changes to the radio you were editing?',
+        body: 'The edits you have not saved for that radio are lost.',
+        confirmLabel: 'Discard and switch',
+        danger: true,
+      }))
+    ) {
       return
     }
     const r = form?.radios?.find((p) => p.id === id)
@@ -1405,8 +1429,16 @@ export function SettingsPanel({
 
   // MAKE ACTIVE — the operating radio swap (carrier dropped first). Separate from Edit now, so
   // configuring a second rig no longer forces you to start operating on it.
-  const handleMakeActive = (id: number) => {
-    if (dirtyRef.current && !window.confirm('Discard unsaved changes and switch the operating radio?')) {
+  const handleMakeActive = async (id: number) => {
+    if (
+      dirtyRef.current &&
+      !(await confirmDialog({
+        title: 'Discard unsaved changes and switch the operating radio?',
+        body: 'The carrier is dropped before the swap. Unsaved edits to the radio you were editing are lost.',
+        confirmLabel: 'Discard and switch',
+        danger: true,
+      }))
+    ) {
       return
     }
     void withErrorToast(() => setActiveRadio(id), 'Could not switch radios').then((s) => {
@@ -1697,12 +1729,15 @@ export function SettingsPanel({
   // machinery to make this reversible is one click away and there is no excuse not to point at it.
   const handleResetConfig = async () => {
     if (
-      !window.confirm(
-        'Reset ALL settings to factory defaults?\n\n' +
-          'Your radios, audio devices, callsign and preferences are erased.\n' +
-          'Your LOGBOOK is not touched, and stored passwords stay in the keychain.\n\n' +
-          'This cannot be undone — back up first if you have not.',
-      )
+      !(await confirmDialog({
+        title: 'Reset ALL settings to factory defaults?',
+        body:
+          'Your radios, audio devices, callsign and preferences are erased. Your LOGBOOK is not ' +
+          'touched, and stored passwords stay in the keychain. This cannot be undone — back up ' +
+          'first if you have not.',
+        confirmLabel: 'Reset everything',
+        danger: true,
+      }))
     ) {
       return
     }
@@ -2469,12 +2504,19 @@ export function SettingsPanel({
                     title={p.blurb}
                     onClick={() => {
                       // Switching from a hand-tuned set discards it — confirm first.
-                      if (
-                        features.profile !== 'custom' ||
-                        window.confirm(`Switch to “${p.label}”? This replaces your custom feature set.`)
-                      ) {
-                        features.applyProfile(p.id)
-                      }
+                      void (async () => {
+                        if (
+                          features.profile !== 'custom' ||
+                          (await confirmDialog({
+                            title: `Switch to “${p.label}”?`,
+                            body: 'This replaces your custom feature set.',
+                            confirmLabel: 'Switch',
+                            danger: true,
+                          }))
+                        ) {
+                          features.applyProfile(p.id)
+                        }
+                      })()
                     }}
                   >
                     {p.label}

@@ -8,6 +8,7 @@
 // ClubLog auto-revokes once it becomes public. If the wording and the redaction ever drift
 // apart, the wording is the one that gets believed.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { confirmDialog } from '../confirm'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { SettingsPanel } from './SettingsPanel'
 import type { FeaturesApi } from '../useFeatures'
@@ -30,6 +31,14 @@ const api = vi.hoisted(() => {
 // defined on the mock"), which presents as a behaviour regression in whichever test happened to
 // run -- not as the out-of-date mock it actually is. Reading the real module's export names makes
 // that failure impossible by construction.
+// window.confirm is INERT in the Tauri webview, so destructive actions now go through the
+// in-app dialog (src/confirm.tsx). Mock THAT -- mocking window.confirm tested a dialog the real
+// app never shows, which is exactly how the dead-confirm bug survived a green suite.
+vi.mock('../confirm', () => ({
+  confirmDialog: vi.fn(() => Promise.resolve(true)),
+  ConfirmHost: () => null,
+}))
+
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   const mod: Record<string, unknown> = {}
@@ -178,7 +187,7 @@ describe('backing up the station', () => {
   // ones: a silent revert of an explicit, confirmed, "this cannot be undone" action. Nothing
   // tested this path at all -- there was not one reference to importSettingsBundle in the suite.
   it('re-reads the settings after a restore, so the panel cannot show stale values', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(confirmDialog).mockResolvedValue(true)
     const { container } = renderPanel()
     fireEvent.click(await screen.findByRole('tab', { name: 'Config' }))
 
@@ -199,7 +208,6 @@ describe('backing up the station', () => {
     await waitFor(() =>
       expect(api.get('getSettings').mock.calls.length).toBeGreaterThan(before),
     )
-    confirmSpy.mockRestore()
   })
 
   it('offers both halves — a backup is no use without a restore', async () => {
