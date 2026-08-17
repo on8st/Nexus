@@ -222,6 +222,95 @@ pub fn pump(
     Pumped::Published
 }
 
+/// The `P3` byte out of an `SS` reply, checked against the sub-command that was asked for.
+///
+/// The radio answers `SS<P1><P2><P3><P4..P7>;` — e.g. `SS0570000;` for `SS05;` (span code 7 =
+/// 200 kHz). Verified on an FT-710 2026-08-17.
+///
+/// The `P2` check is the point of this function existing rather than an index into the string: the
+/// span and mode reads are two commands with identically-shaped replies, and on a link that can
+/// interleave, taking byte 4 of "whatever came back" would silently read the span code as a mode.
+/// A mode of `7` is CURSOR — which the caller then refuses to place — so the failure would look
+/// like a scope that mysteriously stopped working rather than a crossed reply.
+pub fn parse_ss_reply(reply: &str, expect_p2: u8) -> Option<u8> {
+    let b = reply.trim().as_bytes();
+    // "SS" + P1 + P2 + P3 … ';' — at least 6 bytes before the P3 can exist.
+    if b.len() < 6 || &b[0..2] != b"SS" || b[3] != expect_p2 {
+        return None;
+    }
+    Some(b[4])
+}
+
+/// The metadata the reader thread needs, shared with whoever owns the CAT link.
+///
+/// `None` = not established yet (or no longer trustworthy). The reader treats that as
+/// [`Pumped::Unavailable`] and clears the RF feed rather than publishing rows it cannot place.
+pub type SharedMeta = std::sync::Arc<std::sync::Mutex<Option<SweepMeta>>>;
+
+/// A running reader: a thread that pumps frames into the feed until dropped.
+///
+/// WHY A THREAD AND NOT THE RADIO POLL LOOP. The loop's heavy tick is `RIG_POLL_MS` = 750 ms, and
+/// one frame per tick is ~1.3 rows/s — a waterfall that scrolls once a second is not a waterfall.
+/// A read costs 12 ms measured, so a dedicated reader at ~15/s is cheap and never blocks CAT: the
+/// bridge is a SEPARATE USB function from the CAT port, which is the whole reason this is
+/// possible at all.
+///
+/// Lifecycle mirrors [`crate::flexspectrum::FlexSpectrum`] deliberately — that is the existing
+/// answer in this codebase to "a second device that feeds the spectrum": the owner holds it in an
+/// `Option` beside a KEY, and a rig switch drops it (stopping the thread) before starting the one
+/// the new radio needs. Getting that wrong is how a scope keeps streaming the previous radio's
+/// band, which is the dual-radio fault this project has already been bitten by elsewhere.
+pub struct YaesuWaterfall {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl YaesuWaterfall {
+    /// Start reading. `interval` paces the reads; the thread exits on drop.
+    pub fn start(
+        mut src: Box<dyn WaterfallSource + Send>,
+        feed: tempo_app::engine::SpectrumFeed,
+        meta: SharedMeta,
+        interval: std::time::Duration,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                // Copied out under the lock, never held across the SPI read: the CAT side must
+                // never wait on a USB transaction to publish a new span.
+                let m = meta.lock().ok().and_then(|g| *g);
+                match m {
+                    Some(m) => {
+                        if pump(src.as_mut(), &feed, m) == Pumped::Unavailable {
+                            feed.clear_rf();
+                        }
+                    }
+                    // Metadata not established: no row can be placed, so nothing stale may stay.
+                    None => feed.clear_rf(),
+                }
+                std::thread::sleep(interval);
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for YaesuWaterfall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        // NOT clearing the feed here: the owner decides what replaces this source. A rig switch
+        // starts another reader immediately, and blanking in between is a flicker.
+    }
+}
+
 /// The FT4222 transport — the ONE part that needs FTDI's closed-source library.
 ///
 /// ⚠️ **FORK-LOCAL, AND OFF BY DEFAULT.** `LibFT4222`/`D2XX` are closed-source binaries and Nexus
@@ -448,6 +537,86 @@ mod tests {
             ..meta
         };
         assert_eq!(pump(&mut src, &feed, cursor), Pumped::Unavailable);
+    }
+
+    /// The replies the radio actually sent, and the crossed-reply case the P2 check exists for.
+    #[test]
+    fn an_ss_reply_yields_its_p3_only_for_the_subcommand_asked_for() {
+        // Captured from the FT-710 on 2026-08-17.
+        assert_eq!(parse_ss_reply("SS0570000;", b'5'), Some(b'7')); // span  = 200 kHz
+        assert_eq!(parse_ss_reply("SS0640000;", b'6'), Some(b'4')); // mode  = W/F CENTER (NORMAL)
+        assert_eq!(parse_ss_reply("SS0000000;", b'0'), Some(b'0')); // speed = SLOW1
+
+        // A span reply must NOT satisfy a mode read. Byte 4 of this string is '7', which as a
+        // MODE code means CURSOR — so without the check the scope would quietly refuse to draw.
+        assert_eq!(parse_ss_reply("SS0570000;", b'6'), None);
+
+        // Rubbish and truncation are refused rather than indexed into.
+        assert_eq!(parse_ss_reply("?;", b'5'), None);
+        assert_eq!(parse_ss_reply("SS05", b'5'), None);
+        assert_eq!(parse_ss_reply("", b'5'), None);
+        assert_eq!(parse_ss_reply("FA014100000;", b'5'), None);
+    }
+
+    /// The reader thread, end to end: rows appear while it runs, and it stops on drop.
+    #[test]
+    fn the_reader_publishes_while_it_runs_and_stops_when_dropped() {
+        use std::time::Duration;
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
+            dial_hz: 14_100_000.0,
+            span_code: b'7',
+            mode_code: b'4',
+        })));
+        let reader = YaesuWaterfall::start(
+            Box::new(MockWaterfall::ramp()),
+            feed.clone(),
+            meta.clone(),
+            Duration::from_millis(1),
+        );
+        // Give it a few cycles — deliberately generous so a loaded machine does not make this
+        // flaky, the mistake the pipe-buffer test taught.
+        std::thread::sleep(Duration::from_millis(120));
+        let row = feed.row().expect("the reader published a row");
+        assert_eq!(row.source, SOURCE);
+        assert_eq!((row.lo_hz, row.hi_hz), (14_000_000.0, 14_200_000.0));
+
+        drop(reader); // joins; a leaked thread would keep writing after the owner let go
+        let after = feed.row();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            feed.row().map(|r| r.row.len()),
+            after.map(|r| r.row.len()),
+            "nothing may be published after the reader is dropped"
+        );
+    }
+
+    /// Metadata we do not have must CLEAR the feed, not leave the last row standing: the row would
+    /// claim a band the radio is no longer looking at.
+    #[test]
+    fn unknown_metadata_clears_the_feed_rather_than_leaving_a_stale_row() {
+        use std::time::Duration;
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
+            dial_hz: 14_100_000.0,
+            span_code: b'7',
+            mode_code: b'4',
+        })));
+        let _reader = YaesuWaterfall::start(
+            Box::new(MockWaterfall::ramp()),
+            feed.clone(),
+            meta.clone(),
+            Duration::from_millis(1),
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(feed.row().is_some(), "a row was flowing first");
+
+        *meta.lock().unwrap() = None; // the CAT side lost the span/mode
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            feed.row().is_none(),
+            "an unplaceable row must be cleared, not left on screen"
+        );
     }
 
     /// A short read must be DROPPED, not padded. Half a line rendered as a whole one shows
