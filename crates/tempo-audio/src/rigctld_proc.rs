@@ -1427,7 +1427,9 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args([
             "-c",
-            "for i in $(seq 1 4000); do printf '%0.sx' $(seq 1 50); echo; done",
+            // ONE process, not 8000: the first version looped `seq` 4000 times (~8000 spawns)
+            // and sat right on the 10 s budget — a flaky test dressed up as a slow one.
+            "awk 'BEGIN{ s=\"\"; while (length(s) < 50) s = s \"x\"; for (i = 0; i < 5000; i++) print s }'",
         ]);
         let out = capture_bounded(&mut cmd, std::time::Duration::from_secs(10))
             .expect("a large but finite output must be captured, not time out");
