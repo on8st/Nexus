@@ -210,6 +210,79 @@ offering nothing. The other four are unaffected and can go whenever policy allow
 
 ---
 
+## FT-710 waterfall over USB — feasibility, measured 2026-08-17
+
+**Verdict: technically proven on this station. The remaining blocker is licensing, not protocol.**
+
+### What it is
+
+The FT-710 contains an **FT4222 USB→SPI bridge**. Enable *SCU-LAN10* in the radio's menu and it
+appears as a third USB function alongside the CAT bridge and the codec:
+
+```
+IOUSBHostDevice@02400000                 ← the FT-710's internal hub
+  ├─ CP2105 Dual USB to UART @02410000   ← CAT (/dev/cu.usbserial-01AF7FED0 and …1)
+  ├─ USB Audio Device        @02420000   ← the codec
+  └─ FT4222                  @02430000   ← the waterfall bridge (FTDI, VID 0x0403, PID 0x601C)
+```
+
+It is NOT a serial port and NOT a CAT command. Two dead ends ruled out by measurement first:
+`SS` (SPECTRUM SCOPE) only reads/writes scope SETTINGS — verified against Yaesu's own FT-710 CAT
+manual, and confirmed live (`SS05;` → `SS0570000;`, span = 200 kHz). And nothing arrives
+unsolicited: 0 bytes in 3 s on `…FED1` at 38400 and 115200, and 0 bytes on the CAT port itself
+with no daemon holding it.
+
+### The measurement
+
+`libft4222` on Apple Silicon, SPI master per `ratmandu/YaesuWFTesting`
+(`Mode.SINGLE, Clock.DIV_16, Cpol.IDLE_HIGH, Cpha.CLK_TRAILING, SlaveSelect.SS0`, 48 MHz clock):
+
+```
+40 frames of 4096 B in 0.48 s          → 84 reads/s (12 ms per frame)
+waterfall RX1, 852 bins                → min 0, max 248, mean 184
+bins 0-15                              → 6c c4 c9 b4 b5 bc bd b7 bb ca d8 cb ca bf b4 b7
+unique frames                          → 17/40  (LIVE, not a static buffer)
+bins changed, first vs last frame       → 821/852
+```
+
+No init command is needed — open, configure SPI master, read. CAT kept working throughout on
+`…FED0`: this is a separate USB function, not a shared bus.
+
+### Frame layout (from `ratmandu/YaesuWFTesting`, originally via wfview)
+
+4096-byte frame: waterfall RX1 `0..851`, RX2 `852..1703` (reserved on this model), AF-FFT RX1
+192 B, AF oscilloscope RX1 400 B (128 = zero), then a 144-byte parameter block.
+
+⚠️ **The parameter block did not reproduce.** At the documented offset the 144 bytes are 128 zero
+bytes followed by a repeating `ff 01 ee 01` — an idle/padding pattern, not frequencies or meter
+data. (An earlier note here said "all zeroes"; that was read off the first 24 bytes only. The
+distinction matters: the block is not absent, it carries nothing useful.) So on the FT-710 those
+fields sit at a different offset, or are only populated under conditions we did not hit.
+Irrelevant for a waterfall — the 852 bins are solid — but it is exactly the part that project was
+still working on. Do not build on it without re-deriving it. A real frame is committed as
+`crates/tempo-audio/tests/fixtures/ft710_wf_frame.bin` so the next attempt starts from evidence.
+
+### Why this fits Nexus with little new machinery
+
+The app side already exists: a native-scope path (Icom CI-V, Flex), the `rigscope` pane, and a
+`SpectrumFeed` that takes bins. 852 uint8 bins per frame drop into that without new UI or DSP.
+
+And **radio attribution is already solved** by the USB-topology code this fork carries: the
+FT4222 sits on the same parent hub (`0x2400000`) as the FT-710's CAT port and codec, which is the
+same evidence `usbtopo` already uses to label the codec "USB Audio Device #2 — FT-710". With two
+scope-capable radios that is not a nicety — the scope must bind to the right rig.
+
+### What actually blocks upstreaming
+
+**FTDI's D2XX / LibFT4222 is a closed-source binary library, and Nexus is GPL-3.0-only.** That is
+a per-file licence question to answer BEFORE vendoring anything, and it is the one open item. The
+fork's implementation therefore expects the library to be present on the system and is gated
+behind an off-by-default feature; no FTDI binary is vendored into this repo.
+
+One operational note: the first `open` of the FT4222 hung for ten minutes, and every run after it
+was instant. A one-off claim rather than a protocol problem, but an implementation needs a timeout
+around open rather than trusting it.
+
 ## Station notes
 
 - The FT-710 must be plugged **directly into the Mac**, not through a monitor hub — two stacked
