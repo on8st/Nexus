@@ -8048,6 +8048,14 @@ fn rigctld_launch_failed(e: &std::io::Error) -> String {
              Nexus needs the rigctld program. ({e})"
         );
     }
+    // NOT a launch failure — a REFUSAL, and the distinction is the whole message. Something
+    // already holds the port, so Nexus did not start a daemon that would have talked to it
+    // instead of this radio (see `rigctld_proc::port_already_held`). Prefixing this with "could
+    // not launch" would send the operator to check their Hamlib install, which is fine, while
+    // the actual cause — a stray daemon, or another program on that port — went unmentioned.
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        return e.to_string();
+    }
     format!("Could not launch the bundled rigctld (Hamlib): {e}")
 }
 
@@ -8171,6 +8179,37 @@ fn probe_cat_or_explain(rig: &mut Rig, port: u16) -> (Option<bool>, String) {
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+
+    /// A port clash must not be reported as a Hamlib install problem.
+    ///
+    /// These two failures have opposite cures — one is "install libhamlib-utils", the other is
+    /// "something else is already on that port" — and the operator acts on whichever sentence
+    /// they are shown. The clash arm is what a stray daemon from a previous run produces, so it
+    /// is the one most likely to be read on a working install.
+    #[test]
+    fn a_port_clash_is_not_worded_as_a_missing_rigctld() {
+        let clash = rigctld_launch_failed(&std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "rigctld port 4534 is already in use — another rigctld or program is holding it.",
+        ));
+        assert!(clash.contains("4534"), "must name the port: {clash}");
+        assert!(clash.contains("already in use"), "{clash}");
+        assert!(
+            !clash.contains("Could not launch"),
+            "a refusal is not a launch failure: {clash}"
+        );
+        assert!(
+            !clash.contains("isn't installed"),
+            "must not send the operator to check their Hamlib install: {clash}"
+        );
+
+        // CONTROLS — the other two arms must keep saying what they said.
+        let missing = rigctld_launch_failed(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(missing.contains("isn't installed"), "{missing}");
+        let other =
+            rigctld_launch_failed(&std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(other.contains("Could not launch"), "{other}");
+    }
 
     /// What `sat_tune_nominal` is told the bird needs the radio to be in —
     /// named for the same reason the engine's tests name them: the argument's

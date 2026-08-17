@@ -1157,6 +1157,49 @@ fn parse_settable_lines(show_conf: &str) -> SettableLines {
     }
 }
 
+/// Is `tcp_port` already held by something? `Some(err)` if it is, and that error is what the
+/// caller should surface verbatim.
+///
+/// WHY THIS EXISTS. Nothing checked, so Nexus would spawn a daemon onto a port another daemon
+/// already had. rigctld exits almost immediately when it cannot bind — but "almost" is the
+/// problem: for the moment before it does, [`RigctldProc::is_alive`] answers `true`, the caller
+/// connects, and it reaches the FOREIGN daemon holding the port. That daemon may be driving a
+/// DIFFERENT RADIO, which is the crossed-CAT fault `is_alive`'s own doc warns about.
+///
+/// Observed on macOS 2026-08-17, on a two-radio station: an earlier Nexus exited leaving its
+/// rigctld running (macOS has no equivalent of the Windows kill-on-close Job Object, and `Drop`
+/// does not run on an app quit). The next launch spawned a SECOND daemon for the same rig on the
+/// same already-held serial device and the same already-bound TCP port, left the other radio with
+/// no daemon at all, and reported nothing anywhere. From the operator's chair: one radio dead,
+/// one radio possibly answering as the other, and no error to explain either.
+///
+/// **A refusal here is the honest answer, not a workaround.** Nexus must not kill the process on
+/// that port: the rig-share feature (#48) exists precisely so OTHER programs can hold a rigctld,
+/// and a radio may be configured against an external daemon deliberately. So the port's owner is
+/// left strictly alone and the operator is told which port and what to do about it.
+///
+/// Only `AddrInUse` refuses. Any other bind error (a privileged port, an exhausted descriptor
+/// table) is NOT evidence that a daemon is there, so it falls through and lets rigctld try and
+/// report in its own words — a guard that refuses on the wrong evidence is worse than no guard.
+fn port_already_held(tcp_port: u16) -> Option<std::io::Error> {
+    match std::net::TcpListener::bind(("127.0.0.1", tcp_port)) {
+        Ok(l) => {
+            drop(l); // free it again immediately — rigctld is the one that must own it
+            None
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "rigctld port {tcp_port} is already in use — another rigctld or program is \
+                 holding it. Nexus did not start a second daemon on it, because it would have \
+                 talked to that one instead of this radio. Stop the other program, or give this \
+                 radio a different rigctld port in Settings ▸ Radio."
+            ),
+        )),
+        Err(_) => None,
+    }
+}
+
 /// Spawn `rigctld` for `model` on `serial_port`@`baud`, listening on
 /// `tcp_port`. Returns a kill-on-drop handle. Uses the bundled Hamlib if present
 /// (see [`resolve_rigctld`]), otherwise a `rigctld` on `PATH`.
@@ -1184,6 +1227,11 @@ pub fn spawn_rigctld(
         let deliberate = rts_is_deliberate(ptt_line, keying.rts_declared, addr);
         resolve_lines(settable_lines_for(model, ptt_line), want, deliberate)
     };
+    // DO NOT SPAWN ONTO A PORT SOMEBODY ELSE HOLDS. See [`port_already_held`] — this is the
+    // check [`RigctldProc::is_alive`] documents the consequence of not having.
+    if let Some(e) = port_already_held(tcp_port) {
+        return Err(e);
+    }
     let args = rigctld_args(model, addr, baud, tcp_port, network, ptt_line, lines);
     let mut cmd = Command::new(resolve_rigctld());
     cmd.args(&args);
@@ -1255,6 +1303,66 @@ pub fn spawn_rigctld(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stray daemon on the port must STOP the spawn, not be spawned over.
+    ///
+    /// The incident (macOS, 2026-08-17, two radios): a previous Nexus exited leaving its rigctld
+    /// alive, and the next launch put a second daemon on the same already-bound port and the same
+    /// already-open serial device — silently. `is_alive` cannot save the caller here, because for
+    /// the moment before the loser exits it answers `true` and the caller connects to the WRONG
+    /// radio's daemon.
+    ///
+    /// The listener below stands in for the stray daemon: what matters to the check is that the
+    /// port is held, not by whom.
+    #[test]
+    fn a_port_another_daemon_holds_refuses_the_spawn_instead_of_duplicating_it() {
+        // Port 0 = let the OS pick a free one, so this test cannot collide with a real daemon
+        // (including the operator's own, if the suite runs on a live station).
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a spare port");
+        let taken = squatter.local_addr().unwrap().port();
+
+        // `RigctldProc` is not Debug (it owns a Child), so match rather than `expect_err` —
+        // and an Ok here would ALSO mean a daemon got spawned, which is the failure itself.
+        let err = match spawn_rigctld(
+            1049,
+            "/dev/null", // never opened: the refusal happens before anything is spawned
+            38400,
+            taken,
+            false,
+            KeyingFacts::default(),
+            ControlLines::default(),
+        ) {
+            Ok(_) => panic!("spawned a second daemon onto a port another one already holds"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        // The message has to name the port and offer the way out — an operator reading it in a
+        // toast is the whole point of returning an error rather than logging one.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&taken.to_string()),
+            "must name the port: {msg}"
+        );
+        assert!(msg.contains("rigctld port"), "{msg}");
+
+        // POSITIVE CONTROL. The same check must PASS on a free port, or the test above would
+        // pass for a rig that simply refuses everything. Freeing the squatter is what makes the
+        // port free, so this also proves the check reads the live state rather than a cache.
+        drop(squatter);
+        assert!(
+            port_already_held(taken).is_none(),
+            "a released port must be spawnable again"
+        );
+    }
+
+    /// The guard must not invent a squatter: an ordinary free port is not refused.
+    #[test]
+    fn a_free_port_is_not_refused() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        assert!(port_already_held(p).is_none());
+    }
 
     /// Write `body` as an executable shell script in a fresh temp dir and return its path.
     #[cfg(unix)]
