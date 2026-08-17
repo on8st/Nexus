@@ -156,6 +156,72 @@ impl WaterfallSource for MockWaterfall {
     }
 }
 
+/// What one pump attempt did — three outcomes, because two of them are NOT the same failure.
+///
+/// A dropped frame is transient (a short SPI read, a hiccup) and the caller must KEEP the last
+/// picture: blanking the pane on one bad read is a flicker the operator reads as a dying radio.
+/// `Unavailable` is persistent — the scope is in a mode whose edges CAT does not report — and
+/// there the stale row must be CLEARED, or the pane keeps showing a band that is no longer what
+/// the rig is looking at. The CI-V path draws the same line with `clear_rf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pumped {
+    /// A row reached the feed.
+    Published,
+    /// Transient read fault — keep whatever is on screen.
+    Dropped,
+    /// The row cannot be placed on the band at all — the caller should clear the RF feed.
+    Unavailable,
+}
+
+/// What the radio has to tell us over CAT before a row can be placed on the band.
+///
+/// The bins arrive over SPI with no metadata at all — no centre, no span, no mode. Those three
+/// come from `SS<P1>5;` / `SS<P1>6;` and the dial, which is why this transport is useless on its
+/// own and pairs with the CAT link rather than replacing it.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepMeta {
+    pub dial_hz: f64,
+    /// `P3` of `SS<P1>5;` — the SPAN code, as the ASCII byte the radio sent.
+    pub span_code: u8,
+    /// `P3` of `SS<P1>6;` — the MODE code, as the ASCII byte the radio sent.
+    pub mode_code: u8,
+}
+
+/// The feed label for rows from this bridge.
+///
+/// ⚠️ MUST match `isRfScopeSource` in `ui/src/waterfall.ts`. That predicate decides whether a row
+/// spans ABSOLUTE RF Hz or demodulated audio Hz, and an unknown label falls through to the audio
+/// reading — so a row would be drawn against a 0–4000 Hz axis with dB-scaled thresholds. Nothing
+/// errors; the waterfall is simply wrong, which is the failure this constant exists to prevent.
+pub const SOURCE: &str = "yaesu";
+
+/// Read one frame and publish it as an RF row.
+///
+/// Takes the feed rather than the engine: the CI-V scope learned this the hard way — going through
+/// the engine mutex starved the panadapter on the same lock that starved the audio row.
+pub fn pump(
+    src: &mut dyn WaterfallSource,
+    feed: &tempo_app::engine::SpectrumFeed,
+    meta: SweepMeta,
+) -> Pumped {
+    let Some((lo_hz, hi_hz)) = sweep_edges(meta.dial_hz, meta.span_code, meta.mode_code) else {
+        return Pumped::Unavailable;
+    };
+    let Ok(raw) = src.read_frame() else {
+        return Pumped::Dropped;
+    };
+    let Some(row) = parse_wf1(&raw) else {
+        return Pumped::Dropped;
+    };
+    feed.publish_rf(tempo_app::dto::Spectrum {
+        row,
+        lo_hz,
+        hi_hz,
+        source: SOURCE.to_string(),
+    });
+    Pumped::Published
+}
+
 /// The FT4222 transport — the ONE part that needs FTDI's closed-source library.
 ///
 /// ⚠️ **FORK-LOCAL, AND OFF BY DEFAULT.** `LibFT4222`/`D2XX` are closed-source binaries and Nexus
@@ -332,6 +398,56 @@ mod tests {
                 && params[128..] == [0xff, 0x01, 0xee, 0x01].repeat(4),
             "the parameter block changed shape — re-derive it before relying on it"
         );
+    }
+
+    /// THE ENGINE CONNECTION: a frame in, an RF row out, with the edges CAT supplied.
+    #[test]
+    fn a_frame_reaches_the_spectrum_feed_as_an_absolute_rf_row() {
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let mut src = MockWaterfall::ramp();
+        let meta = SweepMeta {
+            dial_hz: 14_100_000.0,
+            span_code: b'7', // 200 kHz — what the radio reported
+            mode_code: b'4', // W/F CENTER (NORMAL) — likewise
+        };
+        assert_eq!(pump(&mut src, &feed, meta), Pumped::Published);
+
+        let row = feed.row().expect("a row reached the feed");
+        assert_eq!(row.row.len(), WF1_BINS);
+        assert_eq!(row.lo_hz, 14_000_000.0);
+        assert_eq!(row.hi_hz, 14_200_000.0);
+        assert_eq!(
+            row.source, SOURCE,
+            "the label the UI's isRfScopeSource must recognise"
+        );
+    }
+
+    /// The two failures are NOT interchangeable, and the distinction is what the caller acts on:
+    /// a transient read fault keeps the last picture, an unplaceable row clears it.
+    #[test]
+    fn a_transient_fault_is_dropped_but_an_unplaceable_row_is_unavailable() {
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let meta = SweepMeta {
+            dial_hz: 14_100_000.0,
+            span_code: b'7',
+            mode_code: b'4',
+        };
+
+        // A source with nothing to give = transient.
+        let mut empty = MockWaterfall::new(vec![]);
+        assert_eq!(pump(&mut empty, &feed, meta), Pumped::Dropped);
+        // A short frame is the same class.
+        let mut short = MockWaterfall::new(vec![vec![0u8; 10]]);
+        assert_eq!(pump(&mut short, &feed, meta), Pumped::Dropped);
+
+        // A CURSOR/FIX scope mode cannot be placed at all — and the read must not even be
+        // attempted, since the answer would be discarded.
+        let mut src = MockWaterfall::ramp();
+        let cursor = SweepMeta {
+            mode_code: b'7',
+            ..meta
+        };
+        assert_eq!(pump(&mut src, &feed, cursor), Pumped::Unavailable);
     }
 
     /// A short read must be DROPPED, not padded. Half a line rendered as a whole one shows

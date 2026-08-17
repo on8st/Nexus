@@ -1,6 +1,26 @@
 import { describe, it, expect } from 'vitest'
-import { SCOPE_WINDOW_DB, TRACE_HOLD_MS, traceHoldDecay, agcRange, applyGainZero, normalize, parkFloor, WF_FLOOR_PCT, bakeLut, themeColormap, resolveColormap, isSymmetricMode, resampleRow, scopeView, cwScopeWindow, CW_SCOPE_SPAN_HZ, sidebandSign, zoomRange, coerceZoomSpan, WATERFALL_ZOOMS, WF_F_MIN, WF_F_MAX, WF_STD_HI, WF_DB_SPAN, spanDb, dbToSpan, WF_PARK_DB, WF_ZERO_TRIM_DB, flattenRow, WF_FLATTEN_MAX_DB, WF_FLATTEN_SEGMENTS } from './waterfall'
+import { SCOPE_WINDOW_DB, TRACE_HOLD_MS, traceHoldDecay, agcRange, applyGainZero, normalize, parkFloor, WF_FLOOR_PCT, bakeLut, themeColormap, resolveColormap, isSymmetricMode, resampleRow, scopeView, cwScopeWindow, CW_SCOPE_SPAN_HZ, sidebandSign, zoomRange, coerceZoomSpan, WATERFALL_ZOOMS, WF_F_MIN, WF_F_MAX, WF_STD_HI, WF_DB_SPAN, spanDb, dbToSpan, WF_PARK_DB, WF_ZERO_TRIM_DB, flattenRow, WF_FLATTEN_MAX_DB, WF_FLATTEN_SEGMENTS, isRfScopeSource } from './waterfall'
 import { sampleLut } from './colormaps'
+
+describe('isRfScopeSource — which feeds span absolute RF Hz', () => {
+  // A LABEL THIS PREDICATE DOES NOT KNOW IS NOT AN ERROR, IT IS A WRONG PICTURE: the row falls
+  // through to the audio reading and gets drawn against a 0-4000 Hz axis with dB-scaled
+  // thresholds. So the backend's published labels and this list are one fact, and this test is
+  // the seam that keeps them together — `yaesu_wf::SOURCE` is the Rust half.
+  it('knows every native panadapter feed, including the FT-710 bridge', () => {
+    expect(isRfScopeSource('flex')).toBe(true)
+    expect(isRfScopeSource('civ')).toBe(true)
+    expect(isRfScopeSource('yaesu')).toBe(true)
+  })
+
+  it('treats the soundcard FFT and anything unknown as audio-passband', () => {
+    expect(isRfScopeSource('')).toBe(false)
+    expect(isRfScopeSource('audio')).toBe(false)
+    // Deliberate: an unrecognised label must not be guessed into the RF reading either.
+    expect(isRfScopeSource('Yaesu')).toBe(false)
+    expect(isRfScopeSource('sdr')).toBe(false)
+  })
+})
 
 describe('agcRange (visual-AGC)', () => {
   it('returns the percentile floor/ceil of a known distribution', () => {
