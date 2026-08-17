@@ -7941,6 +7941,11 @@ fn open_cat(
     };
     match listening {
         crate::rigctld_server::PortReply::Rigctld => {
+            // A rigctld is there — but WHICH RADIO is it driving? Coexisting without asking is
+            // the crossed-CAT bug the monitor path refuses to risk. Ask before adopting.
+            if let Some(detail) = foreign_daemon_refusal(t, &addr) {
+                return (Rig::vox(), None, CatProbe::status(Some(false), detail));
+            }
             // Auto-coexist: connect THROUGH it instead of fighting for the serial port.
             let mut rig = Rig::with_control(Some(addr.clone()), ptt_mode);
             rig.set_slow_transport(t.is_network() || t.is_slow_serial_link());
@@ -8057,6 +8062,81 @@ fn rigctld_launch_failed(e: &std::io::Error) -> String {
         return e.to_string();
     }
     format!("Could not launch the bundled rigctld (Hamlib): {e}")
+}
+
+/// Is the rigctld already on `addr` driving a DIFFERENT radio than this profile describes? If
+/// so, the operator-facing reason to refuse it; `None` to go ahead and share it.
+///
+/// COEXISTING IS A FEATURE, and this must not break it: an external rigctld on the port is the
+/// manual's own NET-rigctl station, and it is how WSJT-X and Nexus share one rig. What was
+/// missing is the question "is it MY rig?", which the monitor path answers by never coexisting at
+/// all and the active path did not answer at all.
+///
+/// TWO SOURCES OF IDENTITY, strongest first:
+///  1. The daemon's own ARGUMENTS (`-m` model, `-r` device). Local processes only, and it is the
+///     only evidence that separates two IDENTICAL rigs — both answer the same model, but they
+///     cannot be on the same serial device.
+///  2. `\dump_state`'s served model. Works for a daemon on another machine, where no process
+///     list can reach, but cannot tell two same-model rigs apart.
+///
+/// REFUSING NEEDS EVIDENCE. Every "cannot tell" answers `None`: no reply, an unparseable reply,
+/// a remote daemon with no readable process, an unsupported platform. A guard that refused on
+/// silence would take CAT away from exactly the shared setups it is meant to protect.
+///
+/// EXEMPT: a profile whose model is Hamlib's own NET/dummy/software class (`<= 4`, or a
+/// software-CAT profile). "NET rigctl" means "whatever serves this address" — that IS the
+/// operator's instruction, and comparing it against the real rig behind the daemon would refuse
+/// the manual's documented setup.
+fn foreign_daemon_refusal(t: &Transport, addr: &str) -> Option<String> {
+    if t.rig_model <= 4 || crate::rigmodels::is_software_cat_profile(t.rig_model) {
+        return None;
+    }
+    // 1. Process arguments — model AND device.
+    if let Some(d) = crate::rigctld_proc::daemon_serving_port(t.rigctld_port) {
+        let model_differs = d.model.is_some_and(|m| m != t.rig_model);
+        let device_differs = match (&d.device, t.serial_port.as_str()) {
+            (Some(dev), want) if !want.is_empty() && !t.is_network() => dev != want,
+            _ => false,
+        };
+        if model_differs || device_differs {
+            return Some(format!(
+                "The rigctld on :{} is driving a different radio — {} — not this one ({} on {}). \
+                 Nexus did not connect to it, because it would have been reading and commanding \
+                 the wrong rig. Stop that daemon, or give this radio its own rigctld port in \
+                 Settings ▸ Radio.",
+                t.rigctld_port,
+                d.describe(),
+                t.rig_model,
+                if t.serial_port.is_empty() {
+                    "no serial port"
+                } else {
+                    &t.serial_port
+                },
+            ));
+        }
+        // Arguments matched: it IS this rig's daemon (ours, or a restart of it). Share it.
+        return None;
+    }
+    // 2. No local process to read (remote daemon, or a platform without the lookup) — fall back
+    //    to the protocol. Model only, which is weaker but reaches further.
+    let served = crate::rigctld_server::served_rig_model(addr, Duration::from_millis(400))?;
+    // A daemon that answers with Hamlib's own NET/dummy/software class is a RELAY, not a radio:
+    // `rigctld -m 2 -r otherhost:4532` chains to a rig whose real model it never reports, and a
+    // test harness or a broker answers the same way. Its model is therefore not evidence about
+    // the rig at the far end, and "cannot tell" is the only honest reading. The LOCAL case that
+    // motivated all of this is not lost by this: a stray daemon on this machine is identified by
+    // its arguments above, which carry the model AND the device.
+    if served <= 4 || crate::rigmodels::is_software_cat_profile(served) {
+        return None;
+    }
+    (served != t.rig_model).then(|| {
+        format!(
+            "The rigctld on :{} is serving Hamlib model {served}, but this radio is model {}. \
+             Nexus did not connect to it — it would have been commanding a different rig. Stop \
+             that daemon, or give this radio its own rigctld port in Settings ▸ Radio.",
+            t.rigctld_port, t.rig_model,
+        )
+    })
 }
 
 /// The single shared tail of both `open_cat` branches (coexist + spawn): the open-time
