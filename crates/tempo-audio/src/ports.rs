@@ -146,6 +146,7 @@ pub fn available_usb_ports() -> Vec<UsbPort> {
     ports
 }
 
+
 /// macOS lists every serial port two to four times, and the operator pays for it: a station with
 /// TWO radios offered 22 rows, all but four of them the same four ports wearing different names.
 ///
@@ -179,19 +180,10 @@ fn collapse_macos_duplicates(ports: Vec<UsbPort>) -> Vec<UsbPort> {
         2
     }
 
-    // 1. Name-based: /dev/tty.X vs /dev/cu.X. Needs no IOKit, so it still works if topology
-    //    lookup fails entirely.
-    let cu: std::collections::HashSet<String> = ports
-        .iter()
-        .filter_map(|p| p.port_name.strip_prefix("/dev/cu.").map(str::to_string))
-        .collect();
-    let ports: Vec<UsbPort> = ports
-        .into_iter()
-        .filter(|p| match p.port_name.strip_prefix("/dev/tty.") {
-            Some(rest) => !cu.contains(rest),
-            None => true,
-        })
-        .collect();
+    // 1. Name-based: /dev/tty.X vs /dev/cu.X — `collapse_tty_twins`, which needs no IOKit and
+    //    so still works when topology lookup fails entirely. Delegated rather than repeated: this
+    //    step used to be a verbatim copy of that function, and two spellings of one rule drift.
+    let ports = collapse_tty_twins(ports);
 
     // 2. Topology-based: same USB device AND same interface number is the same physical port,
     //    whatever it is called. An empty map (IOKit unavailable) leaves the list untouched.
@@ -224,6 +216,38 @@ fn collapse_macos_duplicates(ports: Vec<UsbPort>) -> Vec<UsbPort> {
         .collect()
 }
 
+/// macOS lists every serial port TWICE: `/dev/cu.X` and `/dev/tty.X` are the same hardware.
+///
+/// They are offered side by side, differ by four characters, and look interchangeable — but only
+/// `cu.*` (callout) is usable for a rig. `tty.*` (dial-in) blocks on carrier detect, so choosing it
+/// does not fail, it HANGS, which is the hardest kind of wrong answer to diagnose. Listing it as an
+/// equal option is offering the operator a choice where one branch is always wrong.
+///
+/// Measured on a two-radio station: 22 rows for 2 radios, half of them tty twins.
+///
+/// A `tty.*` with NO `cu.*` twin is KEPT: it is then the only node there is, and dropping a real
+/// port would look exactly like a rig that stopped existing.
+#[cfg(all(feature = "serial", target_os = "macos"))]
+fn collapse_tty_twins(ports: Vec<UsbPort>) -> Vec<UsbPort> {
+    let callouts: std::collections::HashSet<&str> = ports
+        .iter()
+        .filter_map(|p| p.port_name.strip_prefix("/dev/cu."))
+        .collect();
+    let drop: Vec<String> = ports
+        .iter()
+        .filter(|p| {
+            p.port_name
+                .strip_prefix("/dev/tty.")
+                .is_some_and(|rest| callouts.contains(rest))
+        })
+        .map(|p| p.port_name.clone())
+        .collect();
+    ports
+        .into_iter()
+        .filter(|p| !drop.contains(&p.port_name))
+        .collect()
+}
+
 /// USB serial ports — empty without the `serial` feature (no enumeration backend).
 #[cfg(not(feature = "serial"))]
 pub fn available_usb_ports() -> Vec<UsbPort> {
@@ -232,6 +256,45 @@ pub fn available_usb_ports() -> Vec<UsbPort> {
 
 #[cfg(test)]
 mod tests {
+
+    /// macOS offers every serial port twice. `tty.*` blocks on carrier detect and HANGS rather
+    /// than failing, so it is never the right node for a rig — but it sits beside its `cu.*` twin
+    /// in the picker and looks interchangeable. A two-radio station showed 22 rows for 2 radios.
+    #[cfg(all(feature = "serial", target_os = "macos"))]
+    #[test]
+    fn tty_twins_collapse_but_a_lone_tty_survives() {
+        let mk = |n: &str| UsbPort {
+            port_name: n.to_string(),
+            vid: 0x10c4,
+            pid: 0xea70,
+            product: "CP2105".into(),
+            manufacturer: "Silicon Labs".into(),
+        };
+        let got = collapse_tty_twins(vec![
+            mk("/dev/cu.usbserial-A"),
+            mk("/dev/tty.usbserial-A"),
+            mk("/dev/tty.lonelyport"),
+            mk("/dev/cu.usbserial-B"),
+        ]);
+        let names: Vec<&str> = got.iter().map(|p| p.port_name.as_str()).collect();
+        assert!(
+            names.contains(&"/dev/cu.usbserial-A"),
+            "the callout survives: {names:?}"
+        );
+        assert!(
+            names.contains(&"/dev/cu.usbserial-B"),
+            "and so does the other one: {names:?}"
+        );
+        assert!(
+            !names.contains(&"/dev/tty.usbserial-A"),
+            "the dial-in twin must go: {names:?}"
+        );
+        assert!(
+            names.contains(&"/dev/tty.lonelyport"),
+            "a tty with NO cu twin is the only node there is and must be KEPT: {names:?}"
+        );
+        assert_eq!(got.len(), 3);
+    }
     use super::*;
 
     /// The name-based half of the macOS collapse, which must work even when IOKit gives nothing.

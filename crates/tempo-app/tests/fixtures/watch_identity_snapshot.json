@@ -6,6 +6,7 @@
     "status": "",
     "text": ""
   },
+  "b4MatchMode": false,
   "chatCq": "off",
   "clearTick": null,
   "conversations": [],
@@ -16,6 +17,7 @@
   "link": {
     "dtSec": 0.04749727249145508,
     "freqHz": 1500,
+    "periodSecs": 7.5,
     "quality": 1.0,
     "rv": -1,
     "snrDb": 72.0,
@@ -121,7 +123,8 @@
       "snr": 72,
       "tier": "FT4",
       "txAt": null,
-      "worked": false
+      "worked": false,
+      "workedBand": false
     }
   ],
   "stations": [
@@ -139,7 +142,8 @@
       "snr": 72,
       "state": null,
       "tier": "FT4",
-      "worked": false
+      "worked": false,
+      "workedBand": false
     }
   ],
   "uploadNote": null,

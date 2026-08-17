@@ -29,6 +29,14 @@ ai-cw = ["dep:deepcw"]
 name = "audio_probe"
 required-features = ["device"]
 
+# Same gate as audio_probe: it enumerates real sound cards through `tempo_audio::device`, which
+# only exists with the `device` feature. Without this declaration a bare `cargo test --workspace`
+# — which is exactly what CI runs — tries to build the example featureless and fails on a missing
+# module, taking the whole workspace build down with it.
+[[example]]
+name = "usb_topology"
+required-features = ["device"]
+
 [dependencies]
 tempo-app = { path = "../tempo-app" }
 tempo-core = { path = "../tempo-core" }

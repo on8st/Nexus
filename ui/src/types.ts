@@ -4,7 +4,7 @@
 
 export type Presence = 'active' | 'idle' | 'stale'
 
-export type Tier = 'TempoFast' | 'TempoDeep' | 'FT8' | 'FT4' | 'FST4' | 'FST4W' | 'Q65' | 'MSK144' | 'JT65' | 'WSPR'
+export type Tier = 'TempoFast' | 'TempoDeep' | 'FT8' | 'FT4' | 'FT2' | 'FST4' | 'FST4W' | 'Q65' | 'MSK144' | 'JT65' | 'WSPR'
 
 /** Tiers Nexus DECODES but will not transmit. Mirrors `Capabilities { tx: false }`
  * in the `modes` crate — the engine is the enforcement (it refuses to arm TX or
@@ -927,6 +927,9 @@ export interface Station {
   presence: Presence
   /** True if this callsign has been worked (logged) before. */
   worked: boolean
+  /** Worked before ON THE CURRENT BAND (and mode when b4MatchMode is set) — WSJT-X's
+   * stronger CallBand scope, shown as the solid B4 chip; call-anywhere is the hollow one. */
+  workedBand?: boolean
   /** DXCC entity name (country), resolved from the callsign. */
   country?: string | null
   /** Tier/protocol last heard on — 'TempoFast' = Tempo, 'FT8'/'FT4' = digital ops. The Tempo
@@ -1002,6 +1005,8 @@ export interface Conversation {
 
 export interface LinkState {
   tier: Tier
+  /** The active tier's T/R period (s). MSK144's is a 5/10/15/30 setting — never hardcode. */
+  periodSecs: number
   snrDb: number
   dtSec: number
   freqHz: number
@@ -1380,6 +1385,9 @@ export interface DecodeRow {
    * (token-positional — a DM73 grid never counts). Drives the CQ+73 chip. */
   signoff?: boolean
   worked: boolean
+  /** Worked before ON THE CURRENT BAND (and mode when b4MatchMode is set) — WSJT-X's
+   * stronger CallBand scope, shown as the solid B4 chip; call-anywhere is the hollow one. */
+  workedBand?: boolean
   /** Sender's DXCC entity name (country), resolved from the callsign. */
   country?: string | null
   /** Sender resolves to a DXCC entity never worked on ANY band — a true all-time new one (ATNO). */
@@ -1619,6 +1627,9 @@ export interface JourneyCell {
   key: string
   label: string
   worked: boolean
+  /** Worked before ON THE CURRENT BAND (and mode when b4MatchMode is set) — WSJT-X's
+   * stronger CallBand scope, shown as the solid B4 chip; call-anywhere is the hollow one. */
+  workedBand?: boolean
   confirmed: boolean
 }
 
@@ -2133,6 +2144,9 @@ export interface QsoStatus {
   dxgrid?: string | null
   rxReport: number | null
   running: boolean
+  /** True while a CQ RUN is actually in progress — what the CQ/S&P toggle shows.
+   * `running` above is also true through an S&P QSO and indefinitely after it. */
+  cqRunning: boolean
   /** On-air text of the message queued for the next TX slot ("Now sending"). */
   txNow?: string | null
   /** True when the sequencer has retransmitted to its limit without the partner
@@ -2197,7 +2211,7 @@ export interface FieldDayStatus {
   totalScore?: number
 }
 
-/** Result of the SourceForge update check (Phase 1: notify + open the download page). */
+/** Result of the release-feed update check (Phase 1: notify + open the download page). */
 export interface UpdateInfo {
   /** The running build's version. */
   current: string
@@ -2205,7 +2219,7 @@ export interface UpdateInfo {
   latest: string | null
   /** True only when `latest` is strictly newer than `current`. */
   updateAvailable: boolean
-  /** The SourceForge download page to open. */
+  /** The download page to open (GitHub Releases). */
   downloadUrl: string
 }
 
@@ -2396,6 +2410,9 @@ export interface Settings {
    * ⚠️ Wiring-dependent and wrong for most rigs: on a normal setup plain SSB takes TX audio from
    * the MIC, so the radio transmits with no RF. Correct only when the audio reaches the mic path
    * (an interface wired into the mic jack). RTTY-FSK is unaffected. */
+  /** Fold MODE into the worked-before (B4) and Dupe checks — WSJT-X's HighlightByMode,
+   * default off: worked on 40m marks B4-on-band for 40m in every mode. */
+  b4MatchMode?: boolean
   dataModesPlainSsb: boolean
   /** Antenna rotator: rotctld daemon `host:port` (empty = no rotator). */
   /** Integrated rotator: Hamlib rotator model # (0 = none) + serial port +
@@ -2889,6 +2906,8 @@ export interface AppSnapshot {
   activeRadioId?: number
   /** Peg-lock: band selection won't auto-switch the active radio when true. */
   radioPegged?: boolean
+  /** Mirror of Settings b4MatchMode — the B4/Dupe scope every surface applies. */
+  b4MatchMode?: boolean
   /** AI CW decoder (beta): toggle state, status line, rolling stitched transcript. */
   aiCw: { enabled: boolean; status: string; text: string }
   link: LinkState

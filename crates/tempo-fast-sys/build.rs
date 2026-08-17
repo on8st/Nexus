@@ -85,12 +85,50 @@ fn main() {
     // "ld: library 'gfortran' not found". Ask the toolchain where its own libraries
     // are rather than hardcoding a prefix — that keeps this right on both Apple
     // Silicon (/opt/homebrew) and Intel (/usr/local), and across gcc revisions.
-    if cfg!(target_os = "macos") {
+    // TARGET, not host: `cfg!(target_os)` in a build script describes the machine the script
+    // itself was compiled for, so cross-compiling FROM a Mac would wrongly emit these. The file
+    // already draws that distinction for Windows (`is_cross_to_windows_gnu`); same rule here.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         emit_macos_runtime_search_paths();
+        // ⭐ STATIC on macOS — a SHIP-time lesson, not a build-time one (2026-08-16).
+        // Dynamic -lgfortran/-lfftw3f link fine on the CI runner (brew install gcc fftw)
+        // and then the shipped .app aborts at dyld on every Mac WITHOUT Homebrew's gcc:
+        //   dyld: Library not loaded: /opt/homebrew/opt/gcc/lib/gcc/current/libgfortran.5.dylib
+        // — caught by smoke-macos on a clean runner, the first artifact ever built. The
+        // fix mirrors the Windows build's philosophy: the runtimes travel INSIDE the
+        // binary. libgfortran.a/libquadmath.a ship with Homebrew gcc (covered by the GCC
+        // Runtime Library Exception) and Homebrew fftw ships libfftw3f.a; the search
+        // paths emitted above locate all three. C++ is the OS's own libc++ — the C++
+        // objects in libtempo are compiled by AppleClang here, NOT g++, so linking GNU
+        // libstdc++ would be both wrong and another Homebrew dylib dependency.
+        println!("cargo:rustc-link-lib=static=gfortran");
+        println!("cargo:rustc-link-lib=static=quadmath");
+        println!("cargo:rustc-link-lib=static=fftw3f");
+        // Static libgfortran on Darwin uses EMULATED TLS, and ___emutls_get_address
+        // lives in GCC's own libemutls_w.a — Apple's linker and compiler-rt provide
+        // no such symbol (first static link failed on exactly this, CI 2026-08-16).
+        // The archive sits in the versioned gcc subdirectory, not lib/gcc/current,
+        // so probe its full path rather than reusing the search dirs above.
+        let fc = env::var("FC").unwrap_or_else(|_| "gfortran".into());
+        if let Some(dir) = Command::new(&fc)
+            .arg("-print-file-name=libemutls_w.a")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|p| PathBuf::from(p.trim()))
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.parent().map(PathBuf::from))
+        {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=emutls_w");
+        }
+        println!("cargo:rustc-link-lib=dylib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=gfortran");
+        println!("cargo:rustc-link-lib=dylib=fftw3f");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
-    println!("cargo:rustc-link-lib=dylib=gfortran");
-    println!("cargo:rustc-link-lib=dylib=fftw3f");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=m");
     // The MinGW gfortran runtime also needs quadmath.
     if cfg!(windows) {
@@ -114,6 +152,10 @@ fn main() {
 /// the libraries are somewhere the linker already looks, and a real miss surfaces
 /// as the ld error above with better context than a build-script panic.
 fn emit_macos_runtime_search_paths() {
+    // Same rule as WX above: cargo does not re-run a build script when an env var it READS
+    // changes unless told to, so pointing FC at a different toolchain would otherwise keep
+    // the previously-probed paths.
+    println!("cargo:rerun-if-env-changed=FC");
     let fortran = env::var("FC").unwrap_or_else(|_| "gfortran".into());
     if let Some(dir) = Command::new(&fortran)
         .arg("-print-file-name=libgfortran.dylib")
@@ -125,9 +167,11 @@ fn emit_macos_runtime_search_paths() {
         // -print-file-name echoes the bare name back when it cannot resolve it.
         .filter(|p| p.is_absolute())
         .and_then(|p| p.parent().map(PathBuf::from))
-        // The reported path runs through `../../..` segments; canonicalize so the
-        // emitted -L is the real directory.
-        .and_then(|d| d.canonicalize().ok())
+    // The reported path runs through `../../..` segments, but ld takes them as-is —
+    // deliberately NOT canonicalized. Homebrew's gcc resolves through a version-stable
+    // `current` symlink, and canonicalizing bakes the versioned real dir into the emitted
+    // -L: the script only re-runs on libtempo changes or an FC change, so a `brew upgrade
+    // gcc` would leave a stale path and a link failure that needs a `cargo clean`.
     {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
