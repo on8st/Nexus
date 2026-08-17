@@ -35,3 +35,16 @@ justinjohnson256@gmail.com
 # PR #16 — macOS Hamlib discovery; PR #22 — macOS microphone usage description;
 # the TX drive live-apply and tune-carrier work
 g0fqb1@gmail.com
+
+# ── Fork-local entries (on8st/Nexus). Not upstream's; do not carry these into a PR. ──
+
+# The fork's own identity. GitHub REQUIRES the noreply address on pushes to this fork — a push
+# carrying anything else is rejected GH007 — so every commit made here is authored by it. It is
+# already public in every commit of this fork's history; listing it exposes nothing new.
+258096273+on8st@users.noreply.github.com
+
+# GitHub's committer on merges made in the web UI. on8st's upstream PRs (#71, #72, #77, #78, #79)
+# were merged in the browser, so they return into this fork with GitHub as COMMITTER and on8st as
+# author. Not a person, and not an identity anyone commits as locally — an unavoidable artefact of
+# merging in the browser, which is why the gate has to be told about it rather than argued with.
+noreply@github.com
