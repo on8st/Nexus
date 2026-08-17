@@ -1178,6 +1178,37 @@ impl ServedRig {
     }
 }
 
+/// Run `cmd` and capture its stdout, giving up after `timeout`.
+///
+/// ⚠️ READS AND WAITS TOGETHER, and that is the whole point of it existing. The obvious shape —
+/// spawn, poll `try_wait` to a deadline, then read stdout — DEADLOCKS on any command whose output
+/// exceeds the ~64 KB pipe buffer: the child blocks writing, never exits, and the deadline kills
+/// it. The caller then gets `None` and reads it as "nothing to find".
+///
+/// That is not hypothetical. `daemon_serving_port` shipped with exactly that shape and answered
+/// `None` for EVERY port on a live station — `ps -axo command=` runs well past 64 KB there — so
+/// the crossed-CAT guard silently never fired while all of its unit tests passed, because they
+/// exercise the parser and this is what feeds it.
+///
+/// `output()` drains the pipes while it waits; the bound lives on the receive, so a wedged child
+/// still cannot hold up a rig open (the thread is left to finish on its own).
+fn capture_bounded(cmd: &mut Command, timeout: std::time::Duration) -> Option<String> {
+    let mut owned = Command::new(cmd.get_program());
+    owned.args(cmd.get_args());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            owned
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok(),
+        );
+    });
+    let out = rx.recv_timeout(timeout).ok().flatten()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Which rig is the local rigctld on `tcp_port` serving, read from ITS OWN LAUNCH ARGUMENTS?
 ///
 /// A daemon's argv states both facts that identify a radio: `-m <model>` is the rig type and
@@ -1195,31 +1226,11 @@ impl ServedRig {
 #[cfg(unix)]
 pub fn daemon_serving_port(tcp_port: u16) -> Option<ServedRig> {
     // `ps` rather than a crate: this reads the process list once per CAT open, and it is the one
-    // thing every Unix exposes the same way. BOUNDED, like every other subprocess on this path
-    // (see `runs_ok`) — a wedged `ps` must never hold up a rig open; it just means "cannot tell".
-    let mut child = Command::new("ps")
-        .args(["-axo", "pid=,command="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(_) => return None,
-        }
-    }
-    use std::io::Read;
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    // thing every Unix exposes the same way.
+    let out = capture_bounded(
+        Command::new("ps").args(["-axo", "pid=,command="]),
+        std::time::Duration::from_millis(1_500),
+    )?;
     parse_ps_for_port(&out, tcp_port)
 }
 
@@ -1405,6 +1416,42 @@ pub fn spawn_rigctld(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE DEADLOCK, pinned. A command whose output exceeds the pipe buffer must still be
+    /// captured in full — the shape this replaced blocked the child forever and answered `None`,
+    /// which the caller could not distinguish from "nothing found". 200 KB is comfortably past
+    /// the ~64 KB buffer that made it fail on a real machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_outruns_the_pipe_buffer_is_still_captured_whole() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "for i in $(seq 1 4000); do printf '%0.sx' $(seq 1 50); echo; done",
+        ]);
+        let out = capture_bounded(&mut cmd, std::time::Duration::from_secs(10))
+            .expect("a large but finite output must be captured, not time out");
+        assert!(
+            out.len() > 200_000,
+            "expected >200 KB, got {} — a truncated capture is the deadlock returning early",
+            out.len()
+        );
+    }
+
+    /// And the bound still holds: a command that never finishes is given up on, not waited for.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_never_finishes_gives_up_within_the_bound() {
+        let t0 = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let out = capture_bounded(&mut cmd, std::time::Duration::from_millis(300));
+        assert!(out.is_none());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "must not block on it"
+        );
+    }
 
     /// A daemon states which radio it serves in its own launch arguments — the model AND the
     /// device. Real `ps` output from the station this was written on (2026-08-17).
