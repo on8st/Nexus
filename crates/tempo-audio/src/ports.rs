@@ -146,7 +146,6 @@ pub fn available_usb_ports() -> Vec<UsbPort> {
     ports
 }
 
-
 /// macOS lists every serial port two to four times, and the operator pays for it: a station with
 /// TWO radios offered 22 rows, all but four of them the same four ports wearing different names.
 ///
