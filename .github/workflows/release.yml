@@ -482,187 +482,6 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------------------
-  # macOS — native per-arch build (no lipo/universal binary — see MACOS.md for why). Both
-  # Apple Silicon and Intel are PINNED runner images, same discipline as linux-x86's
-  # ubuntu-24.04 pin: the runner's Xcode/SDK is the floor of what the built .app can run on,
-  # and an unpinned `-latest` label would move that floor on GitHub's schedule, not ours.
-  #
-  # THIS IS THE "SEPARATE DECISION" ci.yml's macos-check job points at issue #6 for — the
-  # three gates named there (an Apple Developer ID carries a legal entity name into every
-  # signed binary; the signing secrets are credential handling; a published artifact is a
-  # publish) are exactly what the Apple secrets below and the hard gate two steps down are
-  # for. ci.yml's macos-check stays a compile-only check on purpose — this job, gated to
-  # tag-push/workflow_dispatch only (never a fork PR), is where that decision actually lives.
-  #
-  # NOT SIGNED/NOTARIZED WITHOUT THE APPLE SECRETS. Unlike Windows/Linux, an unsigned macOS
-  # build is not a degraded artifact — Gatekeeper refuses to open it at all for anyone who
-  # downloads it (the quarantine flag a browser sets on download, which this job's own smoke
-  # test never sees because a same-machine build+launch is never quarantined in the first
-  # place — so smoke-macos passing does NOT by itself prove a downloaded copy will open; the
-  # "Verify artifacts" step below asks `spctl` the same question Gatekeeper asks). On a
-  # `workflow_dispatch` dry run this job still builds and uploads unsigned, so CI stays green
-  # and provable before secrets exist (same reasoning as the header comment's dry-run path) —
-  # but on a REAL TAG PUSH, "Verify artifacts" hard-fails an unsigned/unnotarized build rather
-  # than shipping one every mac operator would see "can't be opened" on. Tauri v2 reads
-  # APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD/APPLE_SIGNING_IDENTITY/APPLE_ID/
-  # APPLE_PASSWORD/APPLE_TEAM_ID automatically at build time; nothing in tauri.conf.json needs
-  # to change to support this.
-  # ---------------------------------------------------------------------------------------
-  macos:
-    name: macOS (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14   # Apple Silicon (arm64)
-            arch: arm64
-          - runner: macos-13   # Intel (x86_64) — last Intel-hosted GitHub runner image
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    env:
-      CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
-            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
-          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | shasum -a 256 -c -
-          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | shasum -a 256 -c -
-
-      - name: Install Homebrew build dependencies
-        run: brew install cmake ninja gcc fftw boost
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.93.1
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - name: Build the .app + .dmg
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: bash scripts/build-macos.sh
-
-      - name: Verify artifacts
-        run: |
-          set -euo pipefail
-          dmg=$(find src-tauri/target/release/bundle/dmg -name '*.dmg' -print -quit)
-          app="src-tauri/target/release/bundle/macos/Nexus.app"
-          [ -n "$dmg" ] || { echo "no .dmg produced"; exit 1; }
-          [ -d "$app" ] || { echo "no .app produced"; exit 1; }
-          # Arch check — the failure mode here is a stray x86_64 slice on the arm64 runner (or
-          # vice versa) from a misconfigured cargo target, which would otherwise ship silently.
-          bin="$app/Contents/MacOS/Nexus"
-          got=$(lipo -archs "$bin")
-          want='${{ matrix.arch }}'
-          [ "$got" = "$want" ] || { echo "binary is '$got', expected '$want'"; exit 1; }
-          # The DeepCW model must be IN the bundle — the failure that shipped on 2026-07-20 for
-          # Linux is invisible to every check except looking inside the artifact.
-          m="$app/Contents/Resources/resources/deepcw/model.onnx"
-          [ -s "$m" ] || { echo "DeepCW model missing from the .app"; exit 1; }
-          echo "$MODEL_SHA  $m" | shasum -a 256 -c -
-          # Gatekeeper gate. `spctl` is the same authority Gatekeeper itself consults, so this
-          # asks the real question instead of a proxy (an ad-hoc signature can still fail
-          # notarization checks `codesign` alone would not catch). It works without the
-          # quarantine xattr present — spctl's assess mode simulates the Gatekeeper decision
-          # regardless — which is what makes it meaningful on a same-machine CI build.
-          codesign -dv --verbose=2 "$app" 2>&1 || true
-          gk=$(spctl -a -vvv --type execute "$app" 2>&1) || true
-          echo "$gk"
-          if echo "$gk" | grep -q 'source=Notarized Developer ID'; then
-            echo "Gatekeeper: notarized Developer ID — will open cleanly for a downloaded copy."
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            # A REAL RELEASE. issue #6's third gate — "a published artifact is a publish" —
-            # means this must never ship half-configured: better a red release job than an
-            # operator's first launch being "Nexus.app is damaged and can't be opened."
-            echo "::error::$app fails Gatekeeper assessment on a TAG PUSH (spctl: $gk). Refusing to publish an unopenable build — configure APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD/APPLE_SIGNING_IDENTITY/APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID (see MACOS.md, issue #6) before tagging a release."
-            exit 1
-          else
-            echo "::warning::$app fails Gatekeeper assessment (spctl: $gk) — fine for a workflow_dispatch dry run proving the build green pre-signing, but this must never reach a tag push unsigned."
-          fi
-          mkdir -p out
-          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
-          cp "$dmg" "out/Nexus_${ver}_mac_${{ matrix.arch }}.dmg"
-          # The self-update payload Tauri emits alongside the .app when createUpdaterArtifacts
-          # is on — NOT the .dmg (the .dmg is the initial-install artifact only).
-          tgz=$(find src-tauri/target/release/bundle/macos -name '*.app.tar.gz' -print -quit)
-          if [ -n "$tgz" ]; then
-            cp "$tgz" "out/Nexus_${ver}_mac_${{ matrix.arch }}.app.tar.gz"
-            [ -f "$tgz.sig" ] && cp "$tgz.sig" "out/Nexus_${ver}_mac_${{ matrix.arch }}.app.tar.gz.sig" \
-              || echo "note: unsigned updater payload (no TAURI_SIGNING_* secrets)"
-          fi
-          ( cd out && shasum -a 256 ./* )
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nexus-macos-${{ matrix.arch }}
-          path: out/*
-          if-no-files-found: error
-
-  # ---------------------------------------------------------------------------------------
-  # macOS artifact smoke — launch the ACTUAL built .app on a real macOS runner and require it
-  # to stay alive, same rationale as smoke-windows. Passing here does NOT prove Gatekeeper
-  # will let a downloaded copy open (see the macos job comment) — it only proves the binary
-  # itself starts and doesn't immediately crash, the same class of bug the Linux 2026-07-20
-  # incident and Windows' WebView2 wiring bugs both were.
-  # ---------------------------------------------------------------------------------------
-  smoke-macos:
-    name: Smoke — launch the macOS artifact (${{ matrix.arch }})
-    needs: macos
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            arch: arm64
-          - runner: macos-13
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: nexus-macos-${{ matrix.arch }}
-          merge-multiple: true
-
-      - name: Mount the .dmg and copy the .app
-        run: |
-          set -euo pipefail
-          dmg=$(find dist -name '*.dmg' -print -quit)
-          [ -n "$dmg" ] || { echo "no .dmg in the nexus-macos-${{ matrix.arch }} artifact"; exit 1; }
-          mnt=$(mktemp -d)
-          hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -quiet
-          cp -R "$mnt/Nexus.app" ./Nexus.app
-          hdiutil detach "$mnt" -quiet
-
-      - name: Launch and require it to stay alive
-        run: |
-          set -euo pipefail
-          xattr -cr ./Nexus.app   # strip quarantine so an unsigned CI build can launch headless
-          open -W -n ./Nexus.app --args --no-radio &
-          pid=$!
-          sleep 45
-          if ! kill -0 "$pid" 2>/dev/null && ! pgrep -f 'Nexus.app/Contents/MacOS/Nexus' >/dev/null; then
-            echo "app is not running 45s after launch — dead-on-arrival artifact"; exit 1
-          fi
-          echo "alive after 45 s — startup smoke passed"
-          pkill -f 'Nexus.app/Contents/MacOS/Nexus' || true
-
-  # ---------------------------------------------------------------------------------------
   # Publish — only on a real tag push. Gathers every artifact, proves version == tag across
   # ALL of them, and creates the GitHub Release. A dispatch run stops before this.
   # ---------------------------------------------------------------------------------------
@@ -796,14 +615,9 @@ jobs:
       # can never disagree with what actually shipped — a hand-maintained manifest is a signature
       # mismatch waiting to happen, and the client's only symptom would be a silent refusal.
       #
-      # Windows NSIS + Linux AppImage + macOS .app.tar.gz only: .deb (amd64 and both Pi bases)
-      # is apt-managed and cannot self-update, so those platforms keep the notify-and-download
-      # path forever. Emitting a manifest entry for them would promise an update route that
-      # does not exist. macOS's .dmg is the same story — it's the initial-install artifact,
-      # not the self-update payload; the tar.gz is.
-      #
-      # macOS entries silently omit themselves (via `add`'s own missing-.sig check) whenever
-      # TAURI_SIGNING_* secrets weren't set for the macos job — same as every other platform.
+      # Windows NSIS + Linux AppImage only: .deb (amd64 and both Pi bases) is apt-managed and
+      # cannot self-update, so those platforms keep the notify-and-download path forever. Emitting
+      # a manifest entry for them would promise an update route that does not exist.
       - name: Build the updater manifest (latest.json)
         run: |
           set -euo pipefail
@@ -812,8 +626,6 @@ jobs:
           base="https://github.com/kd9taw/Nexus/releases/download/$tag"
           win=$(find dist -name '*_x64-setup.exe' -print -quit)
           app=$(find dist -name '*_amd64.AppImage' -print -quit)
-          mac_arm=$(find dist -name '*_mac_arm64.app.tar.gz' -print -quit)
-          mac_x64=$(find dist -name '*_mac_x86_64.app.tar.gz' -print -quit)
           platforms=''
           add() { # $1=platform key  $2=artifact path
             [ -n "$2" ] && [ -f "$2.sig" ] || { echo "note: no signature for ${1:-?} — omitting"; return; }
