@@ -28,30 +28,39 @@ export interface RigFormFacts {
   rigConn: string
   pttMethod: string
   rigModel: number
-  radios?: { id: number; name: string; serialPort: string }[]
-  /** Optional on `Settings` (a pre-roster config has none); treated as radio 0. */
-  activeRadio?: number
-}
-
-/** Which radio the form is describing — the one being edited, else the active one. */
-function targetRadioId(form: RigFormFacts, editingRadioId: number | null | undefined): number {
-  return editingRadioId ?? form.activeRadio ?? 0
 }
 
 export function checkRigForm(
   form: RigFormFacts,
   ports: SerialPortInfo[],
-  editingRadioId: number | null | undefined,
   audio?: { input: AudioDeviceInfo[]; output: AudioDeviceInfo[] },
+  /**
+   * Models that need no serial port, from `getPortlessRigModels()` — the backend's own
+   * `model <= 4 || is_software_cat_profile(model)` (crates/tempo-audio/src/usbrig.rs). Empty
+   * means the rule could not be read, and then the port check does not BLOCK: an unreadable
+   * rule must never be why a correct configuration cannot be saved.
+   */
+  portlessModels: number[] = [],
 ): RigCheck[] {
   const out: RigCheck[] = []
   // A network rig has no serial port at all; none of this applies.
   if (form.rigConn === 'network') return out
 
   const port = form.serialPort.trim()
-  const usesSerial = form.rigModel !== 0 || form.pttMethod !== 'vox'
   if (!port) {
-    if (usesSerial && form.rigModel !== 0) {
+    // CAT is wanted and there is nowhere to send it.
+    //
+    // Gated on the portless set, because a whole class of models is served over TCP or a virtual
+    // COM pair by a program on this machine: Dummy, NET rigctl, FLRig, Thetis, PowerSDR,
+    // SmartSDR, SDR Console. Those are configured with no port ON PURPOSE, and ungated this
+    // called every one of them an error and refused the save. Model 0 (None/VOX) is in that set
+    // too, so "no model chosen" needs no separate case.
+    //
+    // `Array.isArray` rather than a bare `.length`: this runs inside the save handler, and a
+    // throw here would abort the save with no message — the exact failure mode the rest of this
+    // file exists to prevent.
+    const ruleKnown = Array.isArray(portlessModels) && portlessModels.length > 0
+    if (ruleKnown && !portlessModels.includes(form.rigModel)) {
       out.push({
         level: 'error',
         message: 'No serial port chosen — a rig model is set, so CAT needs a port.',
@@ -90,18 +99,14 @@ export function checkRigForm(
     })
   }
 
-  // 4. Another radio already uses it. Two profiles on one port means two daemons fighting for it;
-  //    the loser dies and its radio silently stops responding.
-  const me = targetRadioId(form, editingRadioId)
-  const clash = (form.radios ?? []).find(
-    (r) => r.id !== me && r.serialPort.trim() === port && port !== '',
-  )
-  if (clash) {
-    out.push({
-      level: 'error',
-      message: `${clash.name} already uses ${port}. Two radios cannot share one CAT port.`,
-    })
-  }
+  // 4. NOT HERE — two radios on one port. `settings::serial_port_conflicts` already decides it
+  //    and App.tsx already puts the verdict in the status lane as `radioConfigWarning`. That rule
+  //    carries four qualifiers a form-side copy loses on sight — the other profile must be
+  //    `enabled`, have `rig_model > 0`, be on `rig_conn == "serial"` and have a non-empty port —
+  //    and it compares case-insensitively, so the copy here fired on disabled profiles and missed
+  //    `COM3` vs `com3`. It is a WARNING there, correctly: a station that swaps one cable between
+  //    two rigs has both profiles on one port on purpose and must still be able to save. The copy
+  //    BLOCKED. One rule, one place; this file does not get a second opinion on it.
 
   // 5. The sound card must be INSIDE the radio on this CAT port.
   //

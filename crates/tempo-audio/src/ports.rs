@@ -302,7 +302,7 @@ mod tests {
     /// was already listed. `tty.*` blocks on carrier detect, so it is never the right node to open.
     #[cfg(all(feature = "serial", target_os = "macos"))]
     #[test]
-    fn tty_twins_collapse_but_a_lone_tty_survives() {
+    fn the_full_macos_collapse_drops_tty_twins_and_keeps_a_lone_tty() {
         let mk = |n: &str| UsbPort {
             port_name: n.to_string(),
             vid: 0x10c4,

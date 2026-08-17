@@ -32,6 +32,7 @@ import {
   downloadEqslReport,
   downloadLotwReport,
   getAllRigModels,
+  getPortlessRigModels,
   getAudioDevices,
   audioDevicesForPort,
   getBandPlan,
@@ -719,6 +720,9 @@ export function SettingsPanel({
   // Pre-save findings about the RIG form. Recomputed on every save attempt; warnings stay
   // visible after a successful save so a non-blocking oddity is not silently accepted.
   const [rigChecks, setRigChecks] = useState<RigCheck[]>([])
+  /** Models needing no serial port, from the backend's own rule. Empty = it could not be read,
+   *  and then the port check declines to block — see checkRigForm. */
+  const [portlessRigModels, setPortlessRigModels] = useState<number[]>([])
   // A probe result awaiting the operator's yes. Never applied or saved on its own — see
   // `handleAutoTestPorts` for the incident that made this a question rather than a write.
   const [catProposal, setCatProposal] = useState<CatProbeResult | null>(null)
@@ -900,6 +904,11 @@ export function SettingsPanel({
       .catch(() => mounted && setStatus('idle'))
     getRigModels()
       .then((m) => mounted && setRigModels(m))
+      .catch(() => {})
+    // The backend's own "needs no serial port" rule. Array-guarded: this feeds a check that runs
+    // inside the save handler, where a non-array would throw and abort the save with no message.
+    getPortlessRigModels()
+      .then((m) => mounted && Array.isArray(m) && setPortlessRigModels(m))
       .catch(() => {})
     getSerialPortsDetailed()
       .then((infos) => mounted && applyPorts(infos))
@@ -2058,7 +2067,7 @@ export function SettingsPanel({
     // chosen as a CAT port, or the silent second interface of a dual bridge. Errors block and name
     // the fix; warnings are stated and the operator proceeds, because an unusual-but-correct
     // station must never be locked out of its own configuration by a heuristic.
-    const checks = checkRigForm(form, portInfos, editingRadioId, audioInfos)
+    const checks = checkRigForm(form, portInfos, audioInfos, portlessRigModels)
     setRigChecks(checks)
     if (blocks(checks)) {
       setTab('radio')

@@ -18,11 +18,6 @@ const base: RigFormFacts = {
   rigConn: 'serial',
   pttMethod: 'cat',
   rigModel: 1049,
-  activeRadio: 0,
-  radios: [
-    { id: 0, name: 'FT-710', serialPort: '/dev/cu.usbserial-01AF7FED0' },
-    { id: 1, name: 'FTX-1', serialPort: '/dev/cu.usbserial-01A98F800' },
-  ],
 }
 
 // Two rigs, each an internal USB hub: the FT-710 at 0x110000, the FTX-1 at 0x120000. Both
@@ -38,10 +33,14 @@ const AUDIO: { input: AudioDeviceInfo[]; output: AudioDeviceInfo[] } = {
   ],
 }
 
+// Stands in for `getPortlessRigModels()`: Hamlib's low range plus two software-CAT profiles.
+// The real list comes from Rust, where rigmodels.rs pins it against the predicate it mirrors.
+const PORTLESS = [0, 1, 2, 3, 4, 2054, 23005]
+
 describe('rig form pre-save checks', () => {
   it('a correct configuration raises nothing', () => {
-    expect(checkRigForm(base, PORTS, 0)).toEqual([])
-    expect(blocks(checkRigForm(base, PORTS, 0))).toBe(false)
+    expect(checkRigForm(base, PORTS)).toEqual([])
+    expect(blocks(checkRigForm(base, PORTS))).toBe(false)
   })
 
   it('warns when the sound card is not inside the radio on this CAT port', () => {
@@ -51,7 +50,6 @@ describe('rig form pre-save checks', () => {
     const c = checkRigForm(
       { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
       PORTS,
-      0,
       AUDIO,
     )
     expect(c.some((x) => /not inside the radio on/.test(x.message))).toBe(true)
@@ -63,7 +61,6 @@ describe('rig form pre-save checks', () => {
     const c = checkRigForm(
       { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device #2' },
       PORTS,
-      0,
       AUDIO,
     )
     expect(c).toEqual([])
@@ -74,7 +71,6 @@ describe('rig form pre-save checks', () => {
     const c = checkRigForm(
       { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
       PORTS,
-      0,
       noTopo,
     )
     expect(c.some((x) => /not inside the radio/.test(x.message))).toBe(false)
@@ -82,51 +78,83 @@ describe('rig form pre-save checks', () => {
 
   it('flags the silent second interface of a dual bridge', () => {
     // THE convincing failure: the rig is fine, the port answers nothing, and it looks dead.
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01AF7FED1' }, PORTS, 0)
+    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01AF7FED1' }, PORTS)
     expect(c.some((x) => /port 2 of this device/.test(x.message))).toBe(true)
     // A warning, not a block — an unusual rig might genuinely use it.
     expect(blocks(c)).toBe(false)
   })
 
   it('blocks a dial-in tty device, which would just hang', () => {
-    const c = checkRigForm({ ...base, serialPort: '/dev/tty.usbserial-01A98F800' }, PORTS, 0)
+    const c = checkRigForm({ ...base, serialPort: '/dev/tty.usbserial-01A98F800' }, PORTS)
     expect(blocks(c)).toBe(true)
     expect(c.some((x) => /dial-in/.test(x.message))).toBe(true)
   })
 
-  it('blocks two radios sharing one CAT port, and names the other radio', () => {
-    // Editing radio 0, but pointing it at radio 1's port.
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01A98F800' }, PORTS, 0)
-    expect(blocks(c)).toBe(true)
-    expect(c.some((x) => x.message.includes('FTX-1'))).toBe(true)
-  })
-
-  it('does not call a radio a clash with ITSELF', () => {
-    // Editing radio 1, on radio 1's own port — the commonest re-save there is.
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01A98F800', activeRadio: 1 }, PORTS, 1)
-    expect(blocks(c)).toBe(false)
+  // Port collisions belong to the backend (`settings::serial_port_conflicts`), which App.tsx
+  // already surfaces as `radioConfigWarning`. The copy that used to live here dropped all four of
+  // that rule's qualifiers (enabled / rig_model > 0 / serial conn / non-empty port), compared
+  // case-sensitively, and BLOCKED where the real rule warns — so it refused to save a station
+  // that shares one cable between two rigs on purpose.
+  it('says nothing about two radios sharing a port — that rule lives in the backend', () => {
+    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01A98F800' }, PORTS)
+    expect(c.some((x) => /already uses|cannot share/i.test(x.message))).toBe(false)
   })
 
   it('warns when the chosen port is not connected', () => {
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-GONE' }, PORTS, 0)
+    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-GONE' }, PORTS)
     expect(c.some((x) => /not connected right now/.test(x.message))).toBe(true)
     // Absent is not wrong — the rig may simply be switched off.
     expect(blocks(c)).toBe(false)
   })
 
   it('blocks CAT keying with no rig model', () => {
-    const c = checkRigForm({ ...base, rigModel: 0 }, PORTS, 0)
+    const c = checkRigForm({ ...base, rigModel: 0 }, PORTS)
     expect(blocks(c)).toBe(true)
     expect(c.some((x) => /rig model is None\/VOX/.test(x.message))).toBe(true)
   })
 
   it('blocks a rig model with no port at all', () => {
-    const c = checkRigForm({ ...base, serialPort: '  ' }, PORTS, 0)
+    const c = checkRigForm({ ...base, serialPort: '  ' }, PORTS, undefined, PORTLESS)
     expect(blocks(c)).toBe(true)
   })
 
+  // THE GATE. A whole class of models is served over TCP or a virtual COM pair by a program on
+  // this machine, and is configured with NO port on purpose. Ungated, the check above called
+  // every one of them an error and refused the save.
+  it.each([
+    [4, 'FLRig'],
+    [2054, 'Thetis'],
+    [23005, 'SmartSDR'],
+  ])('allows model %i (%s) with no port — served by software, not a cable', (model) => {
+    const c = checkRigForm(
+      { ...base, serialPort: '', rigModel: model as number, pttMethod: 'rts' },
+      PORTS,
+      undefined,
+      PORTLESS,
+    )
+    expect(c).toEqual([])
+  })
+
+  it('does not block when the portless rule could not be read', () => {
+    // Empty list = the backend could not answer. Blocking then would make an unreadable rule the
+    // reason an operator cannot save a configuration that is fine.
+    const c = checkRigForm({ ...base, serialPort: '  ' }, PORTS, undefined, [])
+    expect(blocks(c)).toBe(false)
+  })
+
+  it('survives a non-array where the rule should be, rather than throwing mid-save', () => {
+    // This runs inside the save handler; a throw aborts the save with no message at all.
+    const c = checkRigForm(
+      { ...base, serialPort: '  ' },
+      PORTS,
+      undefined,
+      null as unknown as number[],
+    )
+    expect(blocks(c)).toBe(false)
+  })
+
   it('says nothing at all about a network rig', () => {
-    expect(checkRigForm({ ...base, rigConn: 'network', serialPort: '' }, PORTS, 0)).toEqual([])
+    expect(checkRigForm({ ...base, rigConn: 'network', serialPort: '' }, PORTS)).toEqual([])
   })
 
   it('a monitor is not silently blessed just because it enumerates as a serial device', () => {
@@ -136,7 +164,6 @@ describe('rig form pre-save checks', () => {
     const c = checkRigForm(
       { ...base, serialPort: '/dev/cu.usbmodem601NTGYJF9992', rigModel: 0 },
       PORTS,
-      0,
     )
     expect(blocks(c)).toBe(true)
   })
