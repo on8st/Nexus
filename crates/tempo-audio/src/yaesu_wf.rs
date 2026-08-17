@@ -336,10 +336,18 @@ pub mod ft4222 {
 
     type Handle = *mut c_void;
 
-    #[link(name = "ft4222")]
+    // TWO LIBRARIES, not one, and the split is not obvious from the API's naming: opening and
+    // closing a device are D2XX calls (`FT_*`), while everything SPI is LibFT4222 (`FT4222_*`).
+    // Linking only `ft4222` compiles and then fails at link time on `_FT_Open`/`_FT_Close` alone —
+    // which reads like a missing library rather than a missing SECOND one.
+    #[link(name = "ftd2xx")]
     unsafe extern "C" {
         fn FT_Open(device: c_int, handle: *mut Handle) -> u32;
         fn FT_Close(handle: Handle) -> u32;
+    }
+
+    #[link(name = "ft4222")]
+    unsafe extern "C" {
         fn FT4222_SetClock(handle: Handle, rate: u8) -> u32;
         fn FT4222_SPIMaster_Init(
             handle: Handle,
