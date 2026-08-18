@@ -15,8 +15,11 @@
 //! before this module existed: `SS` (SPECTRUM SCOPE) reads and writes scope SETTINGS only — the
 //! official FT-710 CAT manual has no waveform command at all — and nothing arrives unsolicited on
 //! either virtual COM port. Measured on ON8ST's station 2026-08-17: 40 frames of 4096 B in 0.48 s
-//! (84/s), 852 live bins, 821 of 852 changing between the first and last frame. See FORK.md for
-//! the full feasibility record.
+//! (84/s), 850 live bins. Polarity, width, bin-to-frequency alignment and orientation are all
+//! verified against a known broadcast carrier — the row runs LOW to HIGH left to right (checked by
+//! moving the dial 15 kHz and confirming the signal stayed put). See FORK.md for the measurements
+//! and for the one residual: about 1.1 kHz of error at 15 kHz off centre, which is quantified but
+//! not yet explained.
 //!
 //! WHY THE SPLIT IN THIS FILE. Everything that decides what the bins MEAN is pure and tested here
 //! ([`parse_wf1`], [`span_hz`], [`sweep_edges`]). The only part that needs FTDI's closed-source

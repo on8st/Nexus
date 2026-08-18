@@ -262,6 +262,31 @@ Irrelevant for a waterfall — the 852 bins are solid — but it is exactly the 
 still working on. Do not build on it without re-deriving it. A real frame is committed as
 `crates/tempo-audio/tests/fixtures/ft710_wf_frame.bin` so the next attempt starts from evidence.
 
+### Verified against a known signal — and three faults that only that could find
+
+A strong broadcast carrier on 9.410 MHz, 50 kHz span, W/F CENTER mode. This is the part no unit
+test can do, and it changed the code three times:
+
+| Question | Answer | How |
+|---|---|---|
+| Polarity | **inverted** — low bytes are strong | dial centred, 20 frames averaged: centre bin **109** against a 185-190 floor |
+| Usable width | **850 bins**, not 852 | bins 850/851 zero in all 30 frames sampled; 844-849 vary normally |
+| Bin→frequency | **correct** | `peak 9.4100 MHz` on a dial of 9.410120, stable frame after frame (~59 Hz per bin) |
+| Mirrored? | **no** — low→high, left to right | dial moved to 9.395: peak reported 9.4090, i.e. RIGHT of centre. Mirrored would read 9.3800 |
+
+Publishing the bytes as-is would have drawn every band upside down — signals as holes in a bright
+ceiling — and the display AGC would have stretched that into something plausible. Including the two
+padding bins would have put a permanent phantom carrier at the top edge of every span, moving
+whenever the operator retuned. Neither is mentioned in `ratmandu/YaesuWFTesting` or the
+wfview-derived layout, and neither would have errored.
+
+⚠️ **One residual, quantified rather than assumed.** Dead centre the peak reads 9.4100 (exact);
+15 kHz off centre it reads 9.4090 — about **1.1 kHz low**. Too large for the padding question
+(~35 Hz) and too small for wrong offsets or mirroring. Candidates: the strongest bin of an AM
+signal is not necessarily its carrier, the span may not be exactly 50.000 kHz, or the
+peak-to-frequency interpolation is a few bins out. Irrelevant for drawing a waterfall; it matters
+the moment a click on a signal is supposed to tune to it.
+
 ### Why this fits Nexus with little new machinery
 
 The app side already exists: a native-scope path (Icom CI-V, Flex), the `rigscope` pane, and a
