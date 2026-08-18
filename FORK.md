@@ -197,7 +197,7 @@ offering nothing. The other four are unaffected and can go whenever policy allow
 | `fork/tooling` | this file + `scripts/fork-radar` | fork infrastructure by definition |
 | `usbtopo` (in `macos-support`) | identify which radio a sound card / serial port belongs to, from USB topology | macOS-only, no-ops elsewhere; a design decision, described on #6 but not proposed |
 | `config-ui` | probe UX, validation, Config tab, device cross-checks | product decisions — needs buy-in first |
-| `MACOS.md`, `scripts/build-macos.sh` | macOS build path | upstream has not accepted macOS as a supported platform |
+| `MACOS.md`, `scripts/build-macos.sh` | macOS build path | **reason falsified 2026-08-18 — re-decide.** See "Upstream ships macOS" below. |
 
 ### Open questions put to upstream
 
@@ -307,6 +307,39 @@ behind an off-by-default feature; no FTDI binary is vendored into this repo.
 One operational note: the first `open` of the FT4222 hung for ten minutes, and every run after it
 was instant. A one-off claim rather than a protocol problem, but an implementation needs a timeout
 around open rather than trusting it.
+
+## Upstream ships macOS — checked 2026-08-18, and it overturns an assumption in this file
+
+**macOS is a first-class upstream platform.** This file said the opposite, and that claim was
+load-bearing: it is the stated reason `MACOS.md` and `scripts/build-macos.sh` were never offered.
+Two distinct milestones, both read off the published artifacts rather than off a job name:
+
+| | v1.4.0 | v1.5.0 (16 Aug) | v1.6.0 (16 Aug) onward |
+|---|---|---|---|
+| `.dmg` + signed `.app.tar.gz` | — | **yes** | yes |
+| `latest.json` platforms | win, linux | win, linux | win, linux, **`darwin-aarch64`** |
+
+- **v1.5.0: macOS enters the formal build**, and it *gates* the release — `release.yml`'s publish
+  step declares `needs: [linux-x86, windows, smoke-windows, macos, smoke-macos]`, so a broken
+  macOS build blocks the whole publish. `smoke-macos` mounts the dmg.
+- **v1.6.0: macOS joins the signed auto-updater.**
+- Build: `cargo tauri build --target aarch64-apple-darwin --features radio,custom-protocol
+  --bundles app,dmg` on `macos-14`. Apple Silicon only; no Intel bundle.
+
+**⚠️ How this was got wrong, because the same trap is still in place.** `ci.yml` carries a
+separate, deliberately cheap job named *"macOS compile check (not a shipped platform)"*. It
+builds no bundle **on purpose** and its name is stale. Reading that job title as the project's
+platform policy is how this file came to assert something the release page disproves in one
+query. **The published artifacts are the authority on platform support; a CI job name is not.**
+
+**Consequences to act on, not yet acted on:**
+
+1. `MACOS.md` and `scripts/build-macos.sh` still do not exist upstream (checked 2026-08-18), and
+   the reason for holding them back is gone. That is an upstreaming opportunity, not a closed
+   door — but upstream now has its own macOS build path in `release.yml`, so anything offered
+   must be reconciled with it rather than layered beside it.
+2. The `ci.yml` job name is misleading to every future reader. A one-line doc fix worth offering.
+3. Stop framing macOS work upstream as a second-class ask. It is a gating platform.
 
 ## Station notes
 
