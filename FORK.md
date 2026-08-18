@@ -46,6 +46,33 @@ Fork identity lives in git instead: tag builds `on8st-<upstream version>-<n>` (n
 Fork-only changelog entries go in a separate file, not upstream's `CHANGELOG.md`, so that file
 merges clean forever.
 
+### The updater endpoint is a PERMANENT fork delta — check it after every merge
+
+`src-tauri/tauri.conf.json` → `plugins.updater.endpoints` points at **`on8st/Nexus`**, not
+`kd9taw/Nexus`. One line, and it must survive every upstream merge. `fork-radar` will flag
+upstream commits touching this file; when it does, re-read that line before trusting the merge.
+
+**Why, and it is new as of upstream v1.6.0.** The updater is active in fork builds
+(`useSelfUpdate` checks at startup and hourly, then downloads SILENTLY and banners; installing
+takes one operator click). Until v1.6.0 upstream's `latest.json` carried no `darwin-aarch64`
+entry, so on macOS the check found nothing for this platform and the whole thing was inert.
+It is there now — so a fork build on the 1.6.0 manifests sees upstream's 1.6.1, fetches it, and
+stands there offering an install that would **overwrite the fork build with upstream's**: the
+FT-710 waterfall and every unmerged macOS delta gone, by one absent-minded click on a banner
+that looks exactly like routine housekeeping.
+
+Pointed at the fork it is both safe and honest: `on8st/Nexus` publishes no releases, so
+`releases/latest/download/latest.json` 404s, `check()` throws, and the hook swallows it in
+silence exactly as it does for any unreachable endpoint (measured 2026-08-18: fork 404,
+upstream 200). If the fork ever does publish, it then updates from the right place.
+
+**Deliberately NOT done: changing `identifier`.** It stays `com.kd9taw.tempo`. That would also
+separate the two apps, but it would invalidate the microphone TCC grant, and it buys nothing the
+endpoint change does not — `config_base()` is `$HOME/.config`, so settings live in
+`~/.config/tempo/` and are not identifier-derived either way. The shared identifier does mean a
+side-by-side install of upstream's dmg shares this build's TCC grant and config directory; that
+is a testing hazard, noted in `tasks/STATION-TODO.md`, not a reason to renumber the app.
+
 ---
 
 ## Status — 2026-08-18
