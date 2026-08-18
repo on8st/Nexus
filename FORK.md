@@ -48,13 +48,50 @@ merges clean forever.
 
 ---
 
-## Status — 2026-08-15
+## Status — 2026-08-18
+
+Upstream is **1.6.1**. Five releases in four days — 1.3.0 (14 Aug), 1.4.0, 1.5.0, 1.6.0, 1.6.1
+(17 Aug). The pace has not slowed and it is still editing the same audio files this fork does;
+assume divergence, not stability.
+
+`macos-support` carries the **1.6.0** manifests: **13 commits behind** `upstream/main`, 93 ahead.
+Merge forward before starting anything new — `scripts/fork-radar` first, so the shortlist is the
+upstream commits that touch files these branches touch rather than the whole log.
+
+### The contribution question is answered — in practice, by 14 merges
+
+**14 of 16 fork PRs are merged. Two are open.** Counted from the API on 2026-08-18, not from this
+file's memory, which had all of the merged ones still listed as awaiting review.
+
+| Open | What | State |
+|---|---|---|
+| [#85](https://github.com/kd9taw/Nexus/pull/85) | Restore actually restores — route it through the ordinary save path | three review points addressed; awaiting re-review |
+| [#109](https://github.com/kd9taw/Nexus/pull/109) | `usbtopo` — tell two identical radios apart by USB topology (closes [#93](https://github.com/kd9taw/Nexus/issues/93)) | 9/9 CI green; awaiting review |
+
+Merged: #69, #70, #71, #72, #73, #74, #77, #78, #79, #88, #89, #90, #91, #92.
+
+**What that means for the standing-policy question this file kept waiting on.** It was never
+answered as a written policy, and it no longer needs to be: generic fixes, macOS fixes and
+test-quality work have all gone in, and on [#93](https://github.com/kd9taw/Nexus/issues/93) the
+maintainer answered a *design* question with a concrete shape to build to. Treat the categories as
+settled by behaviour and stop gating work on a policy statement. **Still genuinely open:** the dual
+radio-config representation (`radios[]` versus the ~19 flat `Settings` fields) — do not "fix" that
+until it is answered.
+
+Issue [#76](https://github.com/kd9taw/Nexus/issues/76) (dark-mode placeholder contrast) is closed.
+Issue [#110](https://github.com/kd9taw/Nexus/issues/110) — the FT-710 waterfall — was **withdrawn
+and scrubbed** on 2026-08-18 as filed too early; the draft is kept machine-local at
+`tasks/drafts/ft710-waterfall-issue.md`. Re-file when the FTDI licence question is settled.
+
+---
+
+## Status — 2026-08-15 (previous)
 
 Upstream is **1.3.0**; it released 1.2.10 → 1.2.14 tester builds → 1.3.0 in about a day. It moves
 fast and it is actively editing the same audio files this fork does. Assume divergence, not
 stability. `macos-support` is level with 1.3.0 as of 2026-08-14.
 
-### Nine PRs open upstream, awaiting review
+### Nine PRs open at the time — ⚠️ ALL NINE HAVE SINCE MERGED; see the 2026-08-18 status above
 
 [#69](https://github.com/kd9taw/Nexus/pull/69) macOS link paths · [#70](https://github.com/kd9taw/Nexus/pull/70) rigctld resolve ·
 [#71](https://github.com/kd9taw/Nexus/pull/71) stale rigctld test · [#72](https://github.com/kd9taw/Nexus/pull/72) `npm ci` ·
@@ -65,7 +102,8 @@ stability. `macos-support` is level with 1.3.0 as of 2026-08-14.
 
 Seth said yes to PRs on [#6](https://github.com/kd9taw/Nexus/issues/6) and offered credit. The
 standing-policy question (generic fixes / macOS fixes / enhancements / new features /
-architectural changes) is **still unanswered**, as is the dual radio-config question.
+architectural changes) was open at this point — ⚠️ superseded: answered in practice by 14 merges,
+see the 2026-08-18 status. The dual radio-config question is still genuinely open.
 
 ---
 
@@ -73,6 +111,15 @@ architectural changes) is **still unanswered**, as is the dual radio-config ques
 
 All four fixes above were made on `macos-support`, **not** off `upstream/main`. That is the rule
 in this file being broken for the third time, and the cost is the same each time: extraction.
+
+**⚠️ All four have since been offered, and the assessment below was consumed rather than
+abandoned — keep it for the reasoning, not the status.** Restore persistence is
+[#85](https://github.com/kd9taw/Nexus/pull/85) (open, awaiting re-review); `window.confirm` merged
+as [#89](https://github.com/kd9taw/Nexus/pull/89); add-radio hijack merged as
+[#91](https://github.com/kd9taw/Nexus/pull/91); serial dedup went in two halves, PR #92 and
+[#109](https://github.com/kd9taw/Nexus/pull/109). The "three separate PRs, not one" call below was
+right: the confirm change did take the longest review, and bundling it would have held the
+two-line restore fix hostage to it.
 
 | Fix | Upstreamable? | Shape |
 |---|---|---|
