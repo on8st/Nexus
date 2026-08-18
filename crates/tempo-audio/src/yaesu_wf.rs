@@ -36,8 +36,21 @@
 pub const FRAME_BYTES: usize = 4096;
 /// Receiver 1's waterfall line: `uint8` per bin, at the start of the frame.
 pub const WF1_OFFSET: usize = 0;
-/// Bin count for receiver 1 — the width of one waterfall line.
-pub const WF1_BINS: usize = 852;
+/// Usable bins in receiver 1's line — the width of one waterfall line.
+///
+/// ⚠️ 850, NOT 852, and the two are not interchangeable. The layout reserves 852 bytes (see
+/// [`WF2_OFFSET`], which follows at 852), but the LAST TWO are structurally zero: measured across
+/// 30 consecutive frames on 2026-08-18, bins 850 and 851 were 0 in every one while 844-849 varied
+/// normally.
+///
+/// Including them is not a rounding error, it is a FALSE SIGNAL: raw 0 inverts to full scale (see
+/// [`parse_wf1`]), so both would appear as a permanent pair of strong spikes at the top edge of
+/// every span — a carrier that is always there, moves when the operator retunes, and does not
+/// exist. The published `ratmandu/YaesuWFTesting` layout says 852 and does not mention this.
+pub const WF1_BINS: usize = 850;
+/// Bytes the layout reserves for receiver 1's line, including the two trailing zero bytes that
+/// [`WF1_BINS`] excludes — this is the stride to the next segment, not a usable width.
+pub const WF1_STRIDE: usize = 852;
 /// Receiver 2's line. Present in the layout for the FTDX101 series; unused on the FT-710.
 pub const WF2_OFFSET: usize = 852;
 /// AF-FFT for receiver 1 (`uint8`), after both waterfall lines.
@@ -49,7 +62,20 @@ pub const AF1_SCOPE_OFFSET: usize = 1896;
 /// AF oscilloscope sample count.
 pub const AF1_SCOPE_SAMPLES: usize = 400;
 
-/// Receiver 1's waterfall line, normalised to 0..1 the way [`ScopeSweep::row`] is.
+/// Receiver 1's waterfall line, normalised to 0..1 the way [`ScopeSweep::row`] is — **inverted**,
+/// because the radio sends it upside down.
+///
+/// ⚠️ LOW BYTES ARE STRONG SIGNALS. Measured against a known strong broadcast carrier on
+/// 9.410 MHz, dial centred, 20 frames averaged (2026-08-18): the centre bin read **109** while the
+/// noise floor across the rest of the row sat at **185-190**. The signal is a TROUGH in the raw
+/// bytes, not a peak. An earlier capture on a quiet band agrees from the other side — mean 184
+/// with nothing present, i.e. "quiet" is high.
+///
+/// Publishing the bytes as-is would have drawn every band upside down: signals as holes in a
+/// bright ceiling. Nothing would have errored, the waterfall would simply have been inverted, and
+/// the AGC would have stretched it into something that looks like a plausible display. This is the
+/// one thing in this module that no amount of reading the protocol notes would have caught —
+/// neither `YaesuWFTesting` nor the wfview-derived layout says which way up the bytes run.
 ///
 /// `None` for a short frame rather than a padded one: a truncated SPI read is a transport fault,
 /// and half a line rendered as if it were a full one is worse than a dropped frame — the operator
@@ -63,7 +89,7 @@ pub fn parse_wf1(raw: &[u8]) -> Option<Vec<f32>> {
     Some(
         raw[WF1_OFFSET..WF1_OFFSET + WF1_BINS]
             .iter()
-            .map(|&b| f32::from(b) / 255.0)
+            .map(|&b| f32::from(255 - b) / 255.0)
             .collect(),
     )
 }
@@ -450,10 +476,13 @@ mod tests {
         let raw = src.read_frame().unwrap();
         let row = parse_wf1(&raw).expect("a full frame parses");
         assert_eq!(row.len(), WF1_BINS);
-        assert!((row[0] - 0.0).abs() < 1e-6, "first bin is the floor");
+        // The ramp runs 0..255 in the RAW bytes, and the parser inverts, so the first bin is
+        // full scale and the last is the floor. Asserting it this way round is what would fail if
+        // the inversion were ever dropped.
+        assert!((row[0] - 1.0).abs() < 1e-6, "raw 0 = strongest = 1.0");
         assert!(
-            (row[WF1_BINS - 1] - 1.0).abs() < 1e-6,
-            "last bin is full scale"
+            (row[WF1_BINS - 1] - 0.0).abs() < 1e-6,
+            "raw 255 = weakest = 0.0"
         );
         assert!(
             row.iter().all(|v| (0.0..=1.0).contains(v)),
@@ -477,14 +506,29 @@ mod tests {
 
         // A live band is neither flat nor saturated: there is a noise floor well above zero and
         // peaks below full scale. Flat would mean we are reading a dead region of the frame.
+        // THIS ALSO GUARDS THE INVERSION, and that is why the bounds are tight. The fixture is a
+        // QUIET band (raw bytes average 177 — mostly "nothing here"), so after inverting it must
+        // read DARK: a low mean. Drop the inversion and the same bytes give ~0.69, which fails
+        // here. A loose range would have let that through, and an upside-down waterfall is not
+        // something a test should be able to miss.
         let mean = row.iter().sum::<f32>() / row.len() as f32;
         let max = row.iter().cloned().fold(f32::MIN, f32::max);
         assert!(
-            (0.3..0.9).contains(&mean),
-            "noise floor out of range: mean {mean}"
+            (0.10..0.50).contains(&mean),
+            "a quiet band must read dark after inversion: mean {mean}"
         );
         assert!(max > mean, "no peaks above the floor — wrong offset?");
         assert!(row.iter().all(|v| (0.0..=1.0).contains(v)));
+
+        // The two trailing bytes are structurally zero and MUST be outside the row: inverted they
+        // are full scale, i.e. a permanent phantom carrier at the top of every span.
+        assert_eq!(
+            (raw[850], raw[851]),
+            (0, 0),
+            "bins 850/851 are the padding this row deliberately excludes"
+        );
+        assert_eq!(WF1_BINS, 850);
+        assert_eq!(WF1_STRIDE, 852, "the layout stride is unchanged");
 
         // The 144-byte parameter block is NOT usable on this model: 128 zeroes then a repeating
         // `ff 01 ee 01` idle pattern. Pinned so that if a future frame does carry frequencies,
