@@ -79,7 +79,7 @@ in this file being broken for the third time, and the cost is the same each time
 | **Restore persistence** (3) | **Yes — strongest** | Universal bug, small, self-contained, and the fix is "do what `reset_settings` already does". Needs a test, which it has. |
 | **`window.confirm` inert** (1) | **Yes — macOS, high value** | Exactly the category Seth said gets maintenance. But it is 11 files and introduces a UI primitive, so it is the biggest ask. Frame it as the BUG (thirteen destructive actions silently cancel on macOS) with the dialog as the remedy. |
 | **Add-radio hijack** (2) | **Yes, with care** | Universal bug, but it reverses an invariant pinned by a test with a documented rationale. The PR must explain why the clobber scaffolding is obsolete, not merely delete it. Touches 7 tests. |
-| **Serial dedup** (4) | Probably — macOS-only | Depends on `usbtopo`, which has not been offered. Either propose `usbtopo` first or ship the name-based half alone. |
+| **Serial dedup** (4) | **Done — both halves** | Resolved the way this row suggested, in that order: the name-based half landed upstream as `collapse_tty_twins` via PR #92, and the topology half went in on top of it as `collapse_usb_siblings` in [#109]. |
 
 **Three separate PRs, not one.** They share no code, they carry very different review burdens, and
 Seth merges small ones fastest. Do NOT bundle them: the confirm change would hold the two-line
@@ -195,7 +195,7 @@ offering nothing. The other four are unaffected and can go whenever policy allow
 |---|---|---|
 | `fork/build-stamp` | stamp fork/branch/commit into the build, show in the version chip tooltip | generic enough to offer later; branched off the station, so it needs extraction first. **Collides** with upstream's `2a942d41`, which also edits `src-tauri/build.rs`. |
 | `fork/tooling` | this file + `scripts/fork-radar` | fork infrastructure by definition |
-| `usbtopo` (in `macos-support`) | identify which radio a sound card / serial port belongs to, from USB topology | macOS-only, no-ops elsewhere; a design decision, described on #6 but not proposed |
+| `usbtopo` label rewriting — `label_by_rig`, `label_serial_ports`, `devices_sharing_usb_device` | rewrite what the PICKERS DISPLAY, e.g. "USB Audio Device (FT-710)" instead of a bare `" #2"` | held back on purpose: it changes the text of every picker and wants its own review of what happens when the topology reading is wrong. The rest of `usbtopo` went upstream in [#109] — see below. |
 | `config-ui` | probe UX, validation, Config tab, device cross-checks | product decisions — needs buy-in first |
 | `MACOS.md`, `scripts/build-macos.sh` | macOS build path | **reason falsified 2026-08-18 — re-decide.** See "Upstream ships macOS" below. |
 
@@ -308,6 +308,46 @@ One operational note: the first `open` of the FT4222 hung for ten minutes, and e
 was instant. A one-off claim rather than a protocol problem, but an implementation needs a timeout
 around open rather than trusting it.
 
+## `usbtopo` HAS been offered — #93 / #109, 2026-08-18
+
+Two rows in this file said it had not, and a reader acting on either would have redone work that
+is sitting in an open PR. Recorded here rather than only in the rows, because the split between
+what went and what stayed is the part worth knowing.
+
+[Issue #93](https://github.com/kd9taw/Nexus/issues/93) asked the question; the maintainer answered
+with a shape — *optional topology fields on `SerialPortInfo`, string matching stays the first pass,
+macOS-gated with empty-map stubs, and the two checks held out of #88 can ride in behind it.*
+[PR #109](https://github.com/kd9taw/Nexus/pull/109) is that shape, off `upstream/main`, 9/9 CI
+green, awaiting review.
+
+**Went upstream in #109:** `parent_hub`, `location_from_audio_uid`, the three registry/CoreAudio
+readers and `serial_topology`; `ports::collapse_usb_siblings` (behind upstream's own
+`collapse_tty_twins` — itself the fork's, via PR #92 — and keeping anything it cannot key);
+`interfaceIndex` / `siblingPorts` /
+`pairedAudio` / `usbHub` as optional DTO fields; and the two `checkRigForm` diagnostics.
+
+**Stayed fork-only:** the three label-rewriting helpers. They were REMOVED from the PR rather than
+shipped unwired — offering code with no caller invites the reviewer to design it for you.
+
+**Two findings from the PR that belong in this file, because neither was in the design:**
+
+1. `siblingPorts` exists because live data falsified the first version of the dual-bridge check. It
+   fired on `interfaceIndex > 0` alone, and the LG monitor on this desk is interface **2** of a
+   device with exactly **one** interface — it would have told the operator to pick "port 1" of a
+   device that has no port 1. The count is taken over ports sharing the EXACT `locationID`.
+2. **The two relations are not equally strong, and the difference bounds what each may claim.** Two
+   serial interfaces of one bridge share the same `locationID`, so counting them is exact. A rig's
+   CAT bridge and its codec are SEPARATE USB devices behind the rig's internal hub, so only
+   `parent_hub` relates them — and two unrelated things in one EXTERNAL hub share a parent too. A
+   USB headset beside a rig's CAT adapter can read as "inside" it. Hence the interface advice can
+   be precise while the paired-audio reading may only ever raise a doubt.
+
+Also worth keeping: `cargo clippy --workspace` FEATURELESS caught `collapse_usb_siblings` as dead
+code without `serial`, and the first local clippy run reported clean because `-D warnings` aborted
+on pre-existing findings in `propagation` before reaching `tempo-audio`. Use `--no-deps` when
+linting one crate, and do not read a clean sweep as clean until a positive control says the sweep
+reached your file.
+
 ## Upstream ships macOS — checked 2026-08-18, and it overturns an assumption in this file
 
 **macOS is a first-class upstream platform.** This file said the opposite, and that claim was
@@ -350,3 +390,5 @@ query. **The published artifacts are the authority on platform support; a CI job
   and every jsdom suite fails in `beforeEach`. CI pins Node 24, so this is local-only.
 - A release build from a **worktree** fails on the gitignored DeepCW model unless the model is
   staged or `NEXUS_ALLOW_MISSING_AICW=1` is set.
+
+[#109]: https://github.com/kd9taw/Nexus/pull/109
