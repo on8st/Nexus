@@ -1,121 +1,94 @@
+// Pre-save rig checks. Each case here is a mistake that saves silently today and then presents as
+// broken hardware — the symptom always appears far from the cause, which is why they are worth
+// catching at the one moment the operator is looking at the setting.
 import { describe, it, expect } from 'vitest'
 import { checkRigForm, blocks, type RigFormFacts } from './rigFormChecks'
-import type { SerialPortInfo } from './api'
-import type { AudioDeviceInfo } from './types'
 
-// The real station this was written for: two Yaesus, each a CP2105 with two interfaces, plus a
-// monitor that also presents a serial device. Interface 0 carries CAT; interface 1 is silent.
-const PORTS: SerialPortInfo[] = [
-  { name: '/dev/cu.usbserial-01AF7FED0', label: 'CP2105', interfaceIndex: 0, pairedAudio: 'USB Audio Device #2' },
-  { name: '/dev/cu.usbserial-01AF7FED1', label: 'CP2105', interfaceIndex: 1, pairedAudio: 'USB Audio Device #2' },
-  { name: '/dev/cu.usbserial-01A98F800', label: 'CP2105', interfaceIndex: 0, pairedAudio: 'USB Audio Device' },
-  { name: '/dev/tty.usbserial-01A98F800', label: 'CP2105', interfaceIndex: 0, pairedAudio: 'USB Audio Device' },
-  { name: '/dev/cu.usbmodem601NTGYJF9992', label: 'LG Monitor Controls', interfaceIndex: null, pairedAudio: null },
+const PORTS = ['/dev/cu.usbserial-A', '/dev/tty.usbserial-A', 'COM5']
+
+// The topology rows the backend sends on a platform that can prove them. Measured shape (a
+// two-radio station, macOS, 2026-08-13): both rigs use the same CP2105 bridge chip, so every row
+// carries the byte-identical product label and only the topology tells them apart. `hub` is the
+// USB device each thing is INSIDE — rig A's CAT bridge and codec share 0x2400000, rig B's share
+// 0x2100000, and the LG monitor's serial interface is inside neither.
+const INFOS = [
+  {
+    name: '/dev/cu.usbserial-A',
+    label: 'CP2105',
+    interfaceIndex: 0,
+    siblingPorts: 2,
+    pairedAudio: 'USB Audio Device',
+  },
+  {
+    name: '/dev/tty.usbserial-A',
+    label: 'CP2105',
+    interfaceIndex: 0,
+    siblingPorts: 2,
+    pairedAudio: 'USB Audio Device',
+  },
+  {
+    name: '/dev/cu.usbserial-B',
+    label: 'CP2105',
+    interfaceIndex: 1,
+    siblingPorts: 2,
+    pairedAudio: 'USB Audio Device',
+  },
+  // The trap, and it is a real device on the desk this was measured on: an LG monitor's control
+  // port is the ONLY interface its USB device has, and it is numbered 2. `interfaceIndex > 0`
+  // alone would tell the operator to pick "port 1" of a device that has no port 1.
+  { name: '/dev/cu.usbmodem601', label: 'LG Monitor Controls', interfaceIndex: 2, siblingPorts: 1 },
+  // And a real port with no topology at all — nothing may be said about it either.
+  { name: 'COM5', label: '', interfaceIndex: null, pairedAudio: null },
 ]
 
-const base: RigFormFacts = {
-  serialPort: '/dev/cu.usbserial-01AF7FED0',
+const AUDIO = {
+  input: [
+    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x2400000 },
+    { name: 'USB Audio Device #2', label: 'USB Audio Device', usbHub: 0x2100000 },
+    // A built-in card, on no USB device at all — the case that must stay silent.
+    { name: 'MacBook Pro Microphone', label: 'MacBook Pro Microphone', usbHub: null },
+  ],
+  output: [
+    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x2400000 },
+    { name: 'USB Audio Device #2', label: 'USB Audio Device', usbHub: 0x2100000 },
+  ],
+}
+
+// A stand-in for `getPortlessRigModels()`: Hamlib's low range plus two software-CAT profiles.
+// The real list comes from Rust, where `rigmodels.rs` pins it against the predicate it mirrors.
+const PORTLESS = [0, 1, 2, 3, 4, 2054, 23005]
+
+const form = (over: Partial<RigFormFacts> = {}): RigFormFacts => ({
+  serialPort: '/dev/cu.usbserial-A',
   rigConn: 'serial',
   pttMethod: 'cat',
   rigModel: 1049,
-}
+  ...over,
+})
 
-// Two rigs, each an internal USB hub: the FT-710 at 0x110000, the FTX-1 at 0x120000. Both
-// codecs report the same name and are told apart only by a positional " #2".
-const AUDIO: { input: AudioDeviceInfo[]; output: AudioDeviceInfo[] } = {
-  input: [
-    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x120000 },
-    { name: 'USB Audio Device #2', label: 'USB Audio Device #2', usbHub: 0x110000 },
-  ],
-  output: [
-    { name: 'USB Audio Device', label: 'USB Audio Device', usbHub: 0x120000 },
-    { name: 'USB Audio Device #2', label: 'USB Audio Device #2', usbHub: 0x110000 },
-  ],
-}
-
-// Stands in for `getPortlessRigModels()`: Hamlib's low range plus two software-CAT profiles.
-// The real list comes from Rust, where rigmodels.rs pins it against the predicate it mirrors.
-const PORTLESS = [0, 1, 2, 3, 4, 2054, 23005]
-
-describe('rig form pre-save checks', () => {
-  it('a correct configuration raises nothing', () => {
-    expect(checkRigForm(base, PORTS)).toEqual([])
-    expect(blocks(checkRigForm(base, PORTS))).toBe(false)
+describe('checkRigForm', () => {
+  it('passes a correct setup silently', () => {
+    expect(checkRigForm(form(), PORTS, PORTLESS)).toEqual([])
   })
 
-  it('warns when the sound card is not inside the radio on this CAT port', () => {
-    // THE swap. `…FED0` is the FT-710, whose codec is "USB Audio Device #2" — but the profile
-    // names "USB Audio Device", which is the FTX-1's. Exactly what a rig moving USB port causes,
-    // silently, to every saved profile.
-    const c = checkRigForm(
-      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
+  it('ignores a network rig entirely — it has no serial port to be wrong about', () => {
+    const checks = checkRigForm(form({ rigConn: 'network', serialPort: '' }), PORTS, PORTLESS)
+    expect(checks).toEqual([])
+  })
+
+  it('blocks a rig model with no port — CAT cannot work without one', () => {
+    const checks = checkRigForm(form({ serialPort: '' }), PORTS, PORTLESS)
+    expect(blocks(checks)).toBe(true)
+    expect(checks[0].message).toMatch(/no serial port/i)
+  })
+
+  it('allows no port when there is no rig model either — that is VOX, not a mistake', () => {
+    const checks = checkRigForm(
+      form({ serialPort: '', rigModel: 0, pttMethod: 'vox' }),
       PORTS,
-      AUDIO,
+      PORTLESS,
     )
-    expect(c.some((x) => /not inside the radio on/.test(x.message))).toBe(true)
-    // A separate interface box is a legitimate setup, so this informs rather than refuses.
-    expect(blocks(c)).toBe(false)
-  })
-
-  it('says nothing when the sound card IS the one inside that radio', () => {
-    const c = checkRigForm(
-      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device #2' },
-      PORTS,
-      AUDIO,
-    )
-    expect(c).toEqual([])
-  })
-
-  it('stays silent when topology is unknown (non-macOS, or an unresolvable device)', () => {
-    const noTopo = { input: [{ name: 'USB Audio Device', label: 'x' }], output: [] }
-    const c = checkRigForm(
-      { ...base, serialPort: '/dev/cu.usbserial-01AF7FED0', audioIn: 'USB Audio Device' },
-      PORTS,
-      noTopo,
-    )
-    expect(c.some((x) => /not inside the radio/.test(x.message))).toBe(false)
-  })
-
-  it('flags the silent second interface of a dual bridge', () => {
-    // THE convincing failure: the rig is fine, the port answers nothing, and it looks dead.
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01AF7FED1' }, PORTS)
-    expect(c.some((x) => /port 2 of this device/.test(x.message))).toBe(true)
-    // A warning, not a block — an unusual rig might genuinely use it.
-    expect(blocks(c)).toBe(false)
-  })
-
-  it('blocks a dial-in tty device, which would just hang', () => {
-    const c = checkRigForm({ ...base, serialPort: '/dev/tty.usbserial-01A98F800' }, PORTS)
-    expect(blocks(c)).toBe(true)
-    expect(c.some((x) => /dial-in/.test(x.message))).toBe(true)
-  })
-
-  // Port collisions belong to the backend (`settings::serial_port_conflicts`), which App.tsx
-  // already surfaces as `radioConfigWarning`. The copy that used to live here dropped all four of
-  // that rule's qualifiers (enabled / rig_model > 0 / serial conn / non-empty port), compared
-  // case-sensitively, and BLOCKED where the real rule warns — so it refused to save a station
-  // that shares one cable between two rigs on purpose.
-  it('says nothing about two radios sharing a port — that rule lives in the backend', () => {
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-01A98F800' }, PORTS)
-    expect(c.some((x) => /already uses|cannot share/i.test(x.message))).toBe(false)
-  })
-
-  it('warns when the chosen port is not connected', () => {
-    const c = checkRigForm({ ...base, serialPort: '/dev/cu.usbserial-GONE' }, PORTS)
-    expect(c.some((x) => /not connected right now/.test(x.message))).toBe(true)
-    // Absent is not wrong — the rig may simply be switched off.
-    expect(blocks(c)).toBe(false)
-  })
-
-  it('blocks CAT keying with no rig model', () => {
-    const c = checkRigForm({ ...base, rigModel: 0 }, PORTS)
-    expect(blocks(c)).toBe(true)
-    expect(c.some((x) => /rig model is None\/VOX/.test(x.message))).toBe(true)
-  })
-
-  it('blocks a rig model with no port at all', () => {
-    const c = checkRigForm({ ...base, serialPort: '  ' }, PORTS, undefined, PORTLESS)
-    expect(blocks(c)).toBe(true)
+    expect(checks).toEqual([])
   })
 
   // THE GATE. A whole class of models is served over TCP or a virtual COM pair by a program on
@@ -125,46 +98,169 @@ describe('rig form pre-save checks', () => {
     [4, 'FLRig'],
     [2054, 'Thetis'],
     [23005, 'SmartSDR'],
-  ])('allows model %i (%s) with no port — served by software, not a cable', (model) => {
-    const c = checkRigForm(
-      { ...base, serialPort: '', rigModel: model as number, pttMethod: 'rts' },
+  ])('allows model %i (%s) with no port — it is served by software, not a cable', (model) => {
+    const checks = checkRigForm(
+      form({ serialPort: '', rigModel: model, pttMethod: 'rts' }),
       PORTS,
-      undefined,
       PORTLESS,
     )
-    expect(c).toEqual([])
+    expect(checks).toEqual([])
+  })
+
+  // Positive control for the gate: the same call with a REAL rig must still block, or the two
+  // cases above would pass for the wrong reason (a check that stopped firing at all).
+  it('still blocks a real rig with no port, so the gate is a gate and not an off switch', () => {
+    const checks = checkRigForm(form({ serialPort: '', rigModel: 1049 }), PORTS, PORTLESS)
+    expect(blocks(checks)).toBe(true)
   })
 
   it('does not block when the portless rule could not be read', () => {
     // Empty list = the backend could not answer. Blocking then would make an unreadable rule the
     // reason an operator cannot save a configuration that is fine.
-    const c = checkRigForm({ ...base, serialPort: '  ' }, PORTS, undefined, [])
-    expect(blocks(c)).toBe(false)
+    const checks = checkRigForm(form({ serialPort: '', rigModel: 1049 }), PORTS, [])
+    expect(blocks(checks)).toBe(false)
   })
 
   it('survives a non-array where the rule should be, rather than throwing mid-save', () => {
-    // This runs inside the save handler; a throw aborts the save with no message at all.
-    const c = checkRigForm(
-      { ...base, serialPort: '  ' },
+    // This runs inside the save handler. A throw here aborts the save with no message — which is
+    // the silent no-op this whole file exists to prevent. It happened: under the panel's test
+    // mocks the fetch resolved `null`, and three unrelated save tests died on `.includes`.
+    const checks = checkRigForm(
+      form({ serialPort: '', rigModel: 1049 }),
       PORTS,
-      undefined,
       null as unknown as number[],
     )
-    expect(blocks(c)).toBe(false)
+    expect(blocks(checks)).toBe(false)
   })
 
-  it('says nothing at all about a network rig', () => {
-    expect(checkRigForm({ ...base, rigConn: 'network', serialPort: '' }, PORTS)).toEqual([])
+  it('blocks a /dev/tty.* port, which hangs on carrier instead of failing', () => {
+    const checks = checkRigForm(form({ serialPort: '/dev/tty.usbserial-A' }), PORTS, PORTLESS)
+    expect(blocks(checks)).toBe(true)
+    expect(checks.some((c) => /dial-in device/.test(c.message))).toBe(true)
   })
 
-  it('a monitor is not silently blessed just because it enumerates as a serial device', () => {
-    // The LG monitor WAS chosen as a CAT port, twice. It is a real serial device, so nothing can
-    // honestly call it impossible — but pairing it with CAT keying and no rig model is caught,
-    // and with a model set the operator at least gets the port-1/port-2 and clash checks.
-    const c = checkRigForm(
-      { ...base, serialPort: '/dev/cu.usbmodem601NTGYJF9992', rigModel: 0 },
-      PORTS,
+  it('blocks PTT over CAT with no rig model — nothing to send the keying command to', () => {
+    const checks = checkRigForm(form({ rigModel: 0, pttMethod: 'cat' }), PORTS, PORTLESS)
+    expect(blocks(checks)).toBe(true)
+    expect(checks.some((c) => /PTT is set to CAT/.test(c.message))).toBe(true)
+  })
+
+  it('warns, but does NOT block, when the port is simply not plugged in right now', () => {
+    const checks = checkRigForm(form({ serialPort: 'COM9' }), PORTS, PORTLESS)
+    expect(blocks(checks)).toBe(false)
+    expect(checks[0].level).toBe('warning')
+    expect(checks[0].message).toMatch(/not connected right now/)
+  })
+
+  // Port collisions belong to the backend (`settings::serial_port_conflicts`), which App.tsx
+  // already surfaces as `radioConfigWarning`. This file must not grow a second, unqualified
+  // opinion on them: the earlier version here ignored `enabled`, `rig_model` and `rig_conn`,
+  // compared case-sensitively, and BLOCKED — so it refused to save a station that shares one
+  // cable between two rigs on purpose.
+  it('says nothing about two radios sharing a port — that rule lives in the backend', () => {
+    const checks = checkRigForm(form({ serialPort: 'COM5' }), PORTS, PORTLESS)
+    expect(checks.some((c) => /already uses|cannot share/i.test(c.message))).toBe(false)
+  })
+})
+
+// ─── The two checks that read USB topology ───────────────────────────────────────────────────
+//
+// Both are DIAGNOSTIC and both are warnings. The cases below therefore assert two things every
+// time: that the finding is made, and that it does not BLOCK. A topology reading that turns out
+// to be wrong on somebody's station must cost them a sentence, never their configuration.
+describe('checkRigForm — USB topology (additive, warnings only)', () => {
+  it('warns on the silent half of a dual bridge — the port that makes a working rig look dead', () => {
+    const checks = checkRigForm(
+      form({ serialPort: '/dev/cu.usbserial-B' }),
+      [...PORTS, '/dev/cu.usbserial-B'],
+      PORTLESS,
+      INFOS,
     )
-    expect(blocks(c)).toBe(true)
+    expect(checks.some((c) => /is port 2 of this device/.test(c.message))).toBe(true)
+    expect(blocks(checks)).toBe(false)
+  })
+
+  // Measured false positive (this desk, 2026-08-18): the LG monitor's control port is interface 2
+  // of a device that has exactly one interface. Advice to pick a different port is only meaningful
+  // when a different port exists — otherwise it tells the operator the only thing they CAN pick is
+  // wrong, which is worse than saying nothing.
+  it('says nothing about a lone interface that happens to be numbered 2', () => {
+    const checks = checkRigForm(
+      form({ serialPort: '/dev/cu.usbmodem601' }),
+      [...PORTS, '/dev/cu.usbmodem601'],
+      PORTLESS,
+      INFOS,
+    )
+    expect(checks.some((c) => /of this device/.test(c.message))).toBe(false)
+  })
+
+  it('says nothing about interface 0 — the half that DOES carry CAT', () => {
+    const checks = checkRigForm(form(), PORTS, PORTLESS, INFOS)
+    expect(checks.some((c) => /of this device/.test(c.message))).toBe(false)
+  })
+
+  // The regression this exists for: audio devices are stored BY NAME, two rigs with the same codec
+  // chip share a name, and the " #2" that separates them comes from enumeration order — so moving
+  // one rig to another USB socket silently repoints every saved profile at the OTHER radio.
+  it('warns when the chosen codec is inside the OTHER radio', () => {
+    const checks = checkRigForm(
+      form({ audioIn: 'USB Audio Device #2' }), // rig B's codec, on rig A's CAT port
+      PORTS,
+      PORTLESS,
+      INFOS,
+      AUDIO,
+    )
+    expect(
+      checks.some((c) => /is not inside the radio on \/dev\/cu\.usbserial-A/.test(c.message)),
+    ).toBe(true)
+    expect(blocks(checks)).toBe(false)
+  })
+
+  it('says nothing when the codec IS inside the radio on that port', () => {
+    const checks = checkRigForm(
+      form({ audioIn: 'USB Audio Device', audioOut: 'USB Audio Device' }),
+      PORTS,
+      PORTLESS,
+      INFOS,
+      AUDIO,
+    )
+    expect(checks.some((c) => /is not inside the radio/.test(c.message))).toBe(false)
+  })
+
+  // A separate interface box or an analogue card is a legitimate station, and its device sits on no
+  // USB rig at all. Unknown must read as "nothing proven", never as "wrong".
+  it('says nothing about a built-in sound card, which is on no rig', () => {
+    const checks = checkRigForm(
+      form({ audioIn: 'MacBook Pro Microphone' }),
+      PORTS,
+      PORTLESS,
+      INFOS,
+      AUDIO,
+    )
+    expect(checks.some((c) => /is not inside the radio/.test(c.message))).toBe(false)
+  })
+
+  // THE DEGRADE PATH, and it is the whole reason these are optional parameters: every platform
+  // that cannot read USB topology — which today is every platform except macOS — passes nothing,
+  // and must get exactly the checks that existed before topology did.
+  it('a caller with no topology gets precisely the checks it got before', () => {
+    const f = form({ serialPort: '/dev/cu.usbserial-B', audioIn: 'USB Audio Device #2' })
+    const without = checkRigForm(f, [...PORTS, '/dev/cu.usbserial-B'], PORTLESS)
+    expect(without.some((c) => /of this device|inside the radio/.test(c.message))).toBe(false)
+    // …and the same call WITH topology differs only by adding findings, never by removing one.
+    const with_ = checkRigForm(f, [...PORTS, '/dev/cu.usbserial-B'], PORTLESS, INFOS, AUDIO)
+    for (const c of without) expect(with_.map((x) => x.message)).toContain(c.message)
+    expect(with_.length).toBeGreaterThan(without.length)
+  })
+
+  // Empty arrays are what a Mac reports when the IO registry answers nothing, and they must be
+  // indistinguishable from a platform that has no topology source at all.
+  it('empty topology is the same as no topology', () => {
+    const f = form({ serialPort: '/dev/cu.usbserial-B', audioIn: 'USB Audio Device #2' })
+    const empty = checkRigForm(f, [...PORTS, '/dev/cu.usbserial-B'], PORTLESS, [], {
+      input: [],
+      output: [],
+    })
+    expect(empty.some((c) => /of this device|inside the radio/.test(c.message))).toBe(false)
   })
 })
