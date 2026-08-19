@@ -270,7 +270,7 @@ offering nothing. The other four are unaffected and can go whenever policy allow
 | `fork/build-stamp` | stamp fork/branch/commit into the build, show in the version chip tooltip | generic enough to offer later; branched off the station, so it needs extraction first. **Collides** with upstream's `2a942d41`, which also edits `src-tauri/build.rs`. |
 | `fork/tooling` | this file + `scripts/fork-radar` | fork infrastructure by definition |
 | `usbtopo` label rewriting — `label_by_rig`, `label_serial_ports`, `devices_sharing_usb_device` | rewrite what the PICKERS DISPLAY, e.g. "USB Audio Device (FT-710)" instead of a bare `" #2"` | held back on purpose: it changes the text of every picker and wants its own review of what happens when the topology reading is wrong. The rest of `usbtopo` went upstream in [#109] — see below. |
-| `config-ui` | probe UX, validation, Config tab, device cross-checks | product decisions — needs buy-in first |
+| `config-ui` (work, no longer a branch) | probe UX, validation, Config tab, device cross-checks | product decisions — needs buy-in first; see the PR-candidate table above |
 | `MACOS.md`, `scripts/build-macos.sh` | macOS build path | **reason falsified 2026-08-18 — re-decide.** See "Upstream ships macOS" below. |
 
 ### Open questions put to upstream
@@ -444,7 +444,7 @@ tree** — that mistake produced two near-miss duplicate PRs on 2026-08-18.
 | **AGC AUTO/OFF** | The FT-710 has both and Nexus offered neither; `Engine::AGC_SPEEDS` plus the two cockpit selectors | none — smallest, cleanest win |
 | **USB audio/serial pickers say WHICH RADIO** | `label_by_rig`, `label_serial_ports`, `devices_sharing_usb_device` + `examples/usb_topology.rs`. Rewrites what the pickers DISPLAY | stacks on [#109]; that PR carries the module and the structured fields |
 | `MACOS.md`, `scripts/build-macos.sh` | Local macOS dev-build path | needs rework: upstream now has its own macOS build in `release.yml`, so these must reconcile with it rather than sit beside it |
-| `config-ui` — probe UX, Config tab, device cross-checks, remove-radio refusals | `SettingsPanel.tsx` + its `configtab`/`catproposal` tests, `registry.ts` | **ask first.** These are product decisions, not fixes. Open an issue describing the shape before building a PR |
+| `config-ui` — auto-test PROPOSES a port, a Config tab (Backup/Restore/Reset), probe candidates excluded by USB device, the sound-card-not-in-this-rig warning | Lives on **`macos-support`**; the `config-ui` branch was deleted 2026-08-19 as a redundant second copy (archived locally as tag `archive/config-ui`). A PR branches off `upstream/main` and ports it | **ask first**, and **split it**: ~650 lines across four separable features, and one PR for all of them would land far harder than three small ones |
 
 ### Held, not dropped
 
