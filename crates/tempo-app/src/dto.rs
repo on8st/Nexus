@@ -749,6 +749,13 @@ pub struct RadioStatus {
     /// why the waterfall is blank instead of failing silently.
     #[serde(default)]
     pub audio_error: Option<String>,
+    /// A problem with the RF SCOPE source, separate from `audio_error` on purpose: they have
+    /// different cures and can be true at once. `None` = nothing to say.
+    ///
+    /// The FT-710 case this exists for: the radio only exposes its spectrum once SCU-LAN10 (and the
+    /// external display) are enabled in its EX menu, and Nexus CANNOT set those over CAT — so a
+    /// silent scope is an instruction to the operator, not a fault to retry.
+    pub scope_error: Option<String>,
     /// Set when two enabled radios are configured on the SAME serial COM port — the
     /// monitor radio's CAT can't open the busy port and shows a confusing red pill.
     /// A config warning (self-clears once the ports differ); surfaced in the status lane.

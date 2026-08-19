@@ -938,6 +938,24 @@ impl Default for RadioConfig {
 /// Set on app shutdown so the radio loop unkeys the transmitter and exits
 /// (see the check at the top of the loop in [`run_radio`]). A stuck carrier on
 /// quit is a TX-safety hazard, so the exit path sets this and waits briefly.
+/// How often the FT-710 waterfall reader takes a frame. 12 ms is one frame on the wire (84/s
+/// measured); 100 ms is ~10 rows/s, which is a smooth waterfall and leaves the USB bus alone.
+const YAESU_WF_INTERVAL_MS: u64 = 100;
+/// How often the span/mode are re-read over CAT. SLOW on purpose — see the field's comment.
+const YAESU_WF_META_SECS: f64 = 5.0;
+/// How long a reader may publish nothing before that becomes an operator-facing message. Long
+/// enough to cover an FT4222 that is simply slow to first frame, short enough to be useful.
+const YAESU_WF_GRACE_SECS: f64 = 6.0;
+
+/// The bridge is not on the USB bus at all.
+const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge is not there. Enable SCU-LAN10 in \
+     the radio's EX menu (Nexus cannot set it over CAT), then switch the radio off and on so it \
+     appears on USB. The waterfall keeps using sound-card audio until then.";
+/// The bridge opened but the radio is sending nothing.
+const YAESU_WF_NO_FRAMES: &str = "The FT-710's spectrum bridge is connected but the radio is not \
+     sending a spectrum. Turn the EXTERNAL DISPLAY output on in the radio's EX menu (Nexus cannot \
+     set it over CAT). The waterfall keeps using sound-card audio until then.";
+
 pub static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set by the radio loop AFTER it has unkeyed the transmitter and is exiting.
@@ -2354,6 +2372,24 @@ struct RadioLoop {
     /// `(rig_model, is_network, flex_radio_ip)` — the ADDRESS is part of the key, see
     /// `reconcile_spectrum_source`.
     spectrum_src_key: Option<(u32, bool, String)>,
+    /// FORK-LOCAL: the FT-710's own RF spectrum, read off its internal FT4222 USB→SPI bridge.
+    /// Same lifecycle as `spectrum_src` above — held beside a KEY so a rig switch stops this
+    /// reader before the new radio's starts, which is what keeps a scope from streaming the
+    /// previous radio's band. `None` unless the active radio opted in AND the build has the
+    /// `yaesu-wf` feature.
+    yaesu_wf: Option<crate::yaesu_wf::YaesuWaterfall>,
+    /// `(rig_model, serial_port)` the current reader was started for. The PORT is in the key
+    /// because two FT-710s would share a model but not a cable.
+    yaesu_wf_key: Option<(u32, String)>,
+    /// Dial + span + mode for the reader thread. It holds no CAT link of its own: the bins arrive
+    /// with no metadata at all, so this is the only thing that can place them on the band.
+    yaesu_wf_meta: crate::yaesu_wf::SharedMeta,
+    /// Monotonic seconds at which the span/mode may be re-read. Deliberately SLOW: hammering the
+    /// daemon with `SS` reads is what made the DSP toggles vanish on 2026-08-17 (three missed func
+    /// reads mark a func unsupported, and the retry backs off to half an hour).
+    yaesu_wf_meta_after: f64,
+    /// Monotonic seconds at which the current reader was started, for the no-frames grace period.
+    yaesu_wf_started: f64,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2625,6 +2661,11 @@ struct RadioLoop {
 impl RadioLoop {
     fn new(applied: Transport, rigctld_proc: Option<CatDaemon>, cfg: &RadioConfig) -> Self {
         Self {
+            yaesu_wf: None,
+            yaesu_wf_key: None,
+            yaesu_wf_meta: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            yaesu_wf_meta_after: 0.0,
+            yaesu_wf_started: 0.0,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -2802,6 +2843,107 @@ impl RadioLoop {
     /// scope-rig transition touches threads. Flex runs as a worker here; the Icom CI-V scope
     /// streams through the radio's own `CatDaemon::Native` (drained right after this call), so
     /// `IcomCiv` needs no worker — an Icom without the native daemon keeps the audio-FFT scope.
+    /// FORK-LOCAL: start/stop the FT-710's FT4222 waterfall reader for the ACTIVE radio, refresh the
+    /// metadata it needs, and say something useful when nothing is flowing.
+    ///
+    /// ⚠️ THE SILENT CASE IS AN INSTRUCTION, NOT A FAULT. The FT4222 only appears on USB once
+    /// **SCU-LAN10** is enabled in the radio's EX menu, and frames only flow once the **external
+    /// display** output is on. Both are EX-menu items Nexus cannot set over CAT, so retrying forever
+    /// while the pane stays blank would leave the operator debugging the app instead of the radio.
+    /// The two failures are told apart deliberately — they have different cures:
+    ///
+    /// * the bridge would not OPEN → SCU-LAN10 is off (the device is not on the bus at all);
+    /// * it opened but has published NOTHING after a grace period → the external display is off.
+    ///
+    /// Cheap on the common path: one key compare, and the metadata read is rate-limited to once
+    /// every [`YAESU_WF_META_SECS`].
+    fn reconcile_yaesu_waterfall(&mut self, engine: &Arc<Mutex<Engine>>, rig: &mut Rig, now: f64) {
+        // Opted in, on this radio, on a serial link? Read the flag only when the model could
+        // possibly have the bridge, so every other station keeps the lock-free fast path.
+        let model = self.applied.rig_model;
+        let want = if crate::yaesu_wf::model_has_ft4222(model) && !self.applied.is_network() {
+            let e = engine_lock(engine);
+            e.settings()
+                .radios
+                .iter()
+                .find(|p| p.rig_model == model && p.serial_port == self.applied.serial_port)
+                .map(|p| p.yaesu_rf_scope)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let key = want.then(|| (model, self.applied.serial_port.clone()));
+
+        if key != self.yaesu_wf_key {
+            // Tear the old reader down BEFORE starting a new one: its Drop stops the thread, and two
+            // readers on one FT4222 would fight over the same SPI handle.
+            self.yaesu_wf = None;
+            self.yaesu_wf_key = key.clone();
+            if let Ok(mut m) = self.yaesu_wf_meta.lock() {
+                *m = None; // the new radio's span/mode is not known yet
+            }
+            self.yaesu_wf_started = now;
+            let mut e = engine_lock(engine);
+            if key.is_none() {
+                e.set_scope_error(None);
+            } else {
+                match crate::yaesu_wf::open_default_source() {
+                    Some(src) => {
+                        self.yaesu_wf = Some(crate::yaesu_wf::YaesuWaterfall::start(
+                            src,
+                            self.spectrum_feed.clone(),
+                            self.yaesu_wf_meta.clone(),
+                            std::time::Duration::from_millis(YAESU_WF_INTERVAL_MS),
+                        ));
+                        e.set_scope_error(None);
+                    }
+                    None => e.set_scope_error(Some(YAESU_WF_NO_BRIDGE.to_string())),
+                }
+            }
+            return; // the metadata read can wait a tick; the thread has nothing to place yet
+        }
+
+        let Some(wf) = self.yaesu_wf.as_ref() else {
+            return; // not running — the message (if any) was set above and stands
+        };
+
+        // Refresh dial + span + mode, rarely. `SS<P1>5;`/`SS<P1>6;` are the only source for the
+        // span and the scope mode; the dial we already poll.
+        if now >= self.yaesu_wf_meta_after {
+            self.yaesu_wf_meta_after = now + YAESU_WF_META_SECS;
+            let span = rig
+                .send_raw("SS05;")
+                .and_then(|r| crate::yaesu_wf::parse_ss_reply(&r, b'5'));
+            let mode = rig
+                .send_raw("SS06;")
+                .and_then(|r| crate::yaesu_wf::parse_ss_reply(&r, b'6'));
+            let dial_hz = {
+                let e = engine_lock(engine);
+                e.settings().dial_mhz * 1_000_000.0
+            };
+            if let (Some(span_code), Some(mode_code)) = (span, mode) {
+                if let Ok(mut m) = self.yaesu_wf_meta.lock() {
+                    *m = Some(crate::yaesu_wf::SweepMeta {
+                        dial_hz,
+                        span_code,
+                        mode_code,
+                    });
+                }
+            }
+        }
+
+        // Opened, but has it ever produced a row? After the grace period, silence means the radio is
+        // not sending — which on this rig means the external display output is off.
+        let mut e = engine_lock(engine);
+        if wf.published() == 0 {
+            if now - self.yaesu_wf_started > YAESU_WF_GRACE_SECS {
+                e.set_scope_error(Some(YAESU_WF_NO_FRAMES.to_string()));
+            }
+        } else {
+            e.set_scope_error(None);
+        }
+    }
+
     fn reconcile_spectrum_source(
         &mut self,
         engine: &Arc<Mutex<Engine>>,
@@ -4154,6 +4296,9 @@ impl RadioLoop {
             // capability — cheap (a key compare) unless it just gained/lost/changed a native scope.
             let (scope_model, scope_net) = (self.applied.rig_model, self.applied.is_network());
             self.reconcile_spectrum_source(engine, scope_model, scope_net);
+            // FORK-LOCAL: the FT-710's own spectrum over its internal FT4222 bridge. No-op on every
+            // other radio, and on this one too until the operator opts in.
+            self.reconcile_yaesu_waterfall(engine, rig, now);
             // Native CI-V scope: THE ACTIVE radio's daemon streams the rig's real panadapter.
             // Enable is per-tick idempotent (an atomic store); monitors never enable it, so a
             // backgrounded radio's serial link stays free for its slow poll. Rows land in the

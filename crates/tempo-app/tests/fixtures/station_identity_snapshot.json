@@ -76,6 +76,7 @@
     "rxLevel": 0.0,
     "rxOffsetHz": 1500.0,
     "rxRangesMhz": [],
+    "scopeError": null,
     "sideband": "USB",
     "sidebandOverride": null,
     "slot": 0,

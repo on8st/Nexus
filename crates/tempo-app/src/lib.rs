@@ -297,6 +297,7 @@ impl AppState {
                 cw_wpm: 25,
                 split_tx_mhz: None,
                 audio_error: None,
+                scope_error: None,
                 radio_config_warning: None,
                 recording_warning: None,
                 tx_even: true,

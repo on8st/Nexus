@@ -2086,6 +2086,7 @@ pub struct Engine {
     /// Set by the radio loop when the sound card failed to open, so the UI can
     /// explain a blank waterfall instead of failing silently.
     audio_error: Option<String>,
+    scope_error: Option<String>,
     /// The last per-QSO recording that failed, with the path. Set by the shell (which owns the
     /// file write), carried out in the snapshot, cleared by the next recording that succeeds.
     recording_warning: Option<String>,
@@ -3698,6 +3699,7 @@ impl Engine {
             radio_live: std::collections::HashMap::new(),
             cat_reprobe: false,
             audio_error: None,
+            scope_error: None,
             recording_warning: None,
             qsy,
             rtty_armed: false,
@@ -12965,6 +12967,14 @@ impl Engine {
         self.recording_warning = warning;
     }
 
+    /// Say (or stop saying) what is wrong with the RF SCOPE source. Separate from
+    /// [`Self::set_audio_error`]: a scope that says nothing and an audio device that failed are
+    /// different problems with different cures, and hiding one behind the other is how an operator
+    /// ends up checking their sound card because their radio's EX menu is off.
+    pub fn set_scope_error(&mut self, err: Option<String>) {
+        self.scope_error = err;
+    }
+
     pub fn set_audio_error(&mut self, err: Option<String>) {
         self.audio_error = err;
     }
@@ -13471,6 +13481,7 @@ impl Engine {
         }
         .to_string();
         s.radio.audio_error = self.audio_error.clone();
+        s.radio.scope_error = self.scope_error.clone();
         s.radio.recording_warning = self.recording_warning.clone();
         s.radio.radio_config_warning =
             crate::settings::serial_port_conflicts(&self.settings.radios)
@@ -27359,6 +27370,7 @@ mod tests {
             native_scope: p.native_scope.clone(),
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
+            yaesu_rf_scope: false,
             flex_native_audio: p.flex_native_audio,
         };
 

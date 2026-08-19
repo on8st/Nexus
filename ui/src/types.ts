@@ -1141,6 +1141,16 @@ export interface RadioStatus {
   splitTxMhz?: number | null
   /** Set when the sound card failed to open (explains a blank waterfall). */
   audioError?: string | null
+  /**
+   * What is wrong with the RF SCOPE source, separate from `audioError` — different problem, different
+   * cure, and both can be true at once.
+   *
+   * The FT-710 case: its spectrum only exists once SCU-LAN10 and the external display are enabled in
+   * the radio's own EX menu, and Nexus cannot set those over CAT. So this is an INSTRUCTION to the
+   * operator, not a fault being retried, and it is deliberately not `critical`: the waterfall keeps
+   * working on sound-card audio throughout.
+   */
+  scopeError?: string | null
   /** Set when two radios are on the same serial COM port (explains a red pill). */
   radioConfigWarning?: string | null
   /** The last per-QSO recording failed, with the path it failed at. Surfaced in the status lane;

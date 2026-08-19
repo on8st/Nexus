@@ -287,11 +287,47 @@ pub type SharedMeta = std::sync::Arc<std::sync::Mutex<Option<SweepMeta>>>;
 /// Lifecycle mirrors [`crate::flexspectrum::FlexSpectrum`] deliberately — that is the existing
 /// answer in this codebase to "a second device that feeds the spectrum": the owner holds it in an
 /// `Option` beside a KEY, and a rig switch drops it (stopping the thread) before starting the one
+/// Does this Hamlib model have the internal FT4222 bridge?
+///
+/// Only the FT-710 (1049) is confirmed — measured on hardware 2026-08-17. The FTX-1 (1051) is NOT
+/// included: it has not been checked, and claiming a bridge that is not there would put a
+/// "enable SCU-LAN10" instruction in front of an operator whose radio has no such menu.
+pub fn model_has_ft4222(model: u32) -> bool {
+    model == 1049
+}
+
+/// Open the bridge, or `None` when it is not available for any reason.
+///
+/// `None` is the ORDINARY answer, not an error path: without the `yaesu-wf` feature there is no
+/// transport compiled in at all, and with it the device is absent until SCU-LAN10 is enabled. The
+/// caller turns `None` into the operator-facing instruction.
+pub fn open_default_source() -> Option<Box<dyn WaterfallSource + Send>> {
+    #[cfg(feature = "yaesu-wf")]
+    {
+        match ft4222::Ft4222Waterfall::open(0) {
+            Ok(src) => Some(Box::new(src) as Box<dyn WaterfallSource + Send>),
+            Err(e) => {
+                crate::civ::diag::note(&format!("yaesu waterfall: FT4222 open failed: {e}"));
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "yaesu-wf"))]
+    {
+        None
+    }
+}
+
 /// the new radio needs. Getting that wrong is how a scope keeps streaming the previous radio's
 /// band, which is the dual-radio fault this project has already been bitten by elsewhere.
 pub struct YaesuWaterfall {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// Rows that actually reached the feed. The owner watches this to tell two failures apart that
+    /// look identical from outside — the bridge never opened, versus it opened and sends nothing.
+    /// On an FT-710 those have DIFFERENT cures in the radio's own EX menu, so collapsing them into
+    /// "no spectrum" would send the operator to the wrong setting.
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl YaesuWaterfall {
@@ -305,17 +341,21 @@ impl YaesuWaterfall {
         use std::sync::atomic::Ordering;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let published_thread = published.clone();
         let join = std::thread::spawn(move || {
             while !stop_thread.load(Ordering::Relaxed) {
                 // Copied out under the lock, never held across the SPI read: the CAT side must
                 // never wait on a USB transaction to publish a new span.
                 let m = meta.lock().ok().and_then(|g| *g);
                 match m {
-                    Some(m) => {
-                        if pump(src.as_mut(), &feed, m) == Pumped::Unavailable {
-                            feed.clear_rf();
+                    Some(m) => match pump(src.as_mut(), &feed, m) {
+                        Pumped::Published => {
+                            published_thread.fetch_add(1, Ordering::Relaxed);
                         }
-                    }
+                        Pumped::Dropped => {}
+                        Pumped::Unavailable => feed.clear_rf(),
+                    },
                     // Metadata not established: no row can be placed, so nothing stale may stay.
                     None => feed.clear_rf(),
                 }
@@ -325,7 +365,14 @@ impl YaesuWaterfall {
         Self {
             stop,
             join: Some(join),
+            published,
         }
+    }
+
+    /// How many rows have reached the feed since this reader started. Monotonic; 0 means the
+    /// transport opened but the radio has sent nothing usable yet.
+    pub fn published(&self) -> u64 {
+        self.published.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -399,6 +446,21 @@ pub mod ft4222 {
     pub struct Ft4222Waterfall {
         handle: Handle,
     }
+
+    // SAFETY: `handle` is an opaque D2XX handle (`*mut c_void`), which is why the compiler refuses
+    // `Send` by default — a raw pointer says nothing about who may touch it.
+    //
+    // Sending this value is sound because OWNERSHIP MOVES, it is never shared:
+    //   * the handle is written exactly once, in `open`, and the struct is neither `Clone` nor
+    //     `Copy`, so no second value can ever refer to the same handle;
+    //   * every use goes through `&mut self` (`read_frame`), so D2XX is only ever called from
+    //     whichever single thread owns the value at that moment;
+    //   * `Drop` closes it, on that same owning thread.
+    //
+    // This is `Send` and deliberately NOT `Sync`: the reader thread takes the value and keeps it.
+    // Two threads calling into one FT4222 handle concurrently is exactly what would be unsound, and
+    // `Sync` is what would permit it.
+    unsafe impl Send for Ft4222Waterfall {}
 
     impl Ft4222Waterfall {
         /// Open interface A of the bridge and put it in SPI-master mode.

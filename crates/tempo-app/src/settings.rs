@@ -2261,6 +2261,16 @@ pub struct RadioProfile {
     /// the same reason as `flex_radio_ip` — one Flex may run it while another rig does not.
     #[serde(default)]
     pub flex_native_pan: bool,
+    /// Opt-in to the FT-710's own RF spectrum over its internal FT4222 USB→SPI bridge (FORK-LOCAL;
+    /// only has an effect in a build with the `yaesu-wf` feature). OFF by default.
+    ///
+    /// ⚠️ THE RADIO MUST BE TOLD TO EXPOSE IT, AND NEXUS CANNOT DO THAT. The FT4222 only appears on
+    /// USB once **SCU-LAN10** is enabled in the radio's EX menu, and frames only flow once the
+    /// **external display** output is on too. Both are EX-menu items this app cannot set over CAT,
+    /// so a silent scope with this switched on is an instruction to the operator rather than a fault
+    /// to retry — which is what `RadioStatus::scope_error` says, naming whichever of the two it is.
+    #[serde(default)]
+    pub yaesu_rf_scope: bool,
     /// Opt-in to THIS radio's native FlexRadio DAX audio (BOTH directions — see
     /// [`Settings::flex_native_audio`]). Per-radio, as above.
     #[serde(default)]
@@ -2312,6 +2322,9 @@ pub struct RadioProfilePatch {
     /// See `RadioProfile::flex_native_pan`.
     #[serde(default)]
     pub flex_native_pan: bool,
+    /// See `RadioProfile::yaesu_rf_scope`.
+    #[serde(default)]
+    pub yaesu_rf_scope: bool,
     /// See `RadioProfile::flex_native_audio`.
     #[serde(default)]
     pub flex_native_audio: bool,
@@ -2350,6 +2363,7 @@ impl RadioProfilePatch {
         p.native_scope = self.native_scope;
         p.flex_radio_ip = self.flex_radio_ip;
         p.flex_native_pan = self.flex_native_pan;
+        p.yaesu_rf_scope = self.yaesu_rf_scope;
         p.flex_native_audio = self.flex_native_audio;
     }
 }
@@ -2441,6 +2455,7 @@ impl Default for RadioProfile {
             native_scope: "auto".to_string(),
             flex_radio_ip: String::new(),
             flex_native_pan: false,
+            yaesu_rf_scope: false,
             flex_native_audio: false,
         }
     }
@@ -3034,6 +3049,10 @@ impl Settings {
             // that already HAS profiles).
             flex_radio_ip: self.flex_radio_ip.clone(),
             flex_native_pan: self.flex_native_pan,
+            // No flat counterpart by design: this opt-in is per-radio only. A station with two
+            // rigs has at most one FT-710, and a global mirror would recreate exactly the
+            // dual-representation problem the flat fields already are.
+            yaesu_rf_scope: false,
             flex_native_audio: self.flex_native_audio,
         }
     }
@@ -3930,6 +3949,7 @@ mod tests {
             native_scope: "civ".into(),
             flex_radio_ip: "192.0.2.50".into(),
             flex_native_pan: true,
+            yaesu_rf_scope: false,
             flex_native_audio: true,
         };
 
@@ -4004,6 +4024,7 @@ mod tests {
             native_scope: String::new(),
             flex_radio_ip: String::new(),
             flex_native_pan: false,
+            yaesu_rf_scope: false,
             flex_native_audio: false,
         })
         .expect("patch serializes");
@@ -4174,6 +4195,7 @@ mod tests {
             native_scope: p.native_scope.clone(),
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
+            yaesu_rf_scope: false,
             flex_native_audio: p.flex_native_audio,
         }
     }
