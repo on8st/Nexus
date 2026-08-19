@@ -454,17 +454,36 @@ tree** — that mistake produced two near-miss duplicate PRs on 2026-08-18.
 
 ### Dropped
 
-`up/rigctld-orphans` — see the next section. The branch stays pushed on the fork as a dead
-record; do not build on it.
+`up/rigctld-orphans` — **partly**. Two of its three commits are superseded by upstream
+`291bb662`; the third (refuse to share a rigctld that is driving a DIFFERENT radio) is an uncovered
+gap and belongs in the PR-candidate table above. See the corrected section below.
 
 [#109]: https://github.com/kd9taw/Nexus/pull/109
 
 ## The rigctld-orphan work is OBSOLETE — upstream got there first (2026-08-18)
 
-**Do not re-propose it.** `up/rigctld-orphans` (3 commits: port-already-held guard, which-radio
-identification, the `ps` drain fix) is superseded by upstream **`291bb662` "fix(unix):
-rigctld/rotctld can no longer outlive Nexus on macOS/Linux"**, which landed after v1.6.1 and is in
-1.7.0. Upstream's version is BETTER than the fork's: an on-disk PID ledger, `kill_leftovers` on the
+**⚠️ CORRECTED 2026-08-19 — this section was overstated. TWO of the three commits are obsolete;
+the third is a genuine gap upstream does not cover.** Read the next paragraph before acting on the
+rest of this section.
+
+**Still a real gap: "which radio is this rigctld driving?"** Upstream's `PortReply::Rigctld` arm in
+`open_rig` adopts an existing daemon UNCONDITIONALLY — straight to "Auto-coexist: connect THROUGH
+it" — so a rigctld serving a DIFFERENT radio gets adopted, and CAT and keying then go to the wrong
+rig. The fork's `foreign_daemon_refusal` / `daemon_serving_port` (argv first, `\dump_state`
+fallback) ask first and refuse a foreign one. Upstream's `foreign_cat_port_message` is the OTHER
+arm of the same match (`NotRigctld` — something that is not a rigctld at all), so the two are
+complementary, not competing. **This is a PR candidate, and a strong one: the failure mode is
+keying the wrong radio.**
+
+**How this was got wrong, twice in one day, and it is the same mistake both times:** the
+obsolescence was concluded from SYMBOL-HIT COUNTS (`foreign_daemon_refusal` 3 on the station / 0
+upstream against `foreign_cat_port_message` 8/8) without reading the call sites. A count is not a
+reading. It also produced a proposal to "clean up duplicate logic" from the station that would have
+deleted a live guard. Read the call site.
+
+**Genuinely obsolete (2 of 3).** The port-already-held guard and the `ps` drain fix are superseded
+by upstream **`291bb662` "fix(unix): rigctld/rotctld can no longer outlive Nexus on macOS/Linux"**,
+which landed after v1.6.1 and is in 1.7.0. Upstream's version is BETTER than the fork's: an on-disk PID ledger, `kill_leftovers` on the
 quit path, AND `init_orphan_ledger` sweeping at startup what a crash or force-quit left behind — so
 it survives the cases a Rust `Drop` cannot. `AddrInUse` handling is in 1.7.0 too.
 
