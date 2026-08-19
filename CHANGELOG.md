@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macOS: the device pickers now say WHICH RADIO each port and sound card belongs to.** Building
+  on the topology work above: a station with two rigs using the same bridge and codec chips saw
+  eight serial rows reading the identical "CP2105 Dual USB to UART Bridge Controller" and two sound
+  cards both called "USB Audio Device", separated only by a positional " #2" assigned by
+  enumeration order. There was no way to tell them apart by looking, and a wrong guess sends
+  transmit audio to the other radio. Rows now read like "CP2105 … — FT-710, port 1 of 2" and
+  "USB Audio Device — FT-710". Labels are only ever ADDED to and no row is removed, so anything
+  topology cannot prove looks exactly as it did — an unplugged rig stops naming its codec rather
+  than naming it wrongly, and a hub that matches two radios is left alone, because silence beats a
+  coin-flip when the cost is transmitting into the wrong rig.
+
 - **macOS: the Settings pickers can now tell two identical radios apart.** On a station with
   two rigs that use the same bridge and codec chips, every serial port carried the same product
   label ("CP2105 Dual USB to UART Bridge Controller", eight times) and both sound cards

@@ -7870,7 +7870,12 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
         // where IOKit answers nothing. The label and the name are unchanged, so a picker that
         // ignores these fields behaves exactly as before.
         let (ifaces, locs, audio) = tempo_audio::usbtopo::serial_topology();
-        tempo_audio::ports::available_ports()
+        // …and the same facts are ALSO written into the label the operator reads, because a
+        // structured field only helps at save time. Eight rows reading "CP2105 Dual USB to UART
+        // Bridge Controller" are unpickable however good the validation behind them is; annotated,
+        // they read "… — FT-710, port 1 of 2". `label_serial_ports` only ever ADDS to a label and
+        // removes no row, so a port whose topology is unknown looks exactly as it did.
+        let mut rows: Vec<tempo_audio::audiodev::AudioDevice> = tempo_audio::ports::available_ports()
             .into_iter()
             .map(|name| {
                 let label = usb
@@ -7878,6 +7883,12 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
                     .find(|u| u.port_name == name)
                     .map(|u| u.product.clone())
                     .unwrap_or_default();
+                tempo_audio::audiodev::AudioDevice { name, label }
+            })
+            .collect();
+        tempo_audio::usbtopo::label_serial_ports(&mut rows, &locs, &ifaces, &audio);
+        rows.into_iter()
+            .map(|tempo_audio::audiodev::AudioDevice { name, label }| {
                 // Same physical device = same parent hub. A rig's internal hub carries its CAT
                 // bridge and its codec; a bare USB-serial adapter shares its hub with nothing, and
                 // then this is correctly `None`.
@@ -7955,9 +7966,10 @@ struct AudioDevices {
 /// Enumerate sound-card devices for the Settings audio-device pickers. Empty
 /// lists when built without the `radio` feature (mirrors `get_serial_ports`).
 #[tauri::command]
-async fn get_audio_devices() -> AudioDevices {
+async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevices, String> {
     #[cfg(feature = "radio")]
     {
+        let _ = &state;
         fn dto(
             v: Vec<tempo_audio::audiodev::AudioDevice>,
             locs: &std::collections::HashMap<String, u32>,
@@ -7972,23 +7984,58 @@ async fn get_audio_devices() -> AudioDevices {
                 })
                 .collect()
         }
-        let (input, output) = tempo_audio::device::available_devices();
+        let (mut input, mut output) = tempo_audio::device::available_devices();
+        // Name each codec after the RADIO it is inside. Two rigs with the same codec chip both
+        // enumerate as "USB Audio Device", separated only by a positional " #2" assigned by
+        // enumeration order — so the operator picks between identical strings and a wrong guess
+        // sends TX audio to the other rig.
+        //
+        // Each radio is paired with the USB location of the CAT port it is configured on. A radio
+        // with no port (VOX-only), or one whose port is not present, contributes nothing — so an
+        // unplugged rig stops naming its codec rather than naming it wrongly. A hub matching more
+        // than one radio is left alone too: silence beats a coin-flip when the cost is transmitting
+        // into the wrong radio.
+        let serial_locs = tempo_audio::usbtopo::serial_locations();
+        let rigs: Vec<(String, u32)> = {
+            let eng = state.lock().unwrap_or_else(|e| e.into_inner());
+            eng.settings()
+                .radios
+                .iter()
+                .filter_map(|r| {
+                    serial_locs
+                        .get(r.serial_port.trim())
+                        .map(|loc| (r.name.clone(), *loc))
+                })
+                .collect()
+        };
+        if !rigs.is_empty() {
+            tempo_audio::usbtopo::label_by_rig(
+                &mut input,
+                &tempo_audio::usbtopo::audio_locations(true),
+                &rigs,
+            );
+            tempo_audio::usbtopo::label_by_rig(
+                &mut output,
+                &tempo_audio::usbtopo::audio_locations(false),
+                &rigs,
+            );
+        }
         // Input and output are separate CoreAudio streams even on one card, so each side needs its
         // own lookup; both are empty maps where topology is unavailable, and then every `usb_hub`
         // is `None` and the lists are exactly what they were before.
         let in_locs = tempo_audio::usbtopo::audio_locations(true);
         let out_locs = tempo_audio::usbtopo::audio_locations(false);
-        AudioDevices {
+        Ok(AudioDevices {
             input: dto(input, &in_locs),
             output: dto(output, &out_locs),
-        }
+        })
     }
     #[cfg(not(feature = "radio"))]
     {
-        AudioDevices {
+        Ok(AudioDevices {
             input: Vec::new(),
             output: Vec::new(),
-        }
+        })
     }
 }
 
