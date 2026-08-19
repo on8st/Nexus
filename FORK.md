@@ -422,6 +422,26 @@ on pre-existing findings in `propagation` before reaching `tempo-audio`. Use `--
 linting one crate, and do not read a clean sweep as clean until a positive control says the sweep
 reached your file.
 
+## The rigctld-orphan work is OBSOLETE — upstream got there first (2026-08-18)
+
+**Do not re-propose it.** `up/rigctld-orphans` (3 commits: port-already-held guard, which-radio
+identification, the `ps` drain fix) is superseded by upstream **`291bb662` "fix(unix):
+rigctld/rotctld can no longer outlive Nexus on macOS/Linux"**, which landed after v1.6.1 and is in
+1.7.0. Upstream's version is BETTER than the fork's: an on-disk PID ledger, `kill_leftovers` on the
+quit path, AND `init_orphan_ledger` sweeping at startup what a crash or force-quit left behind — so
+it survives the cases a Rust `Drop` cannot. `AddrInUse` handling is in 1.7.0 too.
+
+**How this was nearly missed, which is the reusable part.** The leak is real and was watched three
+times on 2026-08-18 — but on the shipped **1.6.1** dmg, which predates the fix. A fresh
+`stop_cat_daemons` fix was written, tested and about to be PR'd before anyone read upstream's
+current `rigctld_proc.rs`. Worse, an earlier check "upstream has none of these guards" was run
+against a WORKING TREE at 1.6.1, not against `upstream/main`, and came back clean — a false
+negative that would have produced a PR reimplementing a landed fix.
+
+**The rule this yields:** measure upstream with `git show upstream/main:<path>`, never against a
+checked-out tree, and never against a branch that is behind. `scripts/fork-radar` exists for this;
+use it before writing, not after.
+
 ## Upstream ships macOS — checked 2026-08-18, and it overturns an assumption in this file
 
 **macOS is a first-class upstream platform.** This file said the opposite, and that claim was
