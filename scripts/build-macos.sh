@@ -6,6 +6,17 @@
 #
 #   ./scripts/build-macos.sh            # UI + native modem + Tauri .app/.dmg
 #   ./scripts/build-macos.sh --no-gui   # native modem test exes only (fast)
+#   ./scripts/build-macos.sh --yaesu-wf # + the FT-710 FT4222 waterfall (FORK-LOCAL, see below)
+#
+# --yaesu-wf needs FTDI's LibFT4222 (which bundles D2XX) on this machine — a manual download from
+# ftdichip.com, because their site is behind a JavaScript challenge and because the library is NOT
+# redistributable, so it is never vendored into this repo. Point FT4222_LIB at the directory holding
+# libft4222*.dylib, or drop it in ~/.local/lib/ft4222 which is checked by default:
+#
+#   FT4222_LIB=~/.local/lib/ft4222 ./scripts/build-macos.sh --yaesu-wf
+#
+# ⚠️ The resulting build links a closed-source library against a GPL-3.0-only app. That question is
+# open (see FORK.md), so a build made this way is for THIS machine and is never shipped.
 #
 # One-time dev deps (Homebrew; the script checks and names anything missing):
 #   xcode-select --install
@@ -33,15 +44,43 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [ -f "$HOME/.nexus-build.env" ] && source "$HOME/.nexus-build.env"
 
 GUI=1
+YAESU_WF=0
 for a in "$@"; do
   case "$a" in
     --no-gui) GUI=0 ;;
+    --yaesu-wf) YAESU_WF=1 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $a" ;;
   esac
 done
 
 ARCH="$(uname -m)" # arm64 (Apple Silicon) or x86_64 (Intel) — whatever this Mac actually is.
+
+# Validate the FT4222 preconditions EARLY. They used to sit next to the cargo invocation, which
+# meant a missing library was reported after the whole UI and modem build had already run — three
+# minutes to learn something knowable in the first second.
+FEATURES="radio,custom-protocol"
+if [ "$YAESU_WF" = 1 ]; then
+  # Fail HERE with a sentence the operator can act on, rather than 300 lines into a link error.
+  FT4222_LIB="${FT4222_LIB:-$HOME/.local/lib/ft4222}"
+  [ -d "$FT4222_LIB" ] || die "--yaesu-wf: no such directory: $FT4222_LIB
+  FTDI's LibFT4222 is a manual download (ftdichip.com, FT4222H software examples) and is never
+  vendored here. Unpack it and set FT4222_LIB, or put the dylibs in ~/.local/lib/ft4222."
+  lib="$(ls "$FT4222_LIB"/libft4222*.dylib 2>/dev/null | head -1 || true)"
+  [ -n "$lib" ] || die "--yaesu-wf: no libft4222*.dylib in $FT4222_LIB (found: $(ls "$FT4222_LIB" 2>/dev/null | tr '\n' ' '))"
+  # An x86_64-only library cannot link against an arm64 build, and the linker's own message for that
+  # is famously unhelpful — so check the architecture we are actually building for.
+  if ! lipo -archs "$lib" 2>/dev/null | tr ' ' '\n' | grep -qx "$ARCH"; then
+    die "--yaesu-wf: $(basename "$lib") is $(lipo -archs "$lib" 2>/dev/null) but this build is $ARCH.
+  FTDI ship per-architecture builds; you need the one matching $ARCH (or build Nexus for the arch you have)."
+  fi
+  FEATURES="$FEATURES,yaesu-wf"
+  export RUSTFLAGS="${RUSTFLAGS:-} -L $FT4222_LIB"
+  # The .app finds the dylib at RUN time too — an unsigned local build gets it from the environment.
+  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:+$DYLD_LIBRARY_PATH:}$FT4222_LIB"
+  bold "FT-710 waterfall: ON (linking $(basename "$lib") from $FT4222_LIB)"
+  warn "This build links FTDI's closed-source library — local use only, never shipped. See FORK.md."
+fi
 
 # 1 — toolchain + Homebrew libraries -----------------------------------------------------------
 bold "1/4  Toolchain + Homebrew libraries ($ARCH)"
@@ -136,7 +175,7 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   updater_cfg=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
   warn "no TAURI_SIGNING_PRIVATE_KEY — skipping the unsignable updater payload (.app/.dmg unaffected)"
 fi
-( cd "$REPO/src-tauri" && cargo tauri build --features radio,custom-protocol --bundles app,dmg "${updater_cfg[@]}" )
+( cd "$REPO/src-tauri" && cargo tauri build --features "$FEATURES" --bundles app,dmg "${updater_cfg[@]}" )
 ok "Nexus .app + .dmg ($ARCH)"
 
 bold "Done ✓  macOS artifacts ($ARCH):"
