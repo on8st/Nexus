@@ -422,6 +422,43 @@ on pre-existing findings in `propagation` before reaching `tempo-audio`. Use `--
 linting one crate, and do not read a clean sweep as clean until a positive control says the sweep
 reached your file.
 
+## What stays LOCAL, always — and what is a PR candidate (2026-08-19)
+
+Reviewed after the 1.7.0 merge. **Measured against `upstream/main`, not against a checked-out
+tree** — that mistake produced two near-miss duplicate PRs on 2026-08-18.
+
+### Always local — never offer these
+
+| Item | Why it can never go upstream |
+|---|---|
+| `FORK.md`, `scripts/fork-radar` | Fork infrastructure by definition |
+| `.githooks/contributors` fork entry | The identity the fork's own pre-push gate accepts |
+| `src-tauri/tauri.conf.json` → `plugins.updater.endpoints` | Points at the fork so upstream's release cannot overwrite a fork build. **Re-check after every merge** — see the section on it above |
+| `.gitignore` fork line (`tasks/`) | Machine-local scratch |
+| Fork-only changelog entries | Kept out of upstream's `CHANGELOG.md` so that file merges clean forever |
+
+### PR candidates, in the order they are worth doing
+
+| Item | Shape | Blocker |
+|---|---|---|
+| **AGC AUTO/OFF** | The FT-710 has both and Nexus offered neither; `Engine::AGC_SPEEDS` plus the two cockpit selectors | none — smallest, cleanest win |
+| **USB audio/serial pickers say WHICH RADIO** | `label_by_rig`, `label_serial_ports`, `devices_sharing_usb_device` + `examples/usb_topology.rs`. Rewrites what the pickers DISPLAY | stacks on [#109]; that PR carries the module and the structured fields |
+| `MACOS.md`, `scripts/build-macos.sh` | Local macOS dev-build path | needs rework: upstream now has its own macOS build in `release.yml`, so these must reconcile with it rather than sit beside it |
+| `config-ui` — probe UX, Config tab, device cross-checks, remove-radio refusals | `SettingsPanel.tsx` + its `configtab`/`catproposal` tests, `registry.ts` | **ask first.** These are product decisions, not fixes. Open an issue describing the shape before building a PR |
+
+### Held, not dropped
+
+| Item | Why |
+|---|---|
+| FT-710 waterfall — `yaesu_wf.rs`, its probe, the frame fixture, the `'yaesu'` scope label | FTDI D2XX/LibFT4222 is closed-source against GPL-3.0-only. Issue #110 was withdrawn as premature; the draft is machine-local in `tasks/drafts/`. Re-file when the licence question is answered |
+
+### Dropped
+
+`up/rigctld-orphans` — see the next section. The branch stays pushed on the fork as a dead
+record; do not build on it.
+
+[#109]: https://github.com/kd9taw/Nexus/pull/109
+
 ## The rigctld-orphan work is OBSOLETE — upstream got there first (2026-08-18)
 
 **Do not re-propose it.** `up/rigctld-orphans` (3 commits: port-already-held guard, which-radio
