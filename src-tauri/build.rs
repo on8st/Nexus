@@ -134,8 +134,26 @@ fn build_stamp() -> String {
     // Cargo does not re-run a build script when HEAD moves, so declare it as an
     // input. `--git-path` resolves correctly inside a git WORKTREE, where .git
     // is a FILE rather than a directory and a naive "../.git/HEAD" is wrong.
+    //
+    // WATCHING `HEAD` ALONE IS NOT ENOUGH, and the failure is silent: on a branch, `HEAD` is a
+    // SYMREF file whose contents ("ref: refs/heads/…") a commit does not change, so its mtime does
+    // not move either. In a linked worktree the branch ref lives in the COMMON git dir, further
+    // still from this path. The result is a build that reports the PREVIOUS commit — which is worse
+    // than no stamp at all, because it is trusted. Caught on 2026-08-19: a build containing a fix
+    // stamped itself with the commit before it.
+    //
+    // So watch the resolved ref as well, and `packed-refs` for when the ref has been packed away
+    // (then no loose file exists to change). Any of the three moving re-runs this script.
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head}");
+    }
+    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
+        println!("cargo:rerun-if-changed={packed}");
     }
 
     let Some(sha) = git(&["rev-parse", "--short", "HEAD"]) else {
