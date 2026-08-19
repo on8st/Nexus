@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macOS: the audio pickers put the selected radio's own codec first, and say so.** Picking a CAT
+  port used to leave you facing two dropdowns offering "USB Audio Device" and "USB Audio Device #2"
+  — identical names, with the number coming from enumeration order, so there was nothing to choose
+  between them and a wrong guess sent transmit audio to the other rig. The codec that belongs to the
+  radio on the port you just selected now sorts to the top of both lists and reads
+  "… — this radio". It needs no saved profile and nothing named, so it works during first setup:
+  a rig carrying CAT and audio down one cable is internally a USB hub, and its codec is the device
+  sharing that CAT port's parent. **Nothing is hidden** — every device stays selectable, because the
+  topology answer is absent for a network rig, a separate interface box and every non-macOS build,
+  and a picker that hid your real device would be worse than one that merely failed to highlight it.
+
 - **macOS: the Settings pickers can now tell two identical radios apart.** On a station with
   two rigs that use the same bridge and codec chips, every serial port carried the same product
   label ("CP2105 Dual USB to UART Bridge Controller", eight times) and both sound cards

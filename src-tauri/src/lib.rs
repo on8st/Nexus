@@ -8141,6 +8141,60 @@ async fn get_audio_devices() -> AudioDevices {
     }
 }
 
+/// The audio devices that belong to the SAME RIG as `port` — the ones to offer first.
+///
+/// Answers the configure-time question directly: an operator picks the CAT port, and the audio
+/// pickers should then propose that radio's own codec instead of a list of identically-named
+/// entries to guess between. A rig carrying CAT and audio down one cable is internally a USB hub,
+/// so its codec is the device sharing the CAT port's parent — no naming, no saved profile and no
+/// prior assignment needed, which is what makes this work during first setup.
+///
+/// Empty lists mean "nothing proven", NOT "this rig has no audio": a network-connected rig, a
+/// separate interface box, an analogue card and every non-macOS build all land here. The caller
+/// must fall back to offering everything rather than showing an empty picker.
+#[tauri::command]
+async fn audio_devices_for_port(port: String) -> AudioDevices {
+    #[cfg(feature = "radio")]
+    {
+        let Some(port_loc) = tempo_audio::usbtopo::serial_locations()
+            .get(port.trim())
+            .copied()
+        else {
+            return AudioDevices {
+                input: Vec::new(),
+                output: Vec::new(),
+            };
+        };
+        let (input, output) = tempo_audio::device::available_devices();
+        let pick = |devices: Vec<tempo_audio::audiodev::AudioDevice>, is_input: bool| {
+            let locs = tempo_audio::usbtopo::audio_locations(is_input);
+            let keep = tempo_audio::usbtopo::devices_sharing_usb_device(&devices, &locs, port_loc);
+            devices
+                .into_iter()
+                .filter(|d| keep.contains(&d.name))
+                .map(|d| AudioDeviceDto {
+                    usb_hub: locs.get(&d.name).map(|l| tempo_audio::usbtopo::parent_hub(*l)),
+                    name: d.name,
+                    label: d.label,
+                })
+                .collect()
+        };
+        AudioDevices {
+            input: pick(input, true),
+            output: pick(output, false),
+        }
+    }
+    #[cfg(not(feature = "radio"))]
+    {
+        let _ = port;
+        AudioDevices {
+            input: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+}
+
+
 /// One auto-detected USB radio, for the zero-config setup picker.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17066,6 +17120,7 @@ pub fn run() {
             get_serial_ports,
             get_serial_ports_detailed,
             get_audio_devices,
+            audio_devices_for_port,
             detect_rigs,
             probe_cat_ports,
             point_rotator,

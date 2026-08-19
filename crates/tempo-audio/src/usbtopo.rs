@@ -134,6 +134,35 @@ pub fn location_from_audio_uid(uid: &str) -> Option<u32> {
     u32::from_str_radix(candidate, 16).ok()
 }
 
+/// The devices that sit on the SAME physical USB device as the CAT port at `port_loc`.
+///
+/// The configure-time counterpart of [`label_by_rig`], and the more useful direction: an operator
+/// sets the CAT port first, so by the time they reach the audio pickers the answer is already
+/// determined. It needs no radio to be named, no profile to be saved and no assumption about what
+/// anything is CALLED — a rig carrying CAT and audio down one cable is internally a hub, so its
+/// codec is the one sharing its parent.
+///
+/// Returns the matching `name`s (the identity the picker stores), in the order given. Empty when
+/// nothing matches, which is the honest answer for a rig whose audio is not USB at all (a network
+/// codec, a separate interface box, an analogue card) — the picker then offers everything, as it
+/// always did, rather than an empty list.
+pub fn devices_sharing_usb_device(
+    devices: &[crate::audiodev::AudioDevice],
+    device_locs: &std::collections::HashMap<String, u32>,
+    port_loc: u32,
+) -> Vec<String> {
+    let hub = parent_hub(port_loc);
+    devices
+        .iter()
+        .filter(|d| {
+            device_locs
+                .get(&d.name)
+                .is_some_and(|l| parent_hub(*l) == hub)
+        })
+        .map(|d| d.name.clone())
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
@@ -511,6 +540,61 @@ mod tests {
         assert_eq!(location_from_audio_uid("AppleAggregateDevice:0"), None);
         // A single digit is a channel-layout field, not a port path — never accept it as one.
         assert_eq!(location_from_audio_uid("Some:Device:2"), None);
+    }
+
+    /// Picking a CAT port determines the rig's own codec, with no naming involved — which is what
+    /// makes this usable during first setup, before anything has been saved or named.
+    ///
+    /// Locations measured on a two-radio station: each rig's CAT bridge and codec are siblings on
+    /// that rig's own internal hub.
+    #[test]
+    fn the_codecs_offered_for_a_cat_port_are_the_ones_inside_that_rig() {
+        use crate::audiodev::AudioDevice;
+        use std::collections::HashMap;
+        let dev = |n: &str| AudioDevice {
+            name: n.to_string(),
+            label: n.to_string(),
+        };
+        let devices = vec![
+            dev("USB Audio Device"),    // rig A's, hub 0x110000
+            dev("USB Audio Device #2"), // rig B's, hub 0x120000
+            dev("Mac mini Speakers"),   // not USB at all
+        ];
+        let locs = HashMap::from([
+            ("USB Audio Device".to_string(), 0x112000),
+            ("USB Audio Device #2".to_string(), 0x122000),
+        ]);
+
+        // Rig A's CAT port offers only rig A's codec…
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x111000),
+            vec!["USB Audio Device"]
+        );
+        // …and rig B's only rig B's. This is the pair a NAME cannot separate: both codecs enumerate
+        // as "USB Audio Device" and the " #2" is positional.
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x121000),
+            vec!["USB Audio Device #2"]
+        );
+
+        // THE OTHER HALF OF A DUAL BRIDGE RESOLVES THE SAME. A CP2105 is dual, and CAT may be
+        // configured on either interface; both are on the rig's own hub, so both must find the same
+        // codec. (The original of this test compared 0x111000 with 0x111000 — the same argument to
+        // itself — so it could not have failed. Fixed here to use a genuinely different port
+        // location under the same parent.)
+        assert_eq!(
+            devices_sharing_usb_device(&devices, &locs, 0x113000),
+            devices_sharing_usb_device(&devices, &locs, 0x111000),
+            "either interface of one bridge must resolve to the same rig's codec"
+        );
+
+        // A port on no shared hub proposes NOTHING, so the caller offers the full list rather than
+        // pretending the rig has no audio. This is the case that keeps a network rig, a separate
+        // interface box and every non-macOS build working exactly as before.
+        assert!(devices_sharing_usb_device(&devices, &locs, 0x990000).is_empty());
+        // …and a non-USB device is never proposed for anything.
+        assert!(!devices_sharing_usb_device(&devices, &locs, 0x111000)
+            .contains(&"Mac mini Speakers".to_string()));
     }
 
     /// The registry walk itself is NOT tested here, and that is a statement rather than a gap: CI

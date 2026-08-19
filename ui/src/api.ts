@@ -1276,6 +1276,15 @@ export async function getAudioDevices(): Promise<AudioDevices> {
 }
 
 /**
+ * The audio devices that belong to the same RIG as `port` — its own codec, found by USB topology
+ * rather than by name. Empty means "nothing proven" (a network rig, a separate interface box, every
+ * non-macOS build), NOT "no audio": callers must fall back to the full list, never show nothing.
+ */
+export async function audioDevicesForPort(port: string): Promise<AudioDevices> {
+  return invoke<AudioDevices>('audio_devices_for_port', { port })
+}
+
+/**
  * Enable / disable transmit (the Monitor toggle). Enabling also clears a tripped
  * TX watchdog. Returns the fresh snapshot.
  */
