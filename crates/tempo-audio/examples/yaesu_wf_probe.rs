@@ -42,7 +42,7 @@ use tempo_audio::yaesu_wf::{
 fn ask(addr: &str, line: &str) -> Option<String> {
     let mut s = TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(800)).ok()?;
     s.set_read_timeout(Some(Duration::from_millis(800))).ok()?;
-    write!(s, "{line}\n").ok()?;
+    writeln!(s, "{line}").ok()?;
     let mut buf = Vec::new();
     let mut b = [0u8; 64];
     while buf.len() < 256 {

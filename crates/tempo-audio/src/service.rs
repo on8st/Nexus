@@ -947,14 +947,33 @@ const YAESU_WF_META_SECS: f64 = 5.0;
 /// enough to cover an FT4222 that is simply slow to first frame, short enough to be useful.
 const YAESU_WF_GRACE_SECS: f64 = 6.0;
 
-/// The bridge is not on the USB bus at all.
-const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge is not there. Enable SCU-LAN10 in \
-     the radio's EX menu (Nexus cannot set it over CAT), then switch the radio off and on so it \
-     appears on USB. The waterfall keeps using sound-card audio until then.";
+/// How long to wait before trying a failed FT4222 open again. A failed open MUST be retried, and
+/// this is not a hypothetical: the FT-710's own USB codec drops off the bus by itself (it shows up
+/// as `cpal … device is no longer available`), every churn re-opens the radio, and the FT4222
+/// re-open can race the handle D2XX has not finished releasing. Before this existed, one transient
+/// failure was PERMANENT — the operator-facing message stayed until the radio was switched, and it
+/// blamed the radio's EX menu for a race inside the driver. 5 s is idle-cheap and recovers within
+/// one glance at the scope.
+const YAESU_WF_RETRY_SECS: f64 = 5.0;
+
+/// The bridge is not on the USB bus at all — or something else has it.
+const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be opened. If it is not on \
+     USB at all, enable SCU-LAN10 in the radio's EX menu (Nexus cannot set it over CAT) and switch \
+     the radio off and on. If it is there, another program may have it open. Nexus keeps retrying. \
+     The waterfall uses sound-card audio until then.";
 /// The bridge opened but the radio is sending nothing.
 const YAESU_WF_NO_FRAMES: &str = "The FT-710's spectrum bridge is connected but the radio is not \
      sending a spectrum. Turn the EXTERNAL DISPLAY output on in the radio's EX menu (Nexus cannot \
      set it over CAT). The waterfall keeps using sound-card audio until then.";
+
+/// Should the FT4222 open be attempted on this tick?
+///
+/// Pulled out as a pure function because the interesting case is a NEGATIVE one that no integration
+/// test in this crate can reach without the hardware: wanted, not running, and the retry deadline
+/// already passed. That combination is what a failed open used to make unreachable forever.
+fn yaesu_wf_open_due(want: bool, running: bool, now: f64, retry_after: f64) -> bool {
+    want && !running && now >= retry_after
+}
 
 pub static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2390,6 +2409,8 @@ struct RadioLoop {
     yaesu_wf_meta_after: f64,
     /// Monotonic seconds at which the current reader was started, for the no-frames grace period.
     yaesu_wf_started: f64,
+    /// Earliest time a failed FT4222 open may be attempted again. See `YAESU_WF_RETRY_SECS`.
+    yaesu_wf_retry_after: f64,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2666,6 +2687,7 @@ impl RadioLoop {
             yaesu_wf_meta: std::sync::Arc::new(std::sync::Mutex::new(None)),
             yaesu_wf_meta_after: 0.0,
             yaesu_wf_started: 0.0,
+            yaesu_wf_retry_after: 0.0,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -2883,28 +2905,45 @@ impl RadioLoop {
                 *m = None; // the new radio's span/mode is not known yet
             }
             self.yaesu_wf_started = now;
-            let mut e = engine_lock(engine);
+            self.yaesu_wf_retry_after = now; // attempt at once, in the open block below
             if key.is_none() {
-                e.set_scope_error(None);
-            } else {
-                match crate::yaesu_wf::open_default_source() {
-                    Some(src) => {
-                        self.yaesu_wf = Some(crate::yaesu_wf::YaesuWaterfall::start(
-                            src,
-                            self.spectrum_feed.clone(),
-                            self.yaesu_wf_meta.clone(),
-                            std::time::Duration::from_millis(YAESU_WF_INTERVAL_MS),
-                        ));
-                        e.set_scope_error(None);
-                    }
-                    None => e.set_scope_error(Some(YAESU_WF_NO_BRIDGE.to_string())),
+                engine_lock(engine).set_scope_error(None);
+                return;
+            }
+        }
+
+        // Wanted but not running: open it, now or on the retry cadence. This is deliberately NOT
+        // inside the key-change branch — putting it there made a single transient failure permanent
+        // (see `YAESU_WF_RETRY_SECS` for what produces one on this rig).
+        if yaesu_wf_open_due(
+            self.yaesu_wf_key.is_some(),
+            self.yaesu_wf.is_some(),
+            now,
+            self.yaesu_wf_retry_after,
+        ) {
+            self.yaesu_wf_retry_after = now + YAESU_WF_RETRY_SECS;
+            let mut e = engine_lock(engine);
+            match crate::yaesu_wf::open_default_source() {
+                Some(src) => {
+                    self.yaesu_wf = Some(crate::yaesu_wf::YaesuWaterfall::start(
+                        src,
+                        self.spectrum_feed.clone(),
+                        self.yaesu_wf_meta.clone(),
+                        std::time::Duration::from_millis(YAESU_WF_INTERVAL_MS),
+                    ));
+                    // The grace period runs from the OPEN, not from the key change: a retry that
+                    // succeeded late must still get its full window before "sends nothing" is
+                    // claimed, or a slow first frame would be reported as a radio misconfiguration.
+                    self.yaesu_wf_started = now;
+                    e.set_scope_error(None);
                 }
+                None => e.set_scope_error(Some(YAESU_WF_NO_BRIDGE.to_string())),
             }
             return; // the metadata read can wait a tick; the thread has nothing to place yet
         }
 
         let Some(wf) = self.yaesu_wf.as_ref() else {
-            return; // not running — the message (if any) was set above and stands
+            return; // not wanted, or the retry is not due yet — the message set above stands
         };
 
         // Refresh dial + span + mode, rarely. `SS<P1>5;`/`SS<P1>6;` are the only source for the
@@ -21169,4 +21208,49 @@ mod tests {
             "the FD cursor covers restored + new rows"
         );
     }
+
+    // ── The FT4222 open must be RETRIED ────────────────────────────────────────────────────────
+    //
+    // The regression these four pin down: the open used to live inside `if key != yaesu_wf_key`,
+    // so it was attempted exactly once per radio change. When it failed — and it does, because the
+    // FT-710's codec drops off the bus on its own and the re-open races the handle D2XX has not
+    // finished releasing — the operator got "enable SCU-LAN10 in the EX menu" forever, for a race
+    // inside the driver, with a bridge sitting on the bus the whole time. Observed on the station's
+    // own FT-710 on 2026-08-19: the app held the bridge, lost it, and never took it back.
+    //
+    // The decision is a pure function precisely because the failing case is unreachable from any
+    // test in this crate — it needs the hardware to fail at the right moment.
+
+    #[test]
+    fn a_failed_open_is_retried_once_the_deadline_passes() {
+        // Wanted, nothing running, deadline behind us: this is the case the old shape could not
+        // reach at all, and the whole point of the fix.
+        assert!(yaesu_wf_open_due(true, false, 100.0, 95.0));
+        // Exactly at the deadline counts — a `>` here would stall a tick on a coarse clock.
+        assert!(yaesu_wf_open_due(true, false, 95.0, 95.0));
+    }
+
+    #[test]
+    fn the_retry_does_not_hammer_the_usb_bus() {
+        // Before the deadline, nothing happens. The radio loop ticks far faster than the retry
+        // cadence, so without this the fix would trade a stuck message for an FT_Open storm.
+        assert!(!yaesu_wf_open_due(true, false, 94.999, 95.0));
+    }
+
+    #[test]
+    fn a_running_reader_is_never_joined_by_a_second_one() {
+        // Two readers on one FT4222 fight over the same SPI handle. Running always wins, deadline
+        // or not — this is the invariant the old key-change guard provided as a side effect, and it
+        // has to survive being restated.
+        assert!(!yaesu_wf_open_due(true, true, 1_000.0, 0.0));
+    }
+
+    #[test]
+    fn nothing_is_opened_for_a_radio_that_did_not_ask() {
+        // Not opted in (or not an FT-710, or a network link): no USB traffic at all, whatever the
+        // clock says. A station that never enabled the scope must never see an FT_Open.
+        assert!(!yaesu_wf_open_due(false, false, 1_000.0, 0.0));
+        assert!(!yaesu_wf_open_due(false, true, 1_000.0, 0.0));
+    }
+
 }
