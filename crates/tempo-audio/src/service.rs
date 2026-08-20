@@ -985,10 +985,16 @@ const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be open
      SCU-LAN10 is on. Another program may have it open, or the radio has not been power-cycled \
      since the setting changed. Nexus keeps retrying; the waterfall uses sound-card audio.";
 /// The scope is sweeping, but not around the dial, so no row can be placed on the band.
-const YAESU_WF_NOT_CENTERED: &str = "The radio's spectrum scope is not in a CENTER mode, so Nexus \
-     cannot tell which frequencies the sweep covers — FIX pins the window to a start frequency the \
-     CAT protocol does not report. Set the scope to CENTER for an RF waterfall; until then it uses \
-     sound-card audio.";
+const YAESU_WF_NOT_CENTERED: &str = "Nexus cannot tell which frequencies this sweep covers, so the \
+     waterfall is using sound-card audio. Setting the scope to CENTER always works.";
+/// FIX, with no start stated — and the operator can fix that in one click.
+const YAESU_WF_FIX_UNKNOWN: &str = "The scope is in FIX and Nexus does not know where that window \
+     starts — the radio reports it nowhere. Long-press FIX on the radio at the start frequency, then \
+     click \"FIX starts here\" above the panadapter. Until then the waterfall uses sound-card audio.";
+/// CURSOR, with no anchor — which needs the transition to be seen, not a value to be typed.
+const YAESU_WF_CURSOR_UNKNOWN: &str = "The scope is in CURSOR and Nexus did not see it get there, so \
+     it cannot tell where the window sits. Switch to CENTER and back to CURSOR and it will. Until \
+     then the waterfall uses sound-card audio.";
 
 /// The bridge opened but the radio is sending nothing.
 ///
@@ -3205,13 +3211,31 @@ impl RadioLoop {
         };
 
         let mut e = engine_lock(engine);
-        // A sweep we cannot place is worth EXPLAINING rather than silently blanking. `sweep_edges`
-        // refuses a non-CENTER mode because FIX pins the window to a start frequency the CAT
-        // protocol does not report, so the RF row simply disappears and the waterfall falls back to
-        // audio — which from the operator's chair looks like a fault Nexus caused.
+        // A sweep we cannot place is worth EXPLAINING rather than silently blanking — but the test is
+        // whether it can be PLACED, not whether it is centred. Those were the same thing when this
+        // was written and have not been since: CURSOR became placeable with an anchor and FIX with a
+        // stated start, so asking `mode_is_centered` warned the operator that the sweep could not be
+        // located while it was being drawn correctly in front of them.
         if let Some(m) = meta_now {
-            if !crate::yaesu_wf::mode_is_centered(m.mode_code) {
-                e.set_scope_error(Some(YAESU_WF_NOT_CENTERED.to_string()));
+            let placed = crate::yaesu_wf::sweep_edges_anchored(
+                m.dial_hz,
+                m.span_code,
+                m.mode_code,
+                m.center_hz,
+                m.fix_start_hz,
+            );
+            if placed.is_none() {
+                // And say what to DO about it, which differs per position. Sending a FIX operator to
+                // CENTER is the wrong advice now that stating a start is one click.
+                use crate::yaesu_wf::{position_of, ScopePosition};
+                e.set_scope_error(Some(
+                    match position_of(m.mode_code) {
+                        Some(ScopePosition::Fix) => YAESU_WF_FIX_UNKNOWN,
+                        Some(ScopePosition::Cursor) => YAESU_WF_CURSOR_UNKNOWN,
+                        _ => YAESU_WF_NOT_CENTERED,
+                    }
+                    .to_string(),
+                ));
                 return;
             }
         }
