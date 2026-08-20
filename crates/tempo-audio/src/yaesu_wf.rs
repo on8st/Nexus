@@ -37,6 +37,44 @@
 
 /// One SPI read from the bridge. Fixed size; the radio does not frame or delimit.
 pub const FRAME_BYTES: usize = 4096;
+
+/// The 16 bytes that END every frame: `FF 01 EE 01`, four times.
+///
+/// MEASURED, not documented anywhere: identical in all 200 frames of a bench capture (station
+/// FT-710, 2026-08-20, CENTER, 200 kHz), and the 64-byte slice ending the frame occurs exactly ONCE
+/// per frame — so it is a usable delimiter rather than a pattern that happens to appear.
+///
+/// It exists here because the SPI side has NO framing of its own. `SPIMaster_SingleRead` hands over
+/// a byte pipe; nothing says where a frame begins, and our 4096-byte read window drifts against the
+/// radio's frame boundary on its own (measured: aligned for 48 frames, then misaligned for 51, with
+/// no pause and no operator action in between). Reading bins out of an unaligned window puts every
+/// bin at the wrong frequency, which is the "garbled spectrum" an operator sees.
+pub const FRAME_TRAILER: [u8; 16] = [
+    0xff, 0x01, 0xee, 0x01, 0xff, 0x01, 0xee, 0x01, 0xff, 0x01, 0xee, 0x01, 0xff, 0x01, 0xee, 0x01,
+];
+
+/// Find the end of the LAST complete frame in `window`, or `None`.
+///
+/// "Complete" means the trailer has a whole frame's worth of bytes in front of it. Searching for the
+/// LAST one keeps latency down when a read has caught up on more than one frame.
+pub fn frame_end(window: &[u8]) -> Option<usize> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(rel) = window[from..]
+        .windows(FRAME_TRAILER.len())
+        .position(|w| w == FRAME_TRAILER)
+    {
+        let end = from + rel + FRAME_TRAILER.len();
+        if end >= FRAME_BYTES {
+            found = Some(end);
+        }
+        from += rel + 1;
+        if from + FRAME_TRAILER.len() > window.len() {
+            break;
+        }
+    }
+    found
+}
 /// Receiver 1's waterfall line: `uint8` per bin, at the start of the frame.
 pub const WF1_OFFSET: usize = 0;
 /// Usable bins in receiver 1's line — the width of one waterfall line.
@@ -445,6 +483,9 @@ pub mod ft4222 {
     /// An opened bridge. Closes on drop.
     pub struct Ft4222Waterfall {
         handle: Handle,
+        /// Bytes read but not yet cut into a frame. The pipe has no framing of its own, so a frame
+        /// boundary is found rather than assumed — see `FRAME_TRAILER`.
+        acc: Vec<u8>,
     }
 
     // SAFETY: `handle` is an opaque D2XX handle (`*mut c_void`), which is why the compiler refuses
@@ -476,7 +517,10 @@ pub mod ft4222 {
             if st != 0 || handle.is_null() {
                 return Err(std::io::Error::other(format!("FT_Open failed: {st}")));
             }
-            let me = Self { handle };
+            let me = Self {
+                handle,
+                acc: Vec::with_capacity(2 * FRAME_BYTES),
+            };
             let st = unsafe {
                 FT4222_SPIMaster_Init(
                     handle,
@@ -501,24 +545,74 @@ pub mod ft4222 {
     }
 
     impl WaterfallSource for Ft4222Waterfall {
+        /// Read until a WHOLE frame can be cut out on its trailer.
+        ///
+        /// The transport is a byte pipe with no framing (see `FRAME_TRAILER`), so a fixed-size read
+        /// is not a frame — it is 4096 bytes starting wherever the pipe happens to be. This keeps a
+        /// small accumulator and returns the last complete frame in it, which is what makes a bin
+        /// index mean a frequency. A read that contains no trailer yields `Err`, and the caller
+        /// treats that as a dropped frame: the previous picture stays, which is the right answer for
+        /// a transient, and a persistent one shows as a frozen scope rather than a plausible lie.
         fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
-            let mut buf = vec![0u8; FRAME_BYTES];
+            self.read_once()
+        }
+    }
+
+    /// Bytes per SPI read: TWO frames.
+    ///
+    /// A frame is cut on its trailer out of a pipe with no framing, so a read of exactly one frame's
+    /// length contains a whole frame only when the boundary happens to fall right — measured, that
+    /// is about half the time (184 frames from 400 single-frame reads, and a bounded retry only
+    /// lifted it to 201 for up to three times the traffic, because the failures are correlated).
+    /// Reading two frames' worth means a complete frame is present whatever the rotation.
+    const READ_BYTES: usize = 2 * FRAME_BYTES;
+
+    impl Ft4222Waterfall {
+        fn read_once(&mut self) -> std::io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; READ_BYTES];
             let mut got: u16 = 0;
             let st = unsafe {
                 FT4222_SPIMaster_SingleRead(
                     self.handle,
                     buf.as_mut_ptr(),
-                    FRAME_BYTES as u16,
+                    READ_BYTES as u16,
                     &mut got,
-                    false,
+                    // isEndTransaction = TRUE — chip-select is de-asserted at the end of every read.
+                    //
+                    // It was `false`, carried over from the Python wrapper that first proved this
+                    // transport. With CS held asserted the transaction never ends, so a GAP IN
+                    // READING leaves the slave mid-word and everything after it arrives shifted by
+                    // one BIT — measured on the bench (station FT-710, 2026-08-20): the frame
+                    // trailer `FF 01 EE 01…` came back as `7F 80 F7 00…`, the same bits one place
+                    // right, and it never recovered. The app takes exactly such a gap whenever the
+                    // rig's scope is not in a CENTER mode, because `pump` returns before reading.
+                    // With `true`, three 3-second pauses cost nothing: 300 of 300 frames aligned.
+                    true,
                 )
             };
             if st != 0 {
                 return Err(std::io::Error::other(format!("SingleRead failed: {st}")));
             }
-            // A short read is handed up as-is; `parse_wf1` refuses it rather than padding.
             buf.truncate(got as usize);
-            Ok(buf)
+            self.acc.extend_from_slice(&buf);
+            // Bound the accumulator. Two frames is enough to cut one out at any rotation; more than
+            // that means we are not finding trailers at all, and holding megabytes of a stream we
+            // cannot parse helps nobody.
+            let cap = 3 * FRAME_BYTES;
+            if self.acc.len() > cap {
+                let drop_to = self.acc.len() - cap;
+                self.acc.drain(..drop_to);
+            }
+            match super::frame_end(&self.acc) {
+                Some(end) => {
+                    let frame = self.acc[end - FRAME_BYTES..end].to_vec();
+                    self.acc.drain(..end); // consumed — never re-cut the same frame
+                    Ok(frame)
+                }
+                None => Err(std::io::Error::other(
+                    "no frame trailer in the stream yet — dropping this read",
+                )),
+            }
         }
     }
 
@@ -798,4 +892,63 @@ mod tests {
         // A span wider than the dial would put the row below 0 Hz.
         assert_eq!(sweep_edges(100_000.0, b'9', b'4'), None);
     }
+
+    // ── Framing: the SPI side has none, so a frame boundary is FOUND ─────────────────────────────
+    //
+    // Bench measurement behind these (station FT-710, 2026-08-20), because none of it is guessable:
+    // a fixed-size read is not a frame. With the shipped code, three 3-second gaps in reading left
+    // 100 of 400 frames valid — the rest shifted by one BIT, because chip-select was never
+    // de-asserted — and the read window drifts against the radio's frame boundary even with no gap
+    // at all (aligned 48 frames, then misaligned 51, untouched). Cutting on the trailer and reading
+    // two frames' worth per read gave 400 of 400, checked against a signature the cut does not use.
+
+    fn framed(payload: u8) -> Vec<u8> {
+        let mut f = vec![payload; FRAME_BYTES];
+        f[FRAME_BYTES - FRAME_TRAILER.len()..].copy_from_slice(&FRAME_TRAILER);
+        f
+    }
+
+    #[test]
+    fn a_whole_frame_is_cut_at_its_trailer() {
+        let w = framed(0x22);
+        assert_eq!(frame_end(&w), Some(FRAME_BYTES));
+    }
+
+    #[test]
+    fn a_trailer_without_a_frame_in_front_of_it_is_not_a_frame() {
+        // The rotation case, and the one that makes the difference between a correct row and a
+        // plausible wrong one: the trailer arrived, but the bins that belong to it did not. Cutting
+        // here would splice the head of this frame onto whatever preceded it.
+        let mut w = vec![0x11u8; 100];
+        w.extend_from_slice(&FRAME_TRAILER);
+        assert_eq!(frame_end(&w), None);
+    }
+
+    #[test]
+    fn the_last_complete_frame_wins_when_a_read_caught_up_on_two() {
+        // Two frames' worth is read per call, so this is the ordinary case, not an edge one. Taking
+        // the LAST keeps the waterfall showing the newest sweep instead of one frame of latency.
+        let mut w = framed(0x33);
+        w.extend_from_slice(&framed(0x44));
+        assert_eq!(frame_end(&w), Some(2 * FRAME_BYTES));
+        let cut = &w[frame_end(&w).unwrap() - FRAME_BYTES..frame_end(&w).unwrap()];
+        assert_eq!(cut[0], 0x44, "the newest frame, not the older one");
+    }
+
+    #[test]
+    fn a_stream_with_no_trailer_yields_nothing_rather_than_a_guess() {
+        assert_eq!(frame_end(&vec![0x55u8; 3 * FRAME_BYTES]), None);
+    }
+
+    #[test]
+    fn a_frame_split_across_two_reads_is_still_found() {
+        // What a real read looks like: a partial frame, then a whole one. The whole one must be
+        // recovered, and its first byte must be the new frame's, not the tail of the partial.
+        let mut w = vec![0x66u8; 1_234]; // tail of an earlier frame, no trailer of its own
+        w.extend_from_slice(&framed(0x77));
+        let end = frame_end(&w).expect("the complete frame is found");
+        assert_eq!(end, 1_234 + FRAME_BYTES);
+        assert_eq!(w[end - FRAME_BYTES], 0x77, "cut starts at the frame, not in the tail");
+    }
+
 }

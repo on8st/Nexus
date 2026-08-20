@@ -48,6 +48,10 @@ required-features = ["device"]
 name = "yaesu_wf_probe"
 required-features = ["yaesu-wf"]
 
+[[example]]
+name = "yaesu_wf_dump"
+required-features = ["yaesu-wf"]
+
 [dependencies]
 tempo-app = { path = "../tempo-app" }
 tempo-core = { path = "../tempo-core" }
