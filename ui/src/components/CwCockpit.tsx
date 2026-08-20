@@ -381,6 +381,18 @@ export function CwCockpit({
   const nativeRf = scopeFeed != null && isRfScopeSource(scopeFeed.source)
   // The FT-710's span is commandable over plain CAT, so its row is the rig's own ladder rather
   // than a client-side crop — the app then shows exactly what the radio sweeps. Mirror of Phone.
+  // TWO DIFFERENT QUESTIONS, and conflating them cost the operator the only way out of FIX.
+  //
+  // `yaesuScope` — does this radio have a scope Nexus is talking to? True as soon as the mode code
+  // has been read over CAT, which happens whether or not the sweep can be PLACED. The controls hang
+  // off this.
+  // `yaesuRf` — are RF rows arriving right now? The view bounds hang off this, because when the feed
+  // falls back to sound-card audio the axis really is audio.
+  //
+  // Gating the controls on the feed made them vanish exactly when they were needed: in FIX with no
+  // start stated, no rows flow, so the panadapter block unmounted — taking the "FIX starts here"
+  // button with it, and leaving no way to state the start that would bring the rows back.
+  const yaesuScope = snap.radio.scopeModeCode != null
   const yaesuRf = scopeFeed?.source === 'yaesu'
   // What the radio reports, so the two selects show the rig's state rather than a local guess.
   // `scopeModeCode` is the `SS` P3 byte widened for JSON; an unknown code shows as Center, which is
@@ -1386,7 +1398,7 @@ export function CwCockpit({
           <span className="ph-scope-head-label">Colors</span>
           <PalettePicker />
         </div>
-        {yaesuRf ? (
+        {yaesuScope ? (
           // The FT-710 sweeps its own span and owns where the sweep sits, so these command the RADIO
           // and the app draws what comes back. Two compact <select>s rather than thirteen chips: the
           // rig has ten span rungs and three positions, and a chip row that long crowds the scope it
@@ -1438,7 +1450,7 @@ export function CwCockpit({
             )}
           </div>
         ) : null}
-        {nativeRf && !yaesuRf && (
+        {nativeRf && !yaesuScope && (
           // Native RF panadapter: client-side RF-width zoom around the dial (mirror of Phone).
           <div className="ph-span" role="group" aria-label="Panadapter zoom">
             {RF_SPANS.map((sp) => (
