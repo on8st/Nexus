@@ -2516,6 +2516,8 @@ struct RadioLoop {
     /// Where a CURSOR sweep is centred — see `yaesu_wf_next_anchor`. `None` for CENTER (the dial
     /// is the centre) and for FIX (the window is a preset nothing reports).
     yaesu_wf_anchor: Option<f64>,
+    /// Whether the sweep was placeable on the previous tick — so the log names TRANSITIONS only.
+    yaesu_wf_placed: bool,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2794,6 +2796,7 @@ impl RadioLoop {
             yaesu_wf_started: 0.0,
             yaesu_wf_retry_after: 0.0,
             yaesu_wf_anchor: None,
+            yaesu_wf_placed: false,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -3119,7 +3122,7 @@ impl RadioLoop {
         // tuning across 20 m). The old comment claimed "the dial we already poll", which was true and
         // beside the point — it was polled and then not used until the next CAT read.
         let meta_before = self.yaesu_wf_meta.lock().ok().and_then(|g| *g);
-        let (dial_hz, band, fix_start_mhz) = {
+        let (dial_hz, fix_start_mhz) = {
             let e = engine_lock(engine);
             let s = e.settings();
             let start = s
@@ -3127,7 +3130,7 @@ impl RadioLoop {
                 .iter()
                 .find(|p| p.id == s.active_radio)
                 .and_then(|p| p.yaesu_fix_starts.get(&s.band).copied());
-            (s.dial_mhz * 1_000_000.0, s.band.clone(), start)
+            (s.dial_mhz * 1_000_000.0, start)
         };
         // Surface what is in force so the control can show it rather than always inviting a value.
         engine_lock(engine).set_scope_fix_start(fix_start_mhz);
@@ -3200,6 +3203,10 @@ impl RadioLoop {
             *guard
         };
 
+        if meta_now.is_none() && self.yaesu_wf_placed {
+            self.yaesu_wf_placed = false;
+            eprintln!("yaesu-wf: CANNOT place — span/mode unknown (a CAT read failed this tick)");
+        }
         let mut e = engine_lock(engine);
         // A sweep we cannot place is worth EXPLAINING rather than silently blanking — but the test is
         // whether it can be PLACED, not whether it is centred. Those were the same thing when this
