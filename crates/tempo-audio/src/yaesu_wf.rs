@@ -223,6 +223,56 @@ pub fn parse_ex_reply(reply: &str, item: ExItem) -> Option<String> {
         .then(|| value.to_string())
 }
 
+/// The band a dial sits in, as `(lo_hz, hi_hz)` — the edges a FIX window has to cover.
+///
+/// IARU REGION 1 edges, because that is where this fork's radio is. Region 2/3 are wider on 40 m and
+/// 80 m, so an operator there would see the top of those bands cut off — the table is the one thing
+/// to change, and it is deliberately a table rather than arithmetic for exactly that reason.
+///
+/// Needed because the FT-710 reports its FIX window nowhere (unlike Icom, whose scope puts its fixed
+/// edges in the frame header). If the window has to be derived rather than read, the band is the only
+/// honest thing to derive it from: it is what the operator means by "the whole band".
+pub fn band_edges_hz(dial_hz: f64) -> Option<(f64, f64)> {
+    const BANDS: [(f64, f64); 11] = [
+        (1_810_000.0, 2_000_000.0),   // 160 m
+        (3_500_000.0, 3_800_000.0),   // 80 m
+        (5_351_500.0, 5_366_500.0),   // 60 m
+        (7_000_000.0, 7_200_000.0),   // 40 m
+        (10_100_000.0, 10_150_000.0), // 30 m
+        (14_000_000.0, 14_350_000.0), // 20 m
+        (18_068_000.0, 18_168_000.0), // 17 m
+        (21_000_000.0, 21_450_000.0), // 15 m
+        (24_890_000.0, 24_990_000.0), // 12 m
+        (28_000_000.0, 29_700_000.0), // 10 m
+        (50_000_000.0, 52_000_000.0), // 6 m
+    ];
+    BANDS
+        .iter()
+        .find(|(lo, hi)| dial_hz >= *lo && dial_hz <= *hi)
+        .copied()
+}
+
+/// The FIX window Nexus draws when the scope is in FIX: the band, centred, in the narrowest span the
+/// radio offers that still covers it.
+///
+/// ⚠️ THIS IS AN ASSUMPTION ABOUT THE RADIO, not a reading of it. The FIX start is settable only by a
+/// long press on the front panel — verified against all 56 CAT commands and the whole `EX` menu — so
+/// there is no way to make the rig agree, and no way to check that it does. It is here because the
+/// operator asked for FIX to work with no clicking (2026-08-20), and this is the only interpretation
+/// of "the scope, centred on the tuned band, at the minimal span that shows the whole band" that
+/// needs nothing from them. If the radio's own window differs, the row is misplaced by the
+/// difference — which is why the span is also SET here, so at least one of the two numbers is ours.
+pub fn auto_fix_window(dial_hz: f64) -> Option<(f64, f64, u8)> {
+    let (lo, hi) = band_edges_hz(dial_hz)?;
+    let need = hi - lo;
+    // The narrowest rung that covers the band. Codes ascend in span, so the first fit is the best.
+    let code = (b'0'..=b'9').find(|&c| span_hz(c).is_some_and(|s| s >= need))?;
+    let span = span_hz(code)?;
+    let center = (lo + hi) / 2.0;
+    let start = center - span / 2.0;
+    (start >= 0.0).then_some((start, start + span, code))
+}
+
 /// Where the sweep sits relative to the dial. The operator-facing choice, three ways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopePosition {
@@ -1352,6 +1402,58 @@ mod tests {
             mode_code: b'A',
         };
         assert_eq!(pump(&mut src, &feed, meta), Pumped::Unavailable);
+    }
+
+
+    // ── The FIX window, derived with no operator interaction ────────────────────────────────────
+    //
+    // Operator, 2026-08-20: "I do not want any user interaction/clicking to get the spectrum working
+    // in fix mode. When I select fix mode, I want you to set the scope to the center of the tuned
+    // band, with the minimal span that is needed to be able to show the full band. The start is the
+    // center minus half of the minimal needed span."
+
+    #[test]
+    fn twenty_metres_gets_the_narrowest_span_that_covers_it() {
+        // 14.000-14.350 is 350 kHz wide. 200 kHz does not cover it; 500 kHz does. Centre 14.175, so
+        // the window is 14.175 ± 250 kHz.
+        let (start, end, code) = auto_fix_window(14_074_000.0).expect("20 m is a known band");
+        assert_eq!(code, b'8', "500 kHz — the first rung that fits");
+        assert_eq!(start, 13_925_000.0);
+        assert_eq!(end, 14_425_000.0);
+        assert!(start < 14_000_000.0 && end > 14_350_000.0, "the whole band is inside");
+    }
+
+    #[test]
+    fn a_narrow_band_gets_a_narrow_span_rather_than_the_same_one_everywhere() {
+        // 30 m is 50 kHz wide, so it takes the 50 kHz rung — 850 bins across 50 kHz instead of 500,
+        // which is the whole point of choosing the MINIMAL covering span.
+        let (start, end, code) = auto_fix_window(10_136_000.0).expect("30 m is a known band");
+        assert_eq!(code, b'5', "50 kHz");
+        assert_eq!((start, end), (10_100_000.0, 10_150_000.0));
+    }
+
+    #[test]
+    fn every_band_in_the_table_is_coverable_and_centred() {
+        // Each band must fit inside its chosen window, and sit in the middle of it. A band whose
+        // width exceeded the largest rung would silently return None instead — 10 m at 1.7 MHz is
+        // the closest, and 1 MHz does NOT cover it, which this pins as known behaviour.
+        for dial in [1_850_000.0, 3_600_000.0, 7_100_000.0, 14_074_000.0, 21_074_000.0, 24_915_000.0] {
+            let (lo, hi) = band_edges_hz(dial).expect("a band");
+            let (start, end, _) = auto_fix_window(dial).expect("coverable");
+            assert!(start <= lo && end >= hi, "band {lo}-{hi} inside {start}-{end}");
+            let slack = ((lo - start) - (end - hi)).abs();
+            assert!(slack < 1.0, "the band sits centred in the window");
+        }
+        // 10 m (1.7 MHz) and 6 m (2 MHz) are wider than the 1 MHz top rung: no window covers them,
+        // and saying so is better than drawing a third of the band as if it were all of it.
+        assert_eq!(auto_fix_window(28_074_000.0), None, "10 m exceeds every rung");
+        assert_eq!(auto_fix_window(50_313_000.0), None, "6 m exceeds every rung");
+    }
+
+    #[test]
+    fn a_dial_outside_every_ham_band_yields_no_window() {
+        assert_eq!(band_edges_hz(9_410_000.0), None, "a broadcast station is not a band");
+        assert_eq!(auto_fix_window(9_410_000.0), None);
     }
 
 }

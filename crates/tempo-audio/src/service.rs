@@ -3102,6 +3102,12 @@ impl RadioLoop {
             return; // not wanted, or the retry is not due yet — the message set above stands
         };
 
+        let meta_before = self.yaesu_wf_meta.lock().ok().and_then(|g| *g);
+        let dial_hz_for_span = {
+            let e = engine_lock(engine);
+            e.settings().dial_mhz * 1_000_000.0
+        };
+
         // Span requests from the UI, honoured on the RADIO rather than by cropping the row.
         //
         // The operator's expectation, and it is the right one: the app's panadapter should reflect
@@ -3135,6 +3141,22 @@ impl RadioLoop {
         }
 
 
+        // IN FIX, NEXUS OWNS THE SPAN. The window is the band and the span is what makes it fit, so
+        // the two cannot be chosen separately — asking the radio for the narrowest covering rung is
+        // the other half of deriving the window, and it is the half we CAN make true rather than
+        // assume. Sent only on a change, so it is not a write per tick.
+        if matches!(
+            meta_before.and_then(|m| crate::yaesu_wf::position_of(m.mode_code)),
+            Some(crate::yaesu_wf::ScopePosition::Fix)
+        ) {
+            if let Some((_, _, code)) = crate::yaesu_wf::auto_fix_window(dial_hz_for_span) {
+                if meta_before.map(|m| m.span_code) != Some(code) {
+                    rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
+                    self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
+                }
+            }
+        }
+
         // The scope POSITION, same shape as the span above and the same reason for the scope of
         // the lock. The code arrives ready-made from `mode_code_for`, which keeps the operator in
         // whichever display family the rig is already using.
@@ -3155,7 +3177,6 @@ impl RadioLoop {
         // sees a garbled spectrum rather than an honestly blank one (station report, 2026-08-19,
         // tuning across 20 m). The old comment claimed "the dial we already poll", which was true and
         // beside the point — it was polled and then not used until the next CAT read.
-        let meta_before = self.yaesu_wf_meta.lock().ok().and_then(|g| *g);
         let (dial_hz, fix_start_mhz) = {
             let e = engine_lock(engine);
             let s = e.settings();
@@ -3233,9 +3254,14 @@ impl RadioLoop {
             // one per band, so carrying a 20 m start onto 40 m would draw a window that is simply
             // somewhere else. A band change therefore makes it unknown until the operator says
             // where FIX starts there — the same refusal every other unknown gets here.
-            // The FIX start comes from SETTINGS, keyed by band — the radio keeps one per band and
-            // so do we, so it survives a restart and a 20 m start is never drawn on 40 m.
-            let fix_start = fix_start_mhz.map(|mhz| mhz * 1_000_000.0);
+            // THE FIX WINDOW IS DERIVED, NOT ASKED FOR. The operator wants FIX to work with no
+            // clicking (2026-08-20), and the radio reports its window nowhere, so Nexus computes the
+            // one they described: the tuned band, centred, in the narrowest span that covers it —
+            // `start = centre - span/2`. A hand-written `yaesuFixStarts` entry still wins, as an
+            // escape hatch for a radio whose own window does not match; nothing in the UI writes it.
+            let fix_start = fix_start_mhz
+                .map(|mhz| mhz * 1_000_000.0)
+                .or_else(|| crate::yaesu_wf::auto_fix_window(dial_hz).map(|(start, _, _)| start));
             let keep_stale = now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_SECS;
             *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start, keep_stale);
             *guard
