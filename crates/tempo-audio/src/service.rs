@@ -957,7 +957,7 @@ const YAESU_WF_META_FAST_MS: f64 = 800.0;
 /// costs nothing, and stay far below the time an operator needs to change a setting and look at the
 /// screen. 2.5 s is three fast polls. Past it the sweep is unknown, which is the honest answer — and
 /// the dangerous case it protects against (a mode change we missed) resolves on the next good read.
-const YAESU_WF_STALE_MS: f64 = 2_500.0;
+const YAESU_WF_STALE_MS: f64 = 12_000.0;
 /// How long to leave a span request alone before asking again.
 ///
 /// Long enough that the read-back has had several chances to confirm it, because re-asking is not
@@ -1076,45 +1076,46 @@ fn yaesu_wf_next_meta(
     polled: Option<(Option<u8>, Option<u8>)>,
     anchor_hz: Option<f64>,
     fix_start_hz: Option<f64>,
-    keep_stale: bool,
+    keep_span: bool,
+    keep_mode: bool,
 ) -> Option<crate::yaesu_wf::SweepMeta> {
-    match polled {
-        Some((Some(span_code), Some(mode_code))) => Some(crate::yaesu_wf::SweepMeta {
-            dial_hz,
-            center_hz: anchor_hz,
-            fix_start_hz,
-            span_code,
-            mode_code,
-        }),
-        // Asked and did not learn. `keep_stale` decides whether that is a HICCUP or a fact.
-        //
-        // Going straight to unknown was the original rule, and it is right about the danger: a
-        // stale CENTER pair kept after the operator switches to FIX draws every signal in the wrong
-        // place. But it cannot tell a mode change from a dropped reply, and dropped replies are
-        // routine — the first read after any `SS` set comes back empty by measurement, and a read
-        // can lose a race with another CAT client. So every hiccup blanked the panadapter for a poll
-        // cycle: the operator's "brief glitch of audio spectrum, then recovering" (2026-08-20).
-        //
-        // The caller allows staleness only briefly (see `YAESU_WF_STALE_MS`). Within that window
-        // the previous span and mode stand, because they change only when somebody acts; past it we
-        // admit we do not know. The dial and the anchor are re-stated regardless, so a stale window
-        // still follows the radio while it lasts.
-        Some(_) if keep_stale => prev.map(|m| crate::yaesu_wf::SweepMeta {
+    // MERGED PER FIELD. The span and the mode are two separate reads that fail separately, and the
+    // measured failure is `(None, Some(mode))` — a set makes the NEXT read fail, and the span is
+    // what Nexus sets. Judging them together threw away a mode read successfully THIS TICK because
+    // the span beside it was missing, and "unknown" blanks the sweep: no RF row is published, the
+    // RF slot goes stale after a second, and `SpectrumFeed::row()` falls through to the AUDIO slot.
+    // That is the operator's "brief glitch of audio spectrum, then recovering" (2026-08-20), which
+    // survived two earlier attempts at fixing it.
+    //
+    // It also SHRINKS the danger the staleness rule exists for rather than extending it: holding a
+    // stale MODE is what draws every signal in the wrong place, and a mode read this tick cannot be
+    // stale. The fresh field always wins; only a missing one falls back, and only while the caller
+    // says that field is still young enough.
+    // NOT ASKING IS NOT THE SAME AS ASKING AND NOT LEARNING. A tick between polls carries the
+    // sweep unconditionally — the codes change only when somebody acts, and the dial is re-stated
+    // below so the window still follows the radio. Only a poll that RAN and came back short is
+    // subject to the staleness bound. Collapsing the two made a between-polls tick discard a
+    // perfectly good sweep, which `the_dial_is_taken_from_this_tick_even_when_no_cat_read_happened`
+    // caught immediately.
+    let Some((polled_span, polled_mode)) = polled else {
+        return prev.map(|m| crate::yaesu_wf::SweepMeta {
             dial_hz,
             center_hz: anchor_hz,
             fix_start_hz,
             ..m
-        }),
-        Some(_) => None,
-        None => prev.map(|m| crate::yaesu_wf::SweepMeta {
-            dial_hz,
-            // The anchor is re-stated every tick, not inherited: it is owned by
-            // `yaesu_wf_next_anchor`, which drops it the moment the mode stops being CURSOR.
-            center_hz: anchor_hz,
-            fix_start_hz,
-            ..m
-        }),
-    }
+        });
+    };
+    let span_code = polled_span.or_else(|| prev.filter(|_| keep_span).map(|m| m.span_code))?;
+    let mode_code = polled_mode.or_else(|| prev.filter(|_| keep_mode).map(|m| m.mode_code))?;
+    Some(crate::yaesu_wf::SweepMeta {
+        dial_hz,
+        // The anchor is re-stated every tick, not inherited: it is owned by
+        // `yaesu_wf_next_anchor`, which drops it the moment the mode stops being CURSOR.
+        center_hz: anchor_hz,
+        fix_start_hz,
+        span_code,
+        mode_code,
+    })
 }
 
 /// Should the FT4222 open be attempted on this tick?
@@ -2572,7 +2573,10 @@ struct RadioLoop {
     /// precisely the case one wants to read about.
     yaesu_wf_placed: Option<bool>,
     /// When the span and mode were last read SUCCESSFULLY — see `YAESU_WF_STALE_MS`.
-    yaesu_wf_read_ok: f64,
+    yaesu_wf_span_ok: f64,
+    /// When the MODE was last read successfully — stamped apart from the span because the two
+    /// fail apart. See `yaesu_wf_next_meta`.
+    yaesu_wf_mode_ok: f64,
     /// Last MODE code logged, so a mode change is reported once. See the log site.
     yaesu_wf_mode_seen: Option<(u8, u8, i64)>,
     /// The span code last REQUESTED in FIX, and when — see `YAESU_WF_SPAN_ASK_MS`.
@@ -2856,7 +2860,8 @@ impl RadioLoop {
             yaesu_wf_retry_after: 0.0,
             yaesu_wf_anchor: None,
             yaesu_wf_placed: None,
-            yaesu_wf_read_ok: 0.0,
+            yaesu_wf_span_ok: 0.0,
+            yaesu_wf_mode_ok: 0.0,
             yaesu_wf_mode_seen: None,
             yaesu_wf_span_asked: None,
             cur_tier: Tier::TempoFast,
@@ -3262,8 +3267,12 @@ impl RadioLoop {
             // Surface the position for the UI (and for resolving a position change into a code
             // in the right display family) — see `RadioStatus::scope_mode_code`.
             engine_lock(engine).set_scope_mode_code(mode.map(u32::from));
-            if span.is_some() && mode.is_some() {
-                self.yaesu_wf_read_ok = now;
+            // Stamped SEPARATELY: a poll that learns one of the two still refreshes that one.
+            if span.is_some() {
+                self.yaesu_wf_span_ok = now;
+            }
+            if mode.is_some() {
+                self.yaesu_wf_mode_ok = now;
             }
             Some((span, mode))
         } else {
@@ -3316,22 +3325,26 @@ impl RadioLoop {
                 crate::yaesu_wf::auto_fix_start(dial_hz, span)
             });
             let prev_meta = *guard;
-            let keep_stale = now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_MS;
-            *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start, keep_stale);
+            let keep_span = now - self.yaesu_wf_span_ok <= YAESU_WF_STALE_MS;
+            let keep_mode = now - self.yaesu_wf_mode_ok <= YAESU_WF_STALE_MS;
+            *guard = yaesu_wf_next_meta(
+                *guard, dial_hz, polled, anchor, fix_start, keep_span, keep_mode,
+            );
             (*guard, prev_meta, polled)
         };
 
         if meta_now.is_none() && self.yaesu_wf_placed != Some(false) {
             self.yaesu_wf_placed = Some(false);
             eprintln!(
-                "yaesu-wf: CANNOT place — span/mode unknown (keep_stale={} prev={} polled={} read_ok_age={:.0}ms)",
-                now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_MS,
+                "yaesu-wf: CANNOT place — span/mode unknown (keep span={} mode={} prev={} polled={} span_age={:.0}ms)",
+                now - self.yaesu_wf_span_ok <= YAESU_WF_STALE_MS,
+                now - self.yaesu_wf_mode_ok <= YAESU_WF_STALE_MS,
                 if meta_before.is_some() { "some" } else { "NONE" },
                 match polled_dbg {
                     None => "none".to_string(),
                     Some((sp, md)) => format!("({:?},{:?})", sp.map(|c| c as char), md.map(|c| c as char)),
                 },
-                now - self.yaesu_wf_read_ok,
+                now - self.yaesu_wf_span_ok,
             );
         }
         let mut e = engine_lock(engine);
@@ -21724,6 +21737,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .expect("a known sweep stays known");
         assert_eq!(out.dial_hz, 14_220_400.0, "the dial must follow the radio");
@@ -21735,6 +21749,59 @@ mod tests {
     }
 
     #[test]
+    /// THE GLITCH, pinned. A poll that learns the MODE but drops the SPAN must keep the sweep
+    /// placeable — the fresh mode is used, the span falls back — because "unknown" publishes no RF
+    /// row, the RF slot goes stale after a second, and the waterfall shows AUDIO instead.
+    ///
+    /// Measured on the FT-710: setting the scope mode makes the very next span read come back
+    /// empty, so `(None, Some(mode))` is the ORDINARY consequence of the operator switching modes,
+    /// not a rare fault. Judged as a pair it blanked the sweep every single time.
+    #[test]
+    fn a_dropped_span_beside_a_fresh_mode_keeps_the_sweep_placeable() {
+        let prev = Some(meta(14_150_000.0, b'7', b'4'));
+        let out = yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((None, Some(b'A'))), // span dropped, mode freshly read as FIX
+            None,
+            None,
+            true,
+            true,
+        )
+        .expect("a fresh mode must not be thrown away because the span beside it was missing");
+        assert_eq!(out.mode_code, b'A', "the mode read THIS TICK wins");
+        assert_eq!(out.span_code, b'7', "the span falls back to the last known");
+
+        // And the reverse: a dropped MODE beside a fresh span keeps the last known mode.
+        let out = yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((Some(b'8'), None)),
+            None,
+            None,
+            true,
+            true,
+        )
+        .expect("placeable");
+        assert_eq!(out.span_code, b'8');
+        assert_eq!(out.mode_code, b'4');
+
+        // A field that is BOTH missing and too old is still unknown — the fallback is bounded.
+        assert!(
+            yaesu_wf_next_meta(
+                prev,
+                14_150_000.0,
+                Some((None, Some(b'A'))),
+                None,
+                None,
+                false,
+                true
+            )
+            .is_none(),
+            "an expired span cannot be carried for ever"
+        );
+    }
+
     fn a_failed_span_or_mode_read_makes_the_sweep_unknown_rather_than_stale() {
         // The dangerous branch. Keeping the previous CENTER pair after the operator switched the
         // rig's scope to FIX means every row keeps a centred assumption that is now false, and
@@ -21746,6 +21813,7 @@ mod tests {
             Some((None, Some(b'4'))),
             None,
             None,
+            false,
             false
         )
         .is_none());
@@ -21755,12 +21823,20 @@ mod tests {
             Some((Some(b'7'), None)),
             None,
             None,
+            false,
             false
         )
         .is_none());
-        assert!(
-            yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None, None, false).is_none()
-        );
+        assert!(yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((None, None)),
+            None,
+            None,
+            false,
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -21771,6 +21847,7 @@ mod tests {
             Some((Some(b'3'), Some(b'0'))),
             None,
             None,
+            false,
             false,
         )
         .expect("a complete read is a known sweep");
@@ -21784,7 +21861,7 @@ mod tests {
     fn an_unknown_sweep_is_not_invented_by_a_tick_that_asked_nothing() {
         // Before the first successful poll there is no span and no mode, and a tick that spends no
         // CAT round-trip learns neither. It must stay unknown — a dial alone places nothing.
-        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None, None, false).is_none());
+        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None, None, false, false).is_none());
     }
 
     // ── The CURSOR anchor ───────────────────────────────────────────────────────────────────────
@@ -21859,6 +21936,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .expect("a hiccup does not lose the sweep");
         assert_eq!((out.span_code, out.mode_code), (b'7', b'4'), "codes stand");
@@ -21876,6 +21954,7 @@ mod tests {
             Some((None, Some(b'4'))),
             None,
             None,
+            false,
             false
         )
         .is_none());
@@ -21885,6 +21964,7 @@ mod tests {
             Some((Some(b'7'), None)),
             None,
             None,
+            false,
             false
         )
         .is_none());
@@ -21893,8 +21973,15 @@ mod tests {
     #[test]
     fn staleness_never_invents_a_sweep_that_was_never_known() {
         // With no previous reading there is nothing to keep, however tolerant we are being.
-        assert!(
-            yaesu_wf_next_meta(None, 14_150_000.0, Some((None, None)), None, None, true).is_none()
-        );
+        assert!(yaesu_wf_next_meta(
+            None,
+            14_150_000.0,
+            Some((None, None)),
+            None,
+            None,
+            true,
+            true
+        )
+        .is_none());
     }
 }
