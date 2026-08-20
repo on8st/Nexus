@@ -942,27 +942,31 @@ impl Default for RadioConfig {
 /// measured); 100 ms is ~10 rows/s, which is a smooth waterfall and leaves the USB bus alone.
 const YAESU_WF_INTERVAL_MS: u64 = 100;
 /// How often the span/mode are re-read over CAT. SLOW on purpose — see the field's comment.
-const YAESU_WF_META_SECS: f64 = 5.0;
+const YAESU_WF_META_MS: f64 = 5_000.0;
 /// How often the span and mode are re-read while the sweep CANNOT be placed — so the app notices a
 /// return to CENTER promptly instead of leaving the operator on sound-card audio for most of the
 /// slow interval. Cheap, because nothing is being drawn to spend the link on.
-const YAESU_WF_META_FAST_SECS: f64 = 0.8;
+const YAESU_WF_META_FAST_MS: f64 = 800.0;
 /// How long the last successfully-read span and mode may stand after a read starts failing.
+///
+/// ⚠️ MILLISECONDS, like every clock on this path — `reconcile_yaesu_waterfall` is handed `now`
+/// in ms (`now - clock_offset_ms`). Named `_SECS` and valued 2.5, this window was 2.5 ms, so it
+/// never once applied and the guard it exists to provide was dead from the day it was written.
 ///
 /// Not a guess at a good number: it has to cover a couple of poll cycles so a single dropped reply
 /// costs nothing, and stay far below the time an operator needs to change a setting and look at the
 /// screen. 2.5 s is three fast polls. Past it the sweep is unknown, which is the honest answer — and
 /// the dangerous case it protects against (a mode change we missed) resolves on the next good read.
-const YAESU_WF_STALE_SECS: f64 = 2.5;
+const YAESU_WF_STALE_MS: f64 = 2_500.0;
 /// How long to leave a span request alone before asking again.
 ///
 /// Long enough that the read-back has had several chances to confirm it, because re-asking is not
 /// free: a set makes the next read fail, so a request repeated per tick starves the very read that
 /// would have told us it worked.
-const YAESU_WF_SPAN_ASK_SECS: f64 = 4.0;
+const YAESU_WF_SPAN_ASK_MS: f64 = 4_000.0;
 /// How long a reader may publish nothing before that becomes an operator-facing message. Long
 /// enough to cover an FT4222 that is simply slow to first frame, short enough to be useful.
-const YAESU_WF_GRACE_SECS: f64 = 6.0;
+const YAESU_WF_GRACE_MS: f64 = 6_000.0;
 
 /// How long to wait before trying a failed FT4222 open again. A failed open MUST be retried, and
 /// this is not a hypothetical: the FT-710's own USB codec drops off the bus by itself (it shows up
@@ -971,7 +975,7 @@ const YAESU_WF_GRACE_SECS: f64 = 6.0;
 /// failure was PERMANENT — the operator-facing message stayed until the radio was switched, and it
 /// blamed the radio's EX menu for a race inside the driver. 5 s is idle-cheap and recovers within
 /// one glance at the scope.
-const YAESU_WF_RETRY_SECS: f64 = 5.0;
+const YAESU_WF_RETRY_MS: f64 = 5_000.0;
 
 /// How long to leave the radio alone after WRITING a scope setting, before reading it back.
 ///
@@ -983,14 +987,15 @@ const YAESU_WF_RETRY_SECS: f64 = 5.0;
 /// failed poll means the sweep is UNKNOWN (deliberately — see `yaesu_wf_next_meta`), an unknown
 /// sweep clears the RF row, and the operator watched the panadapter drop to sound-card audio and
 /// come back a few seconds later every time they changed span.
-const YAESU_WF_SETTLE_SECS: f64 = 0.4;
+const YAESU_WF_SETTLE_MS: f64 = 400.0;
 
 /// The bridge could not be opened, and SCU-LAN10 is OFF — which is why.
 ///
 /// This used to tell the operator to go and check the menu, because the setting was believed to be
 /// out of CAT's reach. It is not: `EX 03-01-26` reads and writes it (bench, 2026-08-20), so Nexus
 /// now knows rather than guesses, and can offer to change it rather than instruct.
-const YAESU_WF_SCU_OFF: &str = "SCU-LAN10 is OFF in the radio, so the FT-710's spectrum bridge does \
+const YAESU_WF_SCU_OFF: &str =
+    "SCU-LAN10 is OFF in the radio, so the FT-710's spectrum bridge does \
      not appear on USB. Nexus can switch it on for you; the radio then needs to be powered off and \
      on before the bridge appears. Until then the waterfall uses sound-card audio.";
 /// The bridge could not be opened and SCU-LAN10 is on (or could not be read).
@@ -998,14 +1003,16 @@ const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be open
      SCU-LAN10 is on. Another program may have it open, or the radio has not been power-cycled \
      since the setting changed. Nexus keeps retrying; the waterfall uses sound-card audio.";
 /// The scope is sweeping, but not around the dial, so no row can be placed on the band.
-const YAESU_WF_NOT_CENTERED: &str = "Nexus cannot tell which frequencies this sweep covers, so the \
+const YAESU_WF_NOT_CENTERED: &str =
+    "Nexus cannot tell which frequencies this sweep covers, so the \
      waterfall is using sound-card audio. Setting the scope to CENTER always works.";
 /// FIX, with no start stated — and the operator can fix that in one click.
 const YAESU_WF_FIX_UNKNOWN: &str = "The scope is in FIX and Nexus does not know where that window \
      starts — the radio reports it nowhere. Long-press FIX on the radio at the start frequency, then \
      click \"FIX starts here\" above the panadapter. Until then the waterfall uses sound-card audio.";
 /// CURSOR, with no anchor — which needs the transition to be seen, not a value to be typed.
-const YAESU_WF_CURSOR_UNKNOWN: &str = "The scope is in CURSOR and Nexus did not see it get there, so \
+const YAESU_WF_CURSOR_UNKNOWN: &str =
+    "The scope is in CURSOR and Nexus did not see it get there, so \
      it cannot tell where the window sits. Switch to CENTER and back to CURSOR and it will. Until \
      then the waterfall uses sound-card audio.";
 
@@ -1030,13 +1037,22 @@ const YAESU_WF_NO_FRAMES: &str = "The FT-710's spectrum bridge is connected but 
 /// * staying in CURSOR keeps the anchor, so the window stays put while the dial moves across it;
 /// * anything else — FIX, an unknown code, or a sweep whose span/mode we no longer know — drops it,
 ///   because an anchor kept across a mode we cannot place is a wrong answer waiting to be drawn.
-fn yaesu_wf_next_anchor(prev: Option<f64>, prev_mode: Option<u8>, mode: Option<u8>, dial_hz: f64) -> Option<f64> {
+fn yaesu_wf_next_anchor(
+    prev: Option<f64>,
+    prev_mode: Option<u8>,
+    mode: Option<u8>,
+    dial_hz: f64,
+) -> Option<f64> {
     use crate::yaesu_wf::{position_of, ScopePosition};
     match mode.and_then(position_of) {
         Some(ScopePosition::Center) => None,
         Some(ScopePosition::Cursor) => {
             let was_cursor = matches!(prev_mode.and_then(position_of), Some(ScopePosition::Cursor));
-            if was_cursor { prev.or(Some(dial_hz)) } else { Some(dial_hz) }
+            if was_cursor {
+                prev.or(Some(dial_hz))
+            } else {
+                Some(dial_hz)
+            }
         }
         _ => None,
     }
@@ -1079,7 +1095,7 @@ fn yaesu_wf_next_meta(
         // can lose a race with another CAT client. So every hiccup blanked the panadapter for a poll
         // cycle: the operator's "brief glitch of audio spectrum, then recovering" (2026-08-20).
         //
-        // The caller allows staleness only briefly (see `YAESU_WF_STALE_SECS`). Within that window
+        // The caller allows staleness only briefly (see `YAESU_WF_STALE_MS`). Within that window
         // the previous span and mode stand, because they change only when somebody acts; past it we
         // admit we do not know. The dial and the anchor are re-stated regardless, so a stale window
         // still follows the radio while it lasts.
@@ -2544,7 +2560,7 @@ struct RadioLoop {
     yaesu_wf_meta_after: f64,
     /// Monotonic seconds at which the current reader was started, for the no-frames grace period.
     yaesu_wf_started: f64,
-    /// Earliest time a failed FT4222 open may be attempted again. See `YAESU_WF_RETRY_SECS`.
+    /// Earliest time a failed FT4222 open may be attempted again. See `YAESU_WF_RETRY_MS`.
     yaesu_wf_retry_after: f64,
     /// Where a CURSOR sweep is centred — see `yaesu_wf_next_anchor`. `None` for CENTER (the dial
     /// is the centre) and for FIX (the window is a preset nothing reports).
@@ -2555,9 +2571,11 @@ struct RadioLoop {
     /// bare `bool` starting false, a sweep that was never placeable printed nothing at all — which is
     /// precisely the case one wants to read about.
     yaesu_wf_placed: Option<bool>,
-    /// When the span and mode were last read SUCCESSFULLY — see `YAESU_WF_STALE_SECS`.
+    /// When the span and mode were last read SUCCESSFULLY — see `YAESU_WF_STALE_MS`.
     yaesu_wf_read_ok: f64,
-    /// The span code last REQUESTED in FIX, and when — see `YAESU_WF_SPAN_ASK_SECS`.
+    /// Last MODE code logged, so a mode change is reported once. See the log site.
+    yaesu_wf_mode_seen: Option<(u8, u8, i64)>,
+    /// The span code last REQUESTED in FIX, and when — see `YAESU_WF_SPAN_ASK_MS`.
     yaesu_wf_span_asked: Option<(u8, f64)>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
@@ -2839,6 +2857,7 @@ impl RadioLoop {
             yaesu_wf_anchor: None,
             yaesu_wf_placed: None,
             yaesu_wf_read_ok: 0.0,
+            yaesu_wf_mode_seen: None,
             yaesu_wf_span_asked: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
@@ -3030,7 +3049,7 @@ impl RadioLoop {
     /// * it opened but has published NOTHING after a grace period → the external display is off.
     ///
     /// Cheap on the common path: one key compare, and the metadata read is rate-limited to once
-    /// every [`YAESU_WF_META_SECS`].
+    /// every [`YAESU_WF_META_MS`].
     fn reconcile_yaesu_waterfall(&mut self, engine: &Arc<Mutex<Engine>>, rig: &mut Rig, now: f64) {
         // Opted in, on this radio, on a serial link? Read the flag only when the model could
         // possibly have the bridge, so every other station keeps the lock-free fast path.
@@ -3066,14 +3085,14 @@ impl RadioLoop {
 
         // Wanted but not running: open it, now or on the retry cadence. This is deliberately NOT
         // inside the key-change branch — putting it there made a single transient failure permanent
-        // (see `YAESU_WF_RETRY_SECS` for what produces one on this rig).
+        // (see `YAESU_WF_RETRY_MS` for what produces one on this rig).
         if yaesu_wf_open_due(
             self.yaesu_wf_key.is_some(),
             self.yaesu_wf.is_some(),
             now,
             self.yaesu_wf_retry_after,
         ) {
-            self.yaesu_wf_retry_after = now + YAESU_WF_RETRY_SECS;
+            self.yaesu_wf_retry_after = now + YAESU_WF_RETRY_MS;
             let mut e = engine_lock(engine);
             match crate::yaesu_wf::open_default_source() {
                 Some(src) => {
@@ -3094,7 +3113,9 @@ impl RadioLoop {
                     // readable over CAT, so ask it: `1` = on, anything else (including a read we
                     // could not make) leaves the general message, which does not claim to know.
                     let scu_on = rig
-                        .send_raw(&crate::yaesu_wf::ex_read_command(crate::yaesu_wf::EX_SCU_LAN10))
+                        .send_raw(&crate::yaesu_wf::ex_read_command(
+                            crate::yaesu_wf::EX_SCU_LAN10,
+                        ))
                         .and_then(|r| {
                             crate::yaesu_wf::parse_ex_reply(&r, crate::yaesu_wf::EX_SCU_LAN10)
                         });
@@ -3144,11 +3165,10 @@ impl RadioLoop {
             if let Some(code) = crate::yaesu_wf::span_code_for_hz(half_hz.saturating_mul(2)) {
                 rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
                 // Read it back SOON, but not in this tick — the first read after a set is answered with
-                // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_SECS.
-                self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
+                // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_MS.
+                self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_MS;
             }
         }
-
 
         // IN FIX, NEXUS OWNS THE SPAN. The window is the band and the span is what makes it fit, so
         // the two cannot be chosen separately — asking the radio for the narrowest covering rung is
@@ -3166,11 +3186,11 @@ impl RadioLoop {
                 // wedged the scope on "span/mode unknown" on the bench within seconds.
                 let asked_recently = self
                     .yaesu_wf_span_asked
-                    .is_some_and(|(c, at)| c == code && now - at < YAESU_WF_SPAN_ASK_SECS);
+                    .is_some_and(|(c, at)| c == code && now - at < YAESU_WF_SPAN_ASK_MS);
                 if meta_before.map(|m| m.span_code) != Some(code) && !asked_recently {
                     rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
                     self.yaesu_wf_span_asked = Some((code, now));
-                    self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
+                    self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_MS;
                 }
             }
         }
@@ -3182,8 +3202,8 @@ impl RadioLoop {
         if let Some(code) = mode_request {
             rig.send_raw_set(&crate::yaesu_wf::set_mode_command(code));
             // Read it back SOON, but not in this tick — the first read after a set is answered with
-            // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_SECS.
-            self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
+            // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_MS.
+            self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_MS;
         }
 
         // THE DIAL IS REFRESHED EVERY TICK; only the span and the mode are rare.
@@ -3227,9 +3247,9 @@ impl RadioLoop {
             })
             .is_some();
         let interval = if placeable {
-            YAESU_WF_META_SECS
+            YAESU_WF_META_MS
         } else {
-            YAESU_WF_META_FAST_SECS
+            YAESU_WF_META_FAST_MS
         };
         let polled = if now >= self.yaesu_wf_meta_after {
             self.yaesu_wf_meta_after = now + interval;
@@ -3249,7 +3269,10 @@ impl RadioLoop {
         } else {
             None
         };
-        let meta_now = {
+        // The block hands back the inputs the CANNOT-place message needs to name the failing
+        // arm, rather than writing them to pre-initialised locals (which is an unused-assignment
+        // warning, and CI lints clippy).
+        let (meta_now, meta_before, polled_dbg) = {
             let mut guard = match self.yaesu_wf_meta.lock() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -3279,17 +3302,37 @@ impl RadioLoop {
             // escape hatch for a radio whose own window does not match; nothing in the UI writes it.
             let fix_start = fix_start_mhz.map(|mhz| mhz * 1_000_000.0).or_else(|| {
                 // From the span the radio reports, not the one we asked for — see `auto_fix_start`.
-                let span = guard.map(|m| m.span_code).or(polled.and_then(|(s, _)| s))?;
+                //
+                // ⚠️ THE FRESHLY POLLED SPAN FIRST, and the order is the whole correctness of the
+                // window. `yaesu_wf_next_meta` stores the POLLED span when it has one, so deriving
+                // the start from the PREVIOUS meta puts the start and the width one poll out of
+                // step with each other. Entering FIX is exactly when they differ: the span moves
+                // 200 kHz → 500 kHz, and a start computed against the old 200 kHz rung drew
+                // 14.075-14.575 where the radio's window is 13.925-14.425 — the whole spectrum
+                // 150 kHz off, for a poll cycle, looking authoritative the entire time (measured
+                // on the FT-710, 2026-08-20). Both spans here are the RADIO's own report; this
+                // only takes the newer of the two.
+                let span = polled.and_then(|(s, _)| s).or(guard.map(|m| m.span_code))?;
                 crate::yaesu_wf::auto_fix_start(dial_hz, span)
             });
-            let keep_stale = now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_SECS;
+            let prev_meta = *guard;
+            let keep_stale = now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_MS;
             *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start, keep_stale);
-            *guard
+            (*guard, prev_meta, polled)
         };
 
         if meta_now.is_none() && self.yaesu_wf_placed != Some(false) {
             self.yaesu_wf_placed = Some(false);
-            eprintln!("yaesu-wf: CANNOT place — span/mode unknown (a CAT read failed this tick)");
+            eprintln!(
+                "yaesu-wf: CANNOT place — span/mode unknown (keep_stale={} prev={} polled={} read_ok_age={:.0}ms)",
+                now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_MS,
+                if meta_before.is_some() { "some" } else { "NONE" },
+                match polled_dbg {
+                    None => "none".to_string(),
+                    Some((sp, md)) => format!("({:?},{:?})", sp.map(|c| c as char), md.map(|c| c as char)),
+                },
+                now - self.yaesu_wf_read_ok,
+            );
         }
         let mut e = engine_lock(engine);
         // A sweep we cannot place is worth EXPLAINING rather than silently blanking — but the test is
@@ -3311,6 +3354,29 @@ impl RadioLoop {
             // a stale mode, a dropped reply, a missing FIX start. From outside they are
             // indistinguishable, so each cost a round of guessing. This turns the next one into a
             // line that can be pasted instead of a duration that has to be estimated.
+            // A mode change that stays PLACEABLE logs nothing under the verdict rule, so there
+            // was no way to see whether the sweep followed the operator to FIX or kept a stale
+            // CENTER window and drew every signal in the wrong place — the exact danger
+            // `keep_stale` trades against. Mode changes are operator-driven and rare, so this
+            // cannot become the ten-lines-a-second the verdict rule exists to avoid.
+            // Keyed on the three inputs that decide WHERE the sweep sits, not just the mode:
+            // the FIX start is derived from the span, and a start computed against a stale span
+            // misplaces the whole spectrum with nothing on screen to show it.
+            let placement_key = (
+                m.mode_code,
+                m.span_code,
+                m.fix_start_hz.unwrap_or(0.0) as i64,
+            );
+            if self.yaesu_wf_mode_seen != Some(placement_key) {
+                self.yaesu_wf_mode_seen = Some(placement_key);
+                eprintln!(
+                    "yaesu-wf: mode {} span {} fix {:?} -> {:?}",
+                    m.mode_code as char,
+                    m.span_code as char,
+                    m.fix_start_hz.map(|h| h / 1e6),
+                    placed.map(|(lo, hi)| format!("{:.4}-{:.4} MHz", lo / 1e6, hi / 1e6)),
+                );
+            }
             if self.yaesu_wf_placed != Some(placed.is_some()) {
                 self.yaesu_wf_placed = Some(placed.is_some());
                 match placed {
@@ -3351,7 +3417,7 @@ impl RadioLoop {
         // Opened, but has it ever produced a row? After the grace period, silence means the radio is
         // not sending — which on this rig means the external display output is off.
         if wf.published() == 0 {
-            if now - self.yaesu_wf_started > YAESU_WF_GRACE_SECS {
+            if now - self.yaesu_wf_started > YAESU_WF_GRACE_MS {
                 e.set_scope_error(Some(YAESU_WF_NO_FRAMES.to_string()));
             }
         } else {
@@ -21629,7 +21695,6 @@ mod tests {
         assert!(!yaesu_wf_open_due(false, true, 1_000.0, 0.0));
     }
 
-
     // ── The sweep metadata: a row must never be placed at a centre or a mode we no longer know ──
     //
     // Both rules below were operator-visible defects on 2026-08-19: the FT-710 waterfall looked
@@ -21652,10 +21717,21 @@ mod tests {
         // The garbling: span/mode are polled every 5 s, the dial moves continuously. A tick with no
         // poll must still carry the CURRENT dial, or rows land where the operator used to be — on a
         // 200 kHz span, 70 kHz of tuning is a third of the width.
-        let out = yaesu_wf_next_meta(Some(meta(14_150_000.0, b'7', b'4')), 14_220_400.0, None, None, None, false)
-            .expect("a known sweep stays known");
+        let out = yaesu_wf_next_meta(
+            Some(meta(14_150_000.0, b'7', b'4')),
+            14_220_400.0,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("a known sweep stays known");
         assert_eq!(out.dial_hz, 14_220_400.0, "the dial must follow the radio");
-        assert_eq!((out.span_code, out.mode_code), (b'7', b'4'), "codes are not re-guessed");
+        assert_eq!(
+            (out.span_code, out.mode_code),
+            (b'7', b'4'),
+            "codes are not re-guessed"
+        );
     }
 
     #[test]
@@ -21664,9 +21740,27 @@ mod tests {
         // rig's scope to FIX means every row keeps a centred assumption that is now false, and
         // `sweep_edges` never gets the chance to refuse it. Either read failing is enough.
         let prev = Some(meta(14_150_000.0, b'7', b'4'));
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4'))), None, None, false).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None)), None, None, false).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None, None, false).is_none());
+        assert!(yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((None, Some(b'4'))),
+            None,
+            None,
+            false
+        )
+        .is_none());
+        assert!(yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((Some(b'7'), None)),
+            None,
+            None,
+            false
+        )
+        .is_none());
+        assert!(
+            yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None, None, false).is_none()
+        );
     }
 
     #[test]
@@ -21692,7 +21786,6 @@ mod tests {
         // CAT round-trip learns neither. It must stay unknown — a dial alone places nothing.
         assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None, None, false).is_none());
     }
-
 
     // ── The CURSOR anchor ───────────────────────────────────────────────────────────────────────
     //
@@ -21724,7 +21817,10 @@ mod tests {
     #[test]
     fn a_center_sweep_has_no_anchor_because_the_dial_is_the_centre() {
         for code in [b'0', b'3', b'4'] {
-            assert_eq!(yaesu_wf_next_anchor(Some(1.0), Some(b'7'), Some(code), 7_100_000.0), None);
+            assert_eq!(
+                yaesu_wf_next_anchor(Some(1.0), Some(b'7'), Some(code), 7_100_000.0),
+                None
+            );
         }
     }
 
@@ -21733,13 +21829,21 @@ mod tests {
         // FIX moves the edges to a per-band preset on entry, so the dial at the transition is NOT
         // the window centre — anchoring there would place every signal wrongly while looking right.
         for code in [b'2', b'9', b'A'] {
-            assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'4'), Some(code), 14_150_000.0), None);
-            assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), Some(code), 14_150_000.0), None);
+            assert_eq!(
+                yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'4'), Some(code), 14_150_000.0),
+                None
+            );
+            assert_eq!(
+                yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), Some(code), 14_150_000.0),
+                None
+            );
         }
         // And an unread mode drops it too, rather than carrying a stale window into the unknown.
-        assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), None, 14_150_000.0), None);
+        assert_eq!(
+            yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), None, 14_150_000.0),
+            None
+        );
     }
-
 
     #[test]
     fn a_dropped_reply_keeps_the_last_known_sweep_while_staleness_is_allowed() {
@@ -21748,8 +21852,15 @@ mod tests {
         // measurement — and treating each one as "we no longer know" blanked the panadapter for a
         // whole poll cycle every time. Within the tolerance the previous span and mode stand.
         let prev = Some(meta(14_150_000.0, b'7', b'4'));
-        let out = yaesu_wf_next_meta(prev, 14_162_000.0, Some((None, Some(b'4'))), None, None, true)
-            .expect("a hiccup does not lose the sweep");
+        let out = yaesu_wf_next_meta(
+            prev,
+            14_162_000.0,
+            Some((None, Some(b'4'))),
+            None,
+            None,
+            true,
+        )
+        .expect("a hiccup does not lose the sweep");
         assert_eq!((out.span_code, out.mode_code), (b'7', b'4'), "codes stand");
         assert_eq!(out.dial_hz, 14_162_000.0, "the dial is still this tick's");
     }
@@ -21759,14 +21870,31 @@ mod tests {
         // The other half, and the reason the tolerance is bounded: a mode change we never managed to
         // read must not leave a stale CENTER pair placing rows forever. Past the window, unknown.
         let prev = Some(meta(14_150_000.0, b'7', b'4'));
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4'))), None, None, false).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None)), None, None, false).is_none());
+        assert!(yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((None, Some(b'4'))),
+            None,
+            None,
+            false
+        )
+        .is_none());
+        assert!(yaesu_wf_next_meta(
+            prev,
+            14_150_000.0,
+            Some((Some(b'7'), None)),
+            None,
+            None,
+            false
+        )
+        .is_none());
     }
 
     #[test]
     fn staleness_never_invents_a_sweep_that_was_never_known() {
         // With no previous reading there is nothing to keep, however tolerant we are being.
-        assert!(yaesu_wf_next_meta(None, 14_150_000.0, Some((None, None)), None, None, true).is_none());
+        assert!(
+            yaesu_wf_next_meta(None, 14_150_000.0, Some((None, None)), None, None, true).is_none()
+        );
     }
-
 }
