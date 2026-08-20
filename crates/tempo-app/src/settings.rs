@@ -2322,9 +2322,17 @@ pub struct RadioProfilePatch {
     /// See `RadioProfile::flex_native_pan`.
     #[serde(default)]
     pub flex_native_pan: bool,
-    /// See `RadioProfile::yaesu_rf_scope`.
+    /// See `RadioProfile::yaesu_rf_scope`. `Option`, and NOT a bare `bool` like its neighbours —
+    /// this one has no UI control, so an omitted field is the NORMAL case rather than an old
+    /// payload, and `#[serde(default)]` on a `bool` would read that omission as `false`.
+    ///
+    /// It cost the operator a working RF scope on 2026-08-20: saving anything on the radio form
+    /// sent a patch without this field, the scope switched itself off, and the waterfall silently
+    /// fell back to sound-card audio with nothing to explain it. `flex_native_pan` gets away with a
+    /// bare `bool` only because it HAS a toggle, so the form always states its value. `None` here
+    /// means "leave whatever is stored alone"; a caller that wants it off says so.
     #[serde(default)]
-    pub yaesu_rf_scope: bool,
+    pub yaesu_rf_scope: Option<bool>,
     /// See `RadioProfile::flex_native_audio`.
     #[serde(default)]
     pub flex_native_audio: bool,
@@ -2363,7 +2371,9 @@ impl RadioProfilePatch {
         p.native_scope = self.native_scope;
         p.flex_radio_ip = self.flex_radio_ip;
         p.flex_native_pan = self.flex_native_pan;
-        p.yaesu_rf_scope = self.yaesu_rf_scope;
+        if let Some(v) = self.yaesu_rf_scope {
+            p.yaesu_rf_scope = v;
+        }
         p.flex_native_audio = self.flex_native_audio;
     }
 }
@@ -3949,7 +3959,7 @@ mod tests {
             native_scope: "civ".into(),
             flex_radio_ip: "192.0.2.50".into(),
             flex_native_pan: true,
-            yaesu_rf_scope: false,
+            yaesu_rf_scope: Some(false),
             flex_native_audio: true,
         };
 
@@ -4024,7 +4034,7 @@ mod tests {
             native_scope: String::new(),
             flex_radio_ip: String::new(),
             flex_native_pan: false,
-            yaesu_rf_scope: false,
+            yaesu_rf_scope: Some(false),
             flex_native_audio: false,
         })
         .expect("patch serializes");
@@ -4049,6 +4059,61 @@ mod tests {
              NOT_EDITABLE with a reason."
         );
     }
+
+    /// A patch that does not MENTION the RF scope must leave it alone.
+    ///
+    /// Station report, 2026-08-20: the FT-710 waterfall was working, then it was showing sound-card
+    /// audio again and `yaesuRfScope` had gone to `false` on its own. Cause: this field has no UI
+    /// control, so the radio form builds a patch WITHOUT it, `#[serde(default)]` on a bare `bool`
+    /// read the omission as `false`, and `apply_to` assigned it unconditionally. Saving anything at
+    /// all on the radio form switched the scope off, and nothing said so — the waterfall just fell
+    /// back to audio.
+    ///
+    /// `flex_native_pan` next door is a bare `bool` and is fine, because it HAS a toggle: its form
+    /// always states a value. That is the difference this test exists to hold.
+    #[test]
+    fn a_patch_that_omits_the_rf_scope_leaves_it_enabled() {
+        let mut p = RadioProfile {
+            yaesu_rf_scope: true,
+            ..RadioProfile::default()
+        };
+        // Exactly what the radio form sends: every field it knows, and no mention of this one.
+        let json = r#"{
+            "pttMethod": "cat", "rigModel": 1049, "rigModelName": "Yaesu FT-710",
+            "serialPort": "/dev/cu.usbserial-01AF7FED0", "pttSerialPort": "", "baud": 38400,
+            "rigConn": "serial", "rigAddr": "", "omnirigSlot": 0, "rigctldPort": 4533,
+            "icomNativeCat": false, "dataModesPlainSsb": false,
+            "audioIn": "USB Audio Device", "audioOut": "USB Audio Device",
+            "txLevel": 0.9, "rxGain": 1.0,
+            "rotatorModel": 0, "rotatorPort": "", "rotatorBaud": 9600, "rotatorHost": "",
+            "rotctldPort": 4533, "nativeScope": "auto", "flexRadioIp": "",
+            "flexNativePan": false, "flexNativeAudio": false
+        }"#;
+        let patch: RadioProfilePatch = serde_json::from_str(json).expect("the form's payload parses");
+        assert_eq!(patch.yaesu_rf_scope, None, "an absent field is UNKNOWN, not false");
+        patch.apply_to(&mut p);
+        assert!(
+            p.yaesu_rf_scope,
+            "saving the radio form must not switch the RF scope off behind the operator"
+        );
+    }
+
+    /// And the other direction, so the field is not merely unreachable: a caller that SAYS false
+    /// still turns it off. Without this, "leave it alone" could be implemented as "never assign".
+    #[test]
+    fn a_patch_that_says_false_still_turns_the_rf_scope_off() {
+        let mut p = RadioProfile {
+            yaesu_rf_scope: true,
+            ..RadioProfile::default()
+        };
+        RadioProfilePatch {
+            yaesu_rf_scope: Some(false),
+            ..patch_of(&p)
+        }
+        .apply_to(&mut p);
+        assert!(!p.yaesu_rf_scope);
+    }
+
 
     /// THE FIELD-SPECIFIC HALF for OmniRig, written because yesterday's bug was exactly this
     /// and the generic guards above are only as good as the day they were remembered: a
@@ -4195,7 +4260,7 @@ mod tests {
             native_scope: p.native_scope.clone(),
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
-            yaesu_rf_scope: false,
+            yaesu_rf_scope: Some(p.yaesu_rf_scope),
             flex_native_audio: p.flex_native_audio,
         }
     }

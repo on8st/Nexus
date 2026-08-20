@@ -756,6 +756,13 @@ pub struct RadioStatus {
     /// external display) are enabled in its EX menu, and Nexus CANNOT set those over CAT — so a
     /// silent scope is an instruction to the operator, not a fault to retry.
     pub scope_error: Option<String>,
+    /// Where the rig's own scope currently sits — the `SS` P3 MODE code as the ASCII byte the radio
+    /// sent, widened for JSON. `None` until one has been read.
+    ///
+    /// The UI needs it for two things: to show which of CENTER/CURSOR/FIX is live, and — because
+    /// the FT-710 carries all three positions inside each of three display families — so a request
+    /// to change position can keep the operator in the family they are already using.
+    pub scope_mode_code: Option<u32>,
     /// Set when two enabled radios are configured on the SAME serial COM port — the
     /// monitor radio's CAT can't open the busy port and shows a confusing red pill.
     /// A config warning (self-clears once the ports differ); surfaced in the status lane.

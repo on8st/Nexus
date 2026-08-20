@@ -10825,6 +10825,28 @@ fn set_filter_width(state: State<'_, SharedEngine>, hz: u32) -> Result<AppSnapsh
 }
 
 /// Set the native Icom scope SPAN (± half-width, Hz); applied to the rig by the radio loop.
+/// Set the FT-710 scope POSITION — CENTER, CURSOR or FIX.
+///
+/// The caller sends the position by name; the display family (3DSS / W-F EXPAND / W-F NORMAL) is
+/// resolved beside the radio from what it currently reports, so asking to centre the sweep never
+/// drags a 3DSS operator out of 3DSS.
+#[tauri::command(async)]
+fn set_yaesu_scope_mode(state: State<'_, SharedEngine>, position: String) -> Result<AppSnapshot, String> {
+    use tempo_audio::yaesu_wf::ScopePosition;
+    let pos = match position.as_str() {
+        "center" => ScopePosition::Center,
+        "cursor" => ScopePosition::Cursor,
+        "fix" => ScopePosition::Fix,
+        other => return Err(format!("unknown scope position {other:?}")),
+    };
+    let mut eng = engine_lock(&state);
+    // The current code decides the family. Unknown (nothing read yet) falls back to W/F NORMAL,
+    // which `mode_code_for` handles.
+    let current = eng.snapshot().radio.scope_mode_code.unwrap_or(b'4' as u32) as u8;
+    eng.request_yaesu_scope_mode(tempo_audio::yaesu_wf::mode_code_for(pos, current));
+    Ok(eng.snapshot())
+}
+
 #[tauri::command(async)]
 fn set_scope_span(state: State<'_, SharedEngine>, hz: u32) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
@@ -17322,6 +17344,7 @@ pub fn run() {
             set_sideband_override,
             set_filter_width,
             set_scope_span,
+            set_yaesu_scope_mode,
             set_scope_ref,
             set_flex_pan_span,
             set_flex_pan_ref,

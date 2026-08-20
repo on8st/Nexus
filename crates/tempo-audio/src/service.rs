@@ -3010,6 +3010,15 @@ impl RadioLoop {
             }
         }
 
+        // The scope POSITION, same shape as the span above and the same reason for the scope of
+        // the lock. The code arrives ready-made from `mode_code_for`, which keeps the operator in
+        // whichever display family the rig is already using.
+        let mode_request = engine_lock(engine).take_yaesu_scope_mode_request();
+        if let Some(code) = mode_request {
+            rig.send_raw_set(&crate::yaesu_wf::set_mode_command(code));
+            self.yaesu_wf_meta_after = 0.0; // read it back on the next tick
+        }
+
         // THE DIAL IS REFRESHED EVERY TICK; only the span and the mode are rare.
         //
         // The dial costs nothing to read — it is Nexus's own state, not a CAT round-trip — and it
@@ -3031,6 +3040,9 @@ impl RadioLoop {
             let mode = rig
                 .send_raw("SS06;")
                 .and_then(|r| crate::yaesu_wf::parse_ss_reply(&r, b'6'));
+            // Surface the position for the UI (and for resolving a position change into a code
+            // in the right display family) — see `RadioStatus::scope_mode_code`.
+            engine_lock(engine).set_scope_mode_code(mode.map(u32::from));
             Some((span, mode))
         } else {
             None

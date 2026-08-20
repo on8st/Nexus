@@ -73,6 +73,7 @@
     "rxOffsetHz": 1500.0,
     "rxRangesMhz": [],
     "scopeError": null,
+    "scopeModeCode": null,
     "sideband": "USB",
     "sidebandOverride": null,
     "slot": 101,

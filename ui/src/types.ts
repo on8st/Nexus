@@ -1151,6 +1151,8 @@ export interface RadioStatus {
    * working on sound-card audio throughout.
    */
   scopeError?: string | null
+  /** The rig scope's MODE code (`SS` P3) as read back, or null before one is known. */
+  scopeModeCode?: number | null
   /** Set when two radios are on the same serial COM port (explains a red pill). */
   radioConfigWarning?: string | null
   /** The last per-QSO recording failed, with the path it failed at. Surfaced in the status lane;
@@ -2531,6 +2533,8 @@ export interface Settings {
   flexRadioIp: string
   /** Opt-in to the Flex native SmartSDR panadapter (unverified on hardware; off by default). */
   flexNativePan: boolean
+  /** Read the FT-710's own spectrum over its internal USB-SPI bridge. Per radio. */
+  yaesuRfScope: boolean
   flexNativeAudio: boolean
   /** Let a broker client (WSJT-X/N1MM) key PTT when Nexus is idle. OFF by
    * default — Nexus owns TX unless the operator opts in. */
@@ -2933,6 +2937,9 @@ export interface RadioProfile {
   flexRadioIp?: string
   /** This radio's native SmartSDR panadapter opt-in. */
   flexNativePan?: boolean
+  /** See RadioProfile.yaesuRfScope. Optional on the PATCH: an absent field means LEAVE IT ALONE,
+   *  because omitting it used to switch a working RF scope off (station, 2026-08-20). */
+  yaesuRfScope?: boolean
   /** This radio's native DAX audio opt-in (both directions). */
   flexNativeAudio?: boolean
 }

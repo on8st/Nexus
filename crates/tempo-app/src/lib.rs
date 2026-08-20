@@ -298,6 +298,7 @@ impl AppState {
                 split_tx_mhz: None,
                 audio_error: None,
                 scope_error: None,
+            scope_mode_code: None,
                 radio_config_warning: None,
                 recording_warning: None,
                 tx_even: true,

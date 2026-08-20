@@ -174,6 +174,43 @@ pub fn set_span_command(code: u8) -> String {
     format!("SS05{}0000;", code as char)
 }
 
+/// Where the sweep sits relative to the dial. The operator-facing choice, three ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopePosition {
+    Center,
+    Cursor,
+    Fix,
+}
+
+/// The `SS` P3 MODE code for a position, KEEPING the display family the rig is already in.
+///
+/// The FT-710 has three families — 3DSS (`0 1 2`), W/F EXPAND (`3 6 9`) and W/F NORMAL (`4 7 A`) —
+/// and each carries all three positions. Mapping every request onto W/F NORMAL would quietly drag a
+/// 3DSS operator out of 3DSS for asking to centre the sweep, so the family comes from `current`.
+/// An unrecognised current code falls back to W/F NORMAL, which is the family this app can place.
+pub fn mode_code_for(pos: ScopePosition, current: u8) -> u8 {
+    let family: [u8; 3] = match current {
+        b'0' | b'1' | b'2' => [b'0', b'1', b'2'],
+        b'3' | b'6' | b'9' => [b'3', b'6', b'9'],
+        _ => [b'4', b'7', b'A'],
+    };
+    match pos {
+        ScopePosition::Center => family[0],
+        ScopePosition::Cursor => family[1],
+        ScopePosition::Fix => family[2],
+    }
+}
+
+/// Which position a MODE code names, for showing the operator where the sweep currently sits.
+pub fn position_of(code: u8) -> Option<ScopePosition> {
+    Some(match code {
+        b'0' | b'3' | b'4' => ScopePosition::Center,
+        b'1' | b'6' | b'7' => ScopePosition::Cursor,
+        b'2' | b'9' | b'A' => ScopePosition::Fix,
+        _ => return None,
+    })
+}
+
 /// The raw CAT string that SETS the scope mode — same shape, `P2=6`. `4` is W/F CENTER (NORMAL),
 /// the only family whose sweep edges this module can place on the band.
 pub fn set_mode_command(code: u8) -> String {

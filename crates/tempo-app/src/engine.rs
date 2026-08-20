@@ -1991,6 +1991,8 @@ pub struct Engine {
     /// (± half-width), reference level in tenths of a dB, and center(false)/fixed(true) mode. The
     /// radio loop drains each and calls the CivDaemon while not keyed.
     pending_scope_span: Option<u32>,
+    /// Queued Yaesu scope position as an `SS` P3 code — see `request_yaesu_scope_mode`.
+    pending_yaesu_scope_mode: Option<u8>,
     pending_scope_ref: Option<i32>,
     pending_scope_fixed: Option<bool>,
     /// FlexRadio native-panadapter controls (read continuously by the FlexSpectrum worker, which
@@ -2087,6 +2089,8 @@ pub struct Engine {
     /// explain a blank waterfall instead of failing silently.
     audio_error: Option<String>,
     scope_error: Option<String>,
+    /// See `RadioStatus::scope_mode_code`.
+    scope_mode_code: Option<u32>,
     /// The last per-QSO recording that failed, with the path. Set by the shell (which owns the
     /// file write), carried out in the snapshot, cleared by the next recording that succeeds.
     recording_warning: Option<String>,
@@ -3673,6 +3677,7 @@ impl Engine {
             rig_passband: None,
             pending_passband: None,
             pending_scope_span: None,
+            pending_yaesu_scope_mode: None,
             pending_scope_ref: None,
             flex_pan_span_hz: 200_000.0,
             flex_pan_ref_dbm: None,
@@ -3700,6 +3705,7 @@ impl Engine {
             cat_reprobe: false,
             audio_error: None,
             scope_error: None,
+            scope_mode_code: None,
             recording_warning: None,
             qsy,
             rtty_armed: false,
@@ -6700,6 +6706,19 @@ impl Engine {
     /// Queue a native-scope REFERENCE-level change (tenths of a dB, −200..+200) from the UI.
     pub fn request_scope_ref(&mut self, ref_tenths_db: i32) {
         self.pending_scope_ref = Some(ref_tenths_db);
+    }
+    /// Queue a Yaesu scope POSITION change from the UI — CENTER, CURSOR or FIX.
+    ///
+    /// Separate from `request_scope_fixed`, which is Icom's two-valued center/fixed. The FT-710 has
+    /// three positions and, within each, three display families (3DSS / W-F EXPAND / W-F NORMAL),
+    /// so what travels here is the READY-MADE `SS` P3 code: the family is resolved next to the
+    /// radio, from what the rig currently reports, rather than guessed in the UI.
+    pub fn request_yaesu_scope_mode(&mut self, code: u8) {
+        self.pending_yaesu_scope_mode = Some(code);
+    }
+    /// Take the queued Yaesu scope position, if any.
+    pub fn take_yaesu_scope_mode_request(&mut self) -> Option<u8> {
+        self.pending_yaesu_scope_mode.take()
     }
     /// Queue a native-scope CENTER/FIXED mode change from the UI (`true` = fixed).
     pub fn request_scope_fixed(&mut self, fixed: bool) {
@@ -12971,6 +12990,10 @@ impl Engine {
     /// [`Self::set_audio_error`]: a scope that says nothing and an audio device that failed are
     /// different problems with different cures, and hiding one behind the other is how an operator
     /// ends up checking their sound card because their radio's EX menu is off.
+    /// Record the rig scope's MODE code as read back over CAT — see `RadioStatus::scope_mode_code`.
+    pub fn set_scope_mode_code(&mut self, code: Option<u32>) {
+        self.scope_mode_code = code;
+    }
     pub fn set_scope_error(&mut self, err: Option<String>) {
         self.scope_error = err;
     }
@@ -13482,6 +13505,7 @@ impl Engine {
         .to_string();
         s.radio.audio_error = self.audio_error.clone();
         s.radio.scope_error = self.scope_error.clone();
+        s.radio.scope_mode_code = self.scope_mode_code;
         s.radio.recording_warning = self.recording_warning.clone();
         s.radio.radio_config_warning =
             crate::settings::serial_port_conflicts(&self.settings.radios)
@@ -27370,7 +27394,7 @@ mod tests {
             native_scope: p.native_scope.clone(),
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
-            yaesu_rf_scope: false,
+            yaesu_rf_scope: None,
             flex_native_audio: p.flex_native_audio,
         };
 

@@ -641,6 +641,7 @@ export function radioPatch(s: Partial<RadioProfilePatch>): RadioProfilePatch {
     // that fails when a per-radio field is added without a home in this patch.
     flexRadioIp: s.flexRadioIp ?? '',
     flexNativePan: s.flexNativePan ?? false,
+    yaesuRfScope: s.yaesuRfScope ?? false,
     flexNativeAudio: s.flexNativeAudio ?? false,
   }
 }
@@ -3981,6 +3982,19 @@ export function SettingsPanel({
                       Flex IP set (from Find Radios) and SmartSDR reachable on this network. If the
                       scope stays blank or the app hitches, turn it back off. Save to apply.
                     </span>
+                  </label>
+                )}
+                {form.rigModel === 1049 && (
+                  <label className="settings-field">
+                    <span className="settings-label">FT-710 RF scope (spectrum over USB)</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={form.yaesuRfScope ?? false}
+                      className={`toggle${form.yaesuRfScope ? ' on' : ''}`}
+                      onClick={() => updateBool('yaesuRfScope', !form.yaesuRfScope)}
+                      title="Read the FT-710's own spectrum over its internal USB-SPI bridge instead of the sound card. Needs SCU-LAN10 enabled in the radio's EX menu."
+                    />
                   </label>
                 )}
 
