@@ -311,12 +311,36 @@ impl SpectrumFeed {
     /// and opens the next window; freshness is still judged on the most recent PUBLISH, so a
     /// dead capture goes quiet on exactly the schedule it always did.
     pub fn row(&self) -> Option<Spectrum> {
-        let mut g = self.rows.lock().ok()?;
-        if let Some((spec, at)) = &g.rf {
-            if at.elapsed() < std::time::Duration::from_secs(1) && !spec.row.is_empty() {
-                return Some(spec.clone());
+        {
+            let g = self.rows.lock().ok()?;
+            if let Some((spec, at)) = &g.rf {
+                if at.elapsed() < std::time::Duration::from_secs(1) && !spec.row.is_empty() {
+                    return Some(spec.clone());
+                }
             }
         }
+        self.audio_row()
+    }
+
+    /// The AUDIO row, never the RF one — for the displays that are about the DECODER's passband
+    /// rather than about the band.
+    ///
+    /// WHY THIS IS SEPARATE. `row()` prefers a native RF panadapter, and every backend publishes
+    /// one continuously while it streams — Flex, Icom above 115200 baud, and the FT-710 scope.
+    /// So a rig with a scope silently replaced the audio waterfall EVERYWHERE, including the FT8,
+    /// RTTY, PSK and SSTV displays, where 0-4000 Hz is the whole point: a 500 kHz RF sweep cannot
+    /// show a 50 Hz FT8 tone, and clicking it cannot set an audio offset. Reported on an FT-710
+    /// (2026-08-20) as "the audio spectrum is broken in all cases", and confirmed by turning that
+    /// radio's scope off — the audio waterfall came straight back.
+    ///
+    /// It was invisible until now only because the FT-710's RF path kept going unplaceable, and
+    /// audio showed through the gaps; closing those gaps removed the audio entirely. The same
+    /// displacement has always applied to Icom and Flex.
+    ///
+    /// The freshness rule and the empty-row-when-stale behaviour are exactly `row()`'s: this is
+    /// that branch, not a second opinion about it.
+    pub fn audio_row(&self) -> Option<Spectrum> {
+        let mut g = self.rows.lock().ok()?;
         let audio = g.audio.as_mut()?;
         if audio.at.elapsed() < std::time::Duration::from_secs(2) {
             return Some(audio.take());
@@ -25879,6 +25903,36 @@ mod tests {
     /// slot boundary, so a stall starved the audio row AND the Flex/CI-V panadapter together
     /// (operator report, 2026-07-25: the waterfall "hangs and stops moving"). The rule is
     /// unchanged; it moved to where the writers converge without a lock anyone else contends.
+    /// A NATIVE SCOPE MUST NOT REPLACE THE DECODER'S PASSBAND.
+    ///
+    /// `row()` prefers RF, and that is right for the rig-scope view. But the FT8/RTTY/PSK/SSTV
+    /// waterfalls are about 0-4000 Hz — a 500 kHz sweep cannot show a 50 Hz tone and cannot be
+    /// clicked to set an audio offset. Reported on an FT-710 (2026-08-20): with the rig scope
+    /// streaming, "the audio spectrum is broken in all cases"; turning the scope off brought it
+    /// straight back.
+    #[test]
+    fn audio_row_ignores_a_fresh_rf_row_while_row_still_prefers_it() {
+        let feed = SpectrumFeed::default();
+        feed.publish_audio(Spectrum {
+            row: vec![1.0, 2.0],
+            lo_hz: 0.0,
+            hi_hz: 4000.0,
+            source: "audio".into(),
+        });
+        feed.publish_rf(Spectrum {
+            row: vec![9.0, 9.0],
+            lo_hz: 14_000_000.0,
+            hi_hz: 14_500_000.0,
+            source: "yaesu".into(),
+        });
+        // The rig-scope path still gets the panadapter...
+        assert_eq!(feed.row().expect("a row").source, "yaesu");
+        // ...and the decoder path gets the passband, with the RF row sitting right there.
+        let a = feed.audio_row().expect("an audio row");
+        assert_eq!(a.source, "audio");
+        assert_eq!((a.lo_hz, a.hi_hz), (0.0, 4000.0), "0-4000 Hz, not the band");
+    }
+
     #[test]
     fn a_fresh_native_row_wins_over_audio_and_falls_back_when_cleared() {
         let feed = SpectrumFeed::default();
