@@ -954,6 +954,12 @@ const YAESU_WF_META_FAST_SECS: f64 = 0.8;
 /// screen. 2.5 s is three fast polls. Past it the sweep is unknown, which is the honest answer — and
 /// the dangerous case it protects against (a mode change we missed) resolves on the next good read.
 const YAESU_WF_STALE_SECS: f64 = 2.5;
+/// How long to leave a span request alone before asking again.
+///
+/// Long enough that the read-back has had several chances to confirm it, because re-asking is not
+/// free: a set makes the next read fail, so a request repeated per tick starves the very read that
+/// would have told us it worked.
+const YAESU_WF_SPAN_ASK_SECS: f64 = 4.0;
 /// How long a reader may publish nothing before that becomes an operator-facing message. Long
 /// enough to cover an FT4222 that is simply slow to first frame, short enough to be useful.
 const YAESU_WF_GRACE_SECS: f64 = 6.0;
@@ -2551,6 +2557,8 @@ struct RadioLoop {
     yaesu_wf_placed: Option<bool>,
     /// When the span and mode were last read SUCCESSFULLY — see `YAESU_WF_STALE_SECS`.
     yaesu_wf_read_ok: f64,
+    /// The span code last REQUESTED in FIX, and when — see `YAESU_WF_SPAN_ASK_SECS`.
+    yaesu_wf_span_asked: Option<(u8, f64)>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2831,6 +2839,7 @@ impl RadioLoop {
             yaesu_wf_anchor: None,
             yaesu_wf_placed: None,
             yaesu_wf_read_ok: 0.0,
+            yaesu_wf_span_asked: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -3150,8 +3159,17 @@ impl RadioLoop {
             Some(crate::yaesu_wf::ScopePosition::Fix)
         ) {
             if let Some(code) = crate::yaesu_wf::auto_fix_span_code(dial_hz_for_span) {
-                if meta_before.map(|m| m.span_code) != Some(code) {
+                // ASK ONCE, THEN WAIT FOR THE READ-BACK. Sending it whenever the reported span
+                // differs looks right and is a feedback loop: a set makes the NEXT read come back
+                // empty (measured), an empty read leaves the reported span stale, the stale span
+                // still differs, so it sets again — every tick, and the reads never recover. That
+                // wedged the scope on "span/mode unknown" on the bench within seconds.
+                let asked_recently = self
+                    .yaesu_wf_span_asked
+                    .is_some_and(|(c, at)| c == code && now - at < YAESU_WF_SPAN_ASK_SECS);
+                if meta_before.map(|m| m.span_code) != Some(code) && !asked_recently {
                     rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
+                    self.yaesu_wf_span_asked = Some((code, now));
                     self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
                 }
             }
