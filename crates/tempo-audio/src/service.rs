@@ -968,11 +968,18 @@ const YAESU_WF_RETRY_SECS: f64 = 5.0;
 /// come back a few seconds later every time they changed span.
 const YAESU_WF_SETTLE_SECS: f64 = 0.4;
 
-/// The bridge is not on the USB bus at all — or something else has it.
-const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be opened. If it is not on \
-     USB at all, enable SCU-LAN10 in the radio's EX menu (Nexus cannot set it over CAT) and switch \
-     the radio off and on. If it is there, another program may have it open. Nexus keeps retrying. \
-     The waterfall uses sound-card audio until then.";
+/// The bridge could not be opened, and SCU-LAN10 is OFF — which is why.
+///
+/// This used to tell the operator to go and check the menu, because the setting was believed to be
+/// out of CAT's reach. It is not: `EX 03-01-26` reads and writes it (bench, 2026-08-20), so Nexus
+/// now knows rather than guesses, and can offer to change it rather than instruct.
+const YAESU_WF_SCU_OFF: &str = "SCU-LAN10 is OFF in the radio, so the FT-710's spectrum bridge does \
+     not appear on USB. Nexus can switch it on for you; the radio then needs to be powered off and \
+     on before the bridge appears. Until then the waterfall uses sound-card audio.";
+/// The bridge could not be opened and SCU-LAN10 is on (or could not be read).
+const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be opened even though \
+     SCU-LAN10 is on. Another program may have it open, or the radio has not been power-cycled \
+     since the setting changed. Nexus keeps retrying; the waterfall uses sound-card audio.";
 /// The scope is sweeping, but not around the dial, so no row can be placed on the band.
 const YAESU_WF_NOT_CENTERED: &str = "The radio's spectrum scope is not in a CENTER mode, so Nexus \
      cannot tell which frequencies the sweep covers — FIX pins the window to a start frequency the \
@@ -980,9 +987,37 @@ const YAESU_WF_NOT_CENTERED: &str = "The radio's spectrum scope is not in a CENT
      sound-card audio.";
 
 /// The bridge opened but the radio is sending nothing.
-const YAESU_WF_NO_FRAMES: &str = "The FT-710's spectrum bridge is connected but the radio is not \
-     sending a spectrum. Turn the EXTERNAL DISPLAY output on in the radio's EX menu (Nexus cannot \
-     set it over CAT). The waterfall keeps using sound-card audio until then.";
+///
+/// ⚠️ This used to tell the operator to turn EXTERNAL DISPLAY on. That advice was never verified and
+/// is now known to be wrong: `EX 04-04-01` read OFF on a station whose waterfall was working
+/// perfectly (bench, 2026-08-20). Whatever silence means here, it is not that — so the message no
+/// longer sends anyone to a setting that has nothing to do with it.
+const YAESU_WF_NO_FRAMES: &str = "The FT-710's spectrum bridge is connected but no sweep is \
+     arriving. Nexus keeps reading; the waterfall uses sound-card audio meanwhile.";
+
+/// Where the sweep is centred, after one tick — the CURSOR anchor.
+///
+/// Established rather than read. The FT-710 reports no window position, but switching CENTER →
+/// CURSOR leaves the window exactly where it was (operator, bench, 2026-08-20: "going to cursor
+/// from center, the band edges don't move"), so at that transition the window centre IS the dial.
+/// Entering FIX moves the edges to a per-band preset instead, which is why FIX gets no anchor here.
+///
+/// * a CENTER mode has no anchor: the window follows the dial, which is what CENTER means;
+/// * arriving in CURSOR anchors on THIS tick's dial;
+/// * staying in CURSOR keeps the anchor, so the window stays put while the dial moves across it;
+/// * anything else — FIX, an unknown code, or a sweep whose span/mode we no longer know — drops it,
+///   because an anchor kept across a mode we cannot place is a wrong answer waiting to be drawn.
+fn yaesu_wf_next_anchor(prev: Option<f64>, prev_mode: Option<u8>, mode: Option<u8>, dial_hz: f64) -> Option<f64> {
+    use crate::yaesu_wf::{position_of, ScopePosition};
+    match mode.and_then(position_of) {
+        Some(ScopePosition::Center) => None,
+        Some(ScopePosition::Cursor) => {
+            let was_cursor = matches!(prev_mode.and_then(position_of), Some(ScopePosition::Cursor));
+            if was_cursor { prev.or(Some(dial_hz)) } else { Some(dial_hz) }
+        }
+        _ => None,
+    }
+}
 
 /// The sweep metadata after one radio-loop tick.
 ///
@@ -1000,15 +1035,23 @@ fn yaesu_wf_next_meta(
     prev: Option<crate::yaesu_wf::SweepMeta>,
     dial_hz: f64,
     polled: Option<(Option<u8>, Option<u8>)>,
+    anchor_hz: Option<f64>,
 ) -> Option<crate::yaesu_wf::SweepMeta> {
     match polled {
         Some((Some(span_code), Some(mode_code))) => Some(crate::yaesu_wf::SweepMeta {
             dial_hz,
+            center_hz: anchor_hz,
             span_code,
             mode_code,
         }),
         Some(_) => None, // asked, and did not learn — so we no longer know
-        None => prev.map(|m| crate::yaesu_wf::SweepMeta { dial_hz, ..m }),
+        None => prev.map(|m| crate::yaesu_wf::SweepMeta {
+            dial_hz,
+            // The anchor is re-stated every tick, not inherited: it is owned by
+            // `yaesu_wf_next_anchor`, which drops it the moment the mode stops being CURSOR.
+            center_hz: anchor_hz,
+            ..m
+        }),
     }
 }
 
@@ -2457,6 +2500,9 @@ struct RadioLoop {
     yaesu_wf_started: f64,
     /// Earliest time a failed FT4222 open may be attempted again. See `YAESU_WF_RETRY_SECS`.
     yaesu_wf_retry_after: f64,
+    /// Where a CURSOR sweep is centred — see `yaesu_wf_next_anchor`. `None` for CENTER (the dial
+    /// is the centre) and for FIX (the window is a preset nothing reports).
+    yaesu_wf_anchor: Option<f64>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2734,6 +2780,7 @@ impl RadioLoop {
             yaesu_wf_meta_after: 0.0,
             yaesu_wf_started: 0.0,
             yaesu_wf_retry_after: 0.0,
+            yaesu_wf_anchor: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -2983,7 +3030,20 @@ impl RadioLoop {
                     self.yaesu_wf_started = now;
                     e.set_scope_error(None);
                 }
-                None => e.set_scope_error(Some(YAESU_WF_NO_BRIDGE.to_string())),
+                None => {
+                    // Say WHICH thing is wrong rather than listing what it might be. The menu is
+                    // readable over CAT, so ask it: `1` = on, anything else (including a read we
+                    // could not make) leaves the general message, which does not claim to know.
+                    let scu_on = rig
+                        .send_raw(&crate::yaesu_wf::ex_read_command(crate::yaesu_wf::EX_SCU_LAN10))
+                        .and_then(|r| {
+                            crate::yaesu_wf::parse_ex_reply(&r, crate::yaesu_wf::EX_SCU_LAN10)
+                        });
+                    e.set_scope_error(Some(match scu_on.as_deref() {
+                        Some("0") => YAESU_WF_SCU_OFF.to_string(),
+                        _ => YAESU_WF_NO_BRIDGE.to_string(),
+                    }));
+                }
             }
             return; // the metadata read can wait a tick; the thread has nothing to place yet
         }
@@ -3068,7 +3128,21 @@ impl RadioLoop {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            *guard = yaesu_wf_next_meta(*guard, dial_hz, polled);
+            // The anchor is decided BEFORE the metadata that carries it, and from the mode this
+            // tick read versus the one the previous meta held — that difference is the CENTER →
+            // CURSOR transition, and it is the only moment the window position is knowable.
+            let mode_now = match polled {
+                Some((_, m)) => m,
+                None => guard.map(|m| m.mode_code),
+            };
+            let anchor = yaesu_wf_next_anchor(
+                self.yaesu_wf_anchor,
+                guard.map(|m| m.mode_code),
+                mode_now,
+                dial_hz,
+            );
+            self.yaesu_wf_anchor = anchor;
+            *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor);
             *guard
         };
 
@@ -21375,6 +21449,7 @@ mod tests {
     fn meta(dial: f64, span: u8, mode: u8) -> crate::yaesu_wf::SweepMeta {
         crate::yaesu_wf::SweepMeta {
             dial_hz: dial,
+            center_hz: None,
             span_code: span,
             mode_code: mode,
         }
@@ -21385,7 +21460,7 @@ mod tests {
         // The garbling: span/mode are polled every 5 s, the dial moves continuously. A tick with no
         // poll must still carry the CURRENT dial, or rows land where the operator used to be — on a
         // 200 kHz span, 70 kHz of tuning is a third of the width.
-        let out = yaesu_wf_next_meta(Some(meta(14_150_000.0, b'7', b'4')), 14_220_400.0, None)
+        let out = yaesu_wf_next_meta(Some(meta(14_150_000.0, b'7', b'4')), 14_220_400.0, None, None)
             .expect("a known sweep stays known");
         assert_eq!(out.dial_hz, 14_220_400.0, "the dial must follow the radio");
         assert_eq!((out.span_code, out.mode_code), (b'7', b'4'), "codes are not re-guessed");
@@ -21397,9 +21472,9 @@ mod tests {
         // rig's scope to FIX means every row keeps a centred assumption that is now false, and
         // `sweep_edges` never gets the chance to refuse it. Either read failing is enough.
         let prev = Some(meta(14_150_000.0, b'7', b'4'));
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4')))).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None))).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None))).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4'))), None).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None)), None).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None).is_none());
     }
 
     #[test]
@@ -21408,6 +21483,7 @@ mod tests {
             Some(meta(14_150_000.0, b'7', b'4')),
             21_074_000.0,
             Some((Some(b'3'), Some(b'0'))),
+            None,
         )
         .expect("a complete read is a known sweep");
         assert_eq!(
@@ -21420,7 +21496,54 @@ mod tests {
     fn an_unknown_sweep_is_not_invented_by_a_tick_that_asked_nothing() {
         // Before the first successful poll there is no span and no mode, and a tick that spends no
         // CAT round-trip learns neither. It must stay unknown — a dial alone places nothing.
-        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None).is_none());
+        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None).is_none());
+    }
+
+
+    // ── The CURSOR anchor ───────────────────────────────────────────────────────────────────────
+    //
+    // Bench, 2026-08-20: "going to cursor from center, the band edges don't move; when switching in
+    // and out of fix, they do." That single observation is the whole basis — the FT-710 reports no
+    // window position, so the only moment it is knowable is the CENTER → CURSOR transition, when the
+    // window is still the one we could place.
+
+    #[test]
+    fn arriving_in_cursor_anchors_the_window_on_the_dial_of_that_moment() {
+        // Mode 4 = W/F CENTER (NORMAL) → 7 = W/F CURSOR (NORMAL). The edges do not move, so the
+        // window centre is the dial as it stands right now.
+        assert_eq!(
+            yaesu_wf_next_anchor(None, Some(b'4'), Some(b'7'), 14_150_000.0),
+            Some(14_150_000.0)
+        );
+    }
+
+    #[test]
+    fn staying_in_cursor_keeps_the_window_where_it_was() {
+        // The point of CURSOR: the window stays put and the dial moves across it. Re-anchoring on
+        // every tick would turn it back into CENTER, which is the bug this test exists to prevent.
+        assert_eq!(
+            yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), Some(b'7'), 14_162_500.0),
+            Some(14_150_000.0)
+        );
+    }
+
+    #[test]
+    fn a_center_sweep_has_no_anchor_because_the_dial_is_the_centre() {
+        for code in [b'0', b'3', b'4'] {
+            assert_eq!(yaesu_wf_next_anchor(Some(1.0), Some(b'7'), Some(code), 7_100_000.0), None);
+        }
+    }
+
+    #[test]
+    fn fix_gets_no_anchor_however_we_arrived_at_it() {
+        // FIX moves the edges to a per-band preset on entry, so the dial at the transition is NOT
+        // the window centre — anchoring there would place every signal wrongly while looking right.
+        for code in [b'2', b'9', b'A'] {
+            assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'4'), Some(code), 14_150_000.0), None);
+            assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), Some(code), 14_150_000.0), None);
+        }
+        // And an unread mode drops it too, rather than carrying a stale window into the unknown.
+        assert_eq!(yaesu_wf_next_anchor(Some(14_150_000.0), Some(b'7'), None, 14_150_000.0), None);
     }
 
 }

@@ -174,6 +174,55 @@ pub fn set_span_command(code: u8) -> String {
     format!("SS05{}0000;", code as char)
 }
 
+/// A MENU item, addressed the way `EX` addresses one: three two-digit numbers.
+///
+/// The FT-710's menu is reachable over CAT — `EX<P1><P2><P3>;` reads, appending a value writes —
+/// and that matters more than it looks. The two settings this module used to tell operators to go
+/// and change by hand are BOTH in there, so Nexus can check them instead of guessing, and offer to
+/// change them instead of instructing. Verified on the bench, 2026-08-20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExItem {
+    pub p1: u8,
+    pub p2: u8,
+    pub p3: u8,
+}
+
+/// `0: OFF  1: ON`. What makes the FT4222 spectrum bridge appear on USB at all.
+pub const EX_SCU_LAN10: ExItem = ExItem { p1: 3, p2: 1, p3: 26 };
+/// `0: OFF  1: ON`. NOT required for the bridge: measured OFF on a station whose waterfall was
+/// working, which is why the "turn the external display on" advice was withdrawn.
+pub const EX_EXT_DISPLAY: ExItem = ExItem { p1: 4, p2: 4, p3: 1 };
+/// `0: FILTER  1: CARRIER POINT`. Which point the sweep is centred on, and therefore whether this
+/// module's centred placement is right: on FILTER the centre sits at the filter's centre, offset
+/// from the carrier by roughly half the passband — about 1.5 kHz on SSB, invisible across a 200 kHz
+/// span and gross across a 5 kHz one.
+pub const EX_SCOPE_CTR: ExItem = ExItem { p1: 4, p2: 2, p3: 2 };
+
+/// The CAT string that READS a menu item: `EX030126;` for SCU-LAN10.
+pub fn ex_read_command(item: ExItem) -> String {
+    format!("EX{:02}{:02}{:02};", item.p1, item.p2, item.p3)
+}
+
+/// The CAT string that SETS one. The value is the menu's own `P4` text (`"1"`, `"00"`, `"-25"` …),
+/// passed through rather than interpreted: the menu chart gives a different width per item and
+/// guessing one here would be a silent way to write the wrong thing.
+pub fn ex_set_command(item: ExItem, value: &str) -> String {
+    format!("EX{:02}{:02}{:02}{value};", item.p1, item.p2, item.p3)
+}
+
+/// The value out of an `EX` answer, checked against the item that was asked for.
+///
+/// The address is re-checked for the same reason `parse_ss_reply` checks `P2`: on a link that can
+/// interleave, taking the tail of "whatever came back" would read one menu item's value as
+/// another's — and these are all small integers, so the wrong answer would look perfectly valid.
+pub fn parse_ex_reply(reply: &str, item: ExItem) -> Option<String> {
+    let body = reply.trim().trim_end_matches('\0').strip_prefix("EX")?;
+    let body = body.strip_suffix(';')?;
+    let (addr, value) = body.split_at_checked(6)?;
+    (addr == format!("{:02}{:02}{:02}", item.p1, item.p2, item.p3) && !value.is_empty())
+        .then(|| value.to_string())
+}
+
 /// Where the sweep sits relative to the dial. The operator-facing choice, three ways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopePosition {
@@ -233,12 +282,41 @@ pub fn mode_is_centered(code: u8) -> bool {
 /// below 0 Hz. Every one of those is "we do not know where this row sits", and the honest response
 /// is to render no row rather than a mislabelled one.
 pub fn sweep_edges(dial_hz: f64, span_code: u8, mode_code: u8) -> Option<(f64, f64)> {
-    if !mode_is_centered(mode_code) {
-        return None;
-    }
+    sweep_edges_anchored(dial_hz, span_code, mode_code, None)
+}
+
+/// Absolute row edges, with an optional ANCHOR for a sweep that is not centred on the dial.
+///
+/// `anchor_hz` is where the window sits — see `SweepMeta::center_hz`. With one, a CURSOR sweep is
+/// placeable: the window is static and the dial moves across it. Two things are still refused, and
+/// both would otherwise draw an authoritative wrong answer:
+///
+/// * FIX, always. Its window jumps to a per-band preset when entered ("switching in and out of fix,
+///   they do [move]"), and no `SS` sub-command reports it — so an anchor observed at a CENTER→FIX
+///   transition would be the wrong window from the first frame.
+/// * A CURSOR sweep whose dial has left the window. The radio does something at that edge and we
+///   cannot see what; the honest answer is that we no longer know where the window is.
+pub fn sweep_edges_anchored(
+    dial_hz: f64,
+    span_code: u8,
+    mode_code: u8,
+    anchor_hz: Option<f64>,
+) -> Option<(f64, f64)> {
+    let centered = mode_is_centered(mode_code);
+    let cursor = matches!(position_of(mode_code), Some(ScopePosition::Cursor));
+    let center = match (centered, cursor, anchor_hz) {
+        (true, _, _) => dial_hz,
+        (false, true, Some(a)) => a,
+        _ => return None, // FIX, or CURSOR with no anchor established
+    };
     let span = span_hz(span_code)?;
+    if !centered && (dial_hz - center).abs() > span / 2.0 {
+        return None; // the dial has left the window — where it went next is not ours to guess
+    }
     let half = span / 2.0;
-    (dial_hz - half >= 0.0).then_some((dial_hz - half, dial_hz + half))
+    // A window that would run below 0 Hz is not a window. Checked on the CENTRE, not the dial:
+    // in CURSOR they are different numbers and the dial is the one that moves.
+    (center - half >= 0.0).then_some((center - half, center + half))
 }
 
 /// A source of raw 4096-byte frames.
@@ -308,6 +386,15 @@ pub enum Pumped {
 #[derive(Debug, Clone, Copy)]
 pub struct SweepMeta {
     pub dial_hz: f64,
+    /// Where the sweep is CENTRED, when that is not the dial — the CURSOR case.
+    ///
+    /// `None` means "centred on the dial", which is what a CENTER mode does. `Some(hz)` is an
+    /// anchor the owner ESTABLISHED rather than read: switching CENTER → CURSOR leaves the window
+    /// exactly where it was (operator, bench, 2026-08-20 — "going to cursor from center, the band
+    /// edges don't move"), so the anchor is the dial at the instant of that transition. The CAT
+    /// protocol reports no such value; this is knowable only because the transition is observed, or
+    /// caused, by us.
+    pub center_hz: Option<f64>,
     /// `P3` of `SS<P1>5;` — the SPAN code, as the ASCII byte the radio sent.
     pub span_code: u8,
     /// `P3` of `SS<P1>6;` — the MODE code, as the ASCII byte the radio sent.
@@ -331,7 +418,9 @@ pub fn pump(
     feed: &tempo_app::engine::SpectrumFeed,
     meta: SweepMeta,
 ) -> Pumped {
-    let Some((lo_hz, hi_hz)) = sweep_edges(meta.dial_hz, meta.span_code, meta.mode_code) else {
+    let Some((lo_hz, hi_hz)) =
+        sweep_edges_anchored(meta.dial_hz, meta.span_code, meta.mode_code, meta.center_hz)
+    else {
         return Pumped::Unavailable;
     };
     let Ok(raw) = src.read_frame() else {
@@ -767,6 +856,7 @@ mod tests {
         let mut src = MockWaterfall::ramp();
         let meta = SweepMeta {
             dial_hz: 14_100_000.0,
+            center_hz: None,
             span_code: b'7', // 200 kHz — what the radio reported
             mode_code: b'4', // W/F CENTER (NORMAL) — likewise
         };
@@ -789,6 +879,7 @@ mod tests {
         let feed = tempo_app::engine::SpectrumFeed::default();
         let meta = SweepMeta {
             dial_hz: 14_100_000.0,
+            center_hz: None,
             span_code: b'7',
             mode_code: b'4',
         };
@@ -836,6 +927,7 @@ mod tests {
         let feed = tempo_app::engine::SpectrumFeed::default();
         let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
             dial_hz: 14_100_000.0,
+            center_hz: None,
             span_code: b'7',
             mode_code: b'4',
         })));
@@ -870,6 +962,7 @@ mod tests {
         let feed = tempo_app::engine::SpectrumFeed::default();
         let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
             dial_hz: 14_100_000.0,
+            center_hz: None,
             span_code: b'7',
             mode_code: b'4',
         })));
@@ -1058,6 +1151,96 @@ mod tests {
         // the same function the reply path uses, pointed at what we are about to send.
         assert_eq!(parse_ss_reply(&set_span_command(b'7'), b'5'), Some(b'7'));
         assert_eq!(parse_ss_reply(&set_mode_command(b'4'), b'6'), Some(b'4'));
+    }
+
+
+    // ── Placing a CURSOR sweep ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_anchored_cursor_window_stays_put_while_the_dial_moves_across_it() {
+        // 200 kHz span anchored at 14.150; the dial moves 20 kHz and the EDGES do not.
+        let at = |dial: f64| sweep_edges_anchored(dial, b'7', b'7', Some(14_150_000.0));
+        let a = at(14_150_000.0).expect("anchored cursor is placeable");
+        let b = at(14_170_000.0).expect("still placeable after tuning");
+        assert_eq!(a, b, "the window is fixed; the dial is what moves");
+        assert_eq!(a, (14_050_000.0, 14_250_000.0));
+    }
+
+    #[test]
+    fn a_cursor_sweep_with_no_anchor_is_refused() {
+        // Before the transition is seen — e.g. Nexus started with the rig already in CURSOR — the
+        // window is unknown, and unknown must not be drawn.
+        assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', b'7', None), None);
+    }
+
+    #[test]
+    fn a_dial_that_has_left_the_cursor_window_makes_it_unknown_again() {
+        // At the edge the radio does something — shift, re-centre, stop — and nothing tells us
+        // which. Half of 200 kHz is 100 kHz, so 100.1 kHz away is outside.
+        assert!(sweep_edges_anchored(14_249_000.0, b'7', b'7', Some(14_150_000.0)).is_some());
+        assert_eq!(sweep_edges_anchored(14_251_000.0, b'7', b'7', Some(14_150_000.0)), None);
+    }
+
+    #[test]
+    fn fix_is_refused_even_with_an_anchor_offered() {
+        // The anchor rule never produces one for FIX; this pins the geometry so a future caller
+        // cannot make FIX placeable by handing one in.
+        for code in [b'2', b'9', b'A'] {
+            assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', code, Some(14_150_000.0)), None);
+        }
+    }
+
+    #[test]
+    fn a_center_sweep_ignores_any_anchor_and_follows_the_dial() {
+        let with = sweep_edges_anchored(14_150_000.0, b'7', b'4', Some(7_000_000.0));
+        let without = sweep_edges_anchored(14_150_000.0, b'7', b'4', None);
+        assert_eq!(with, without);
+        assert_eq!(with, Some((14_050_000.0, 14_250_000.0)));
+    }
+
+
+    // ── The EX menu, which turned out to be reachable over CAT ──────────────────────────────────
+    //
+    // Every shape below was READ OFF the radio (bench, 2026-08-20), not derived from the chart:
+    //   EX030126;  -> EX0301261;   SCU-LAN10 = ON
+    //   EX040401;  -> EX0404010;   EXT DISPLAY = OFF  (and the waterfall was working)
+    //   EX040202;  -> EX0402021;   SCOPE CTR = CARRIER POINT
+    // The middle one is why an operator message got withdrawn rather than reworded.
+
+    #[test]
+    fn a_menu_item_reads_with_three_two_digit_fields() {
+        assert_eq!(ex_read_command(EX_SCU_LAN10), "EX030126;");
+        assert_eq!(ex_read_command(EX_EXT_DISPLAY), "EX040401;");
+        assert_eq!(ex_read_command(EX_SCOPE_CTR), "EX040202;");
+    }
+
+    #[test]
+    fn a_set_is_the_read_with_the_value_appended() {
+        assert_eq!(ex_set_command(EX_SCU_LAN10, "1"), "EX0301261;");
+        assert_eq!(ex_set_command(EX_SCOPE_CTR, "1"), "EX0402021;");
+    }
+
+    #[test]
+    fn a_reply_yields_its_value_and_survives_the_nul_the_radio_sends() {
+        // The raw-CAT path is NUL-terminated, so the parser has to tolerate it — that terminator is
+        // what broke every raw read in this app until 2026-08-20.
+        assert_eq!(parse_ex_reply("EX0301261;", EX_SCU_LAN10).as_deref(), Some("1"));
+        assert_eq!(parse_ex_reply("EX0301261;\0", EX_SCU_LAN10).as_deref(), Some("1"));
+        assert_eq!(parse_ex_reply("EX0404010;", EX_EXT_DISPLAY).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn a_reply_for_a_different_menu_item_is_refused() {
+        // The point of checking the address. These values are all small integers, so one item's
+        // answer read as another's would look perfectly valid — and on a link that can interleave,
+        // that is not hypothetical. SCU-LAN10 reading "0" from EXT DISPLAY's reply would send the
+        // operator to power-cycle a radio whose setting was already on.
+        assert_eq!(parse_ex_reply("EX0404010;", EX_SCU_LAN10), None);
+        assert_eq!(parse_ex_reply("EX0402021;", EX_EXT_DISPLAY), None);
+        // And malformed answers yield nothing rather than a guess.
+        assert_eq!(parse_ex_reply("EX030126;", EX_SCU_LAN10), None, "no value at all");
+        assert_eq!(parse_ex_reply("?;", EX_SCU_LAN10), None);
+        assert_eq!(parse_ex_reply("", EX_SCU_LAN10), None);
     }
 
 }
