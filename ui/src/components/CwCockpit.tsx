@@ -1448,9 +1448,12 @@ export function CwCockpit({
                 {/* The start IN FORCE, not just an invitation: a click that never reached the radio loop
                     is otherwise indistinguishable from one that did, since the waterfall stays on audio
                     either way. Showing the number makes that visible to the operator and to a bug report. */}
+                {/* The start IN FORCE. Never an invitation: once it is persisted per band the
+                    unset case is a first-time-on-this-band thing, and a sentence of instructions
+                    on a chip row is clutter the rest of the time. The tooltip carries the how. */}
                 {snap.radio.scopeFixStartMhz != null
                   ? `FIX ${snap.radio.scopeFixStartMhz.toFixed(3)}`
-                  : 'FIX starts here'}
+                  : 'FIX ⌖'}
               </button>
             )}
           </div>

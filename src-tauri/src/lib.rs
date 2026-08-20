@@ -10836,7 +10836,13 @@ fn set_yaesu_fix_start(state: State<'_, SharedEngine>, mhz: f64) -> Result<AppSn
         return Err(format!("implausible FIX start {mhz} MHz"));
     }
     let mut eng = engine_lock(&state);
-    eng.request_yaesu_fix_start(mhz * 1_000_000.0);
+    // Keyed by the band it applies to, and PERSISTED: the radio keeps a FIX start per band and
+    // changing band should not cost the operator a click they already paid for.
+    let band = eng.settings().band.clone();
+    eng.set_yaesu_fix_start(&band, mhz);
+    if let Err(e) = eng.settings().save(&settings_path()) {
+        eprintln!("tempo: failed to persist the FIX start: {e}");
+    }
     Ok(eng.snapshot())
 }
 

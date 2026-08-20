@@ -180,7 +180,9 @@ describe.each(cockpits)('$name cockpit panadapter controls', ({ render: mount })
     expect(screen.getByLabelText('Panadapter span (sets the radio)')).toBeTruthy()
     expect(screen.getByLabelText('Panadapter position (sets the radio)')).toBeTruthy()
     // And the way OUT of the unplaceable state. This is the assertion the shipped bug failed.
-    expect(screen.getByRole('button', { name: 'FIX starts here' })).toBeTruthy()
+    // The label is deliberately NOT a sentence of instructions: the start persists per band, so the
+    // unset case is a first-time-on-this-band thing and the tooltip carries the how.
+    expect(screen.getByRole('button', { name: 'FIX ⌖' })).toBeTruthy()
   })
 
   it('offer no FIX-start action when the sweep is not in FIX', () => {
@@ -188,9 +190,26 @@ describe.each(cockpits)('$name cockpit panadapter controls', ({ render: mount })
     // apply it to. Its absence is as much a requirement as its presence above.
     for (const code of [CENTER_NORMAL, CURSOR_NORMAL]) {
       mount(snapWithMode(code))
-      expect(screen.queryByRole('button', { name: 'FIX starts here' })).toBeNull()
+      expect(screen.queryByRole('button', { name: 'FIX ⌖' })).toBeNull()
       cleanup()
     }
+  })
+
+  it('name the FIX start in force rather than inviting one again', () => {
+    // Once stated, the control reads back the window Nexus believes it is drawing. That is the only
+    // way an operator can tell a start that landed from one that did not — both leave the waterfall
+    // on sound-card audio, which cost a debugging round on 2026-08-20.
+    render(
+      <PhoneCockpit
+        snap={{ mycall: 'KD9TAW', radio: { ...radio, scopeModeCode: FIX_NORMAL, scopeFixStartMhz: 14.15 } } as unknown as AppSnapshot}
+        theme="dark"
+        onWorkSpot={() => {}}
+        spots={[]}
+        panels={panels}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'FIX 14.150' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'FIX ⌖' })).toBeNull()
   })
 
   it('show the position the RADIO reports, not a local default', () => {

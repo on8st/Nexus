@@ -1284,12 +1284,12 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
                   title="Long-press FIX on the radio at the start frequency, then click this: Nexus takes your current dial as the left edge of the fixed window."
                   onClick={() => void setYaesuFixStart(snap.radio.dialMhz).then((s) => onSnap?.(s)).catch((e) => pushToast(String(e), 'error'))}
                 >
-                  {/* The start IN FORCE, not just an invitation: a click that never reached the radio loop
-                      is otherwise indistinguishable from one that did, since the waterfall stays on audio
-                      either way. Showing the number makes that visible to the operator and to a bug report. */}
-                  {snap.radio.scopeFixStartMhz != null
-                    ? `FIX ${snap.radio.scopeFixStartMhz.toFixed(3)}`
-                    : 'FIX starts here'}
+{/* The start IN FORCE. Never an invitation: once it is persisted per band the
+    unset case is a first-time-on-this-band thing, and a sentence of instructions
+    on a chip row is clutter the rest of the time. The tooltip carries the how. */}
+{snap.radio.scopeFixStartMhz != null
+  ? `FIX ${snap.radio.scopeFixStartMhz.toFixed(3)}`
+  : 'FIX ⌖'}
                 </button>
               )}
             </div>

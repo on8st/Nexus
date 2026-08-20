@@ -2271,6 +2271,15 @@ pub struct RadioProfile {
     /// to retry — which is what `RadioStatus::scope_error` says, naming whichever of the two it is.
     #[serde(default)]
     pub yaesu_rf_scope: bool,
+    /// Where the rig's FIX sweep starts, per BAND, in MHz — `{"20m": 14.15}`.
+    ///
+    /// The radio reports this nowhere: it is set by a long press on FIX, a front-panel-only action,
+    /// and the whole `EX` menu was searched without finding it. So the operator states it once and
+    /// Nexus keeps it. PER BAND because the radio keeps one per band — a 20 m start drawn on 40 m
+    /// would be a window somewhere else entirely, and unlike most errors here it would persist,
+    /// since a FIX window has no reason to change.
+    #[serde(default)]
+    pub yaesu_fix_starts: std::collections::BTreeMap<String, f64>,
     /// Opt-in to THIS radio's native FlexRadio DAX audio (BOTH directions — see
     /// [`Settings::flex_native_audio`]). Per-radio, as above.
     #[serde(default)]
@@ -2333,9 +2342,24 @@ pub struct RadioProfilePatch {
     /// means "leave whatever is stored alone"; a caller that wants it off says so.
     #[serde(default)]
     pub yaesu_rf_scope: Option<bool>,
+    /// See `RadioProfile::yaesu_fix_starts`. `Option` for the same reason as the field above: a form
+    /// that does not know about it must not erase it.
+    #[serde(default)]
+    pub yaesu_fix_starts: Option<std::collections::BTreeMap<String, f64>>,
     /// See `RadioProfile::flex_native_audio`.
     #[serde(default)]
     pub flex_native_audio: bool,
+}
+
+impl Settings {
+    /// Test-only mirror of `Engine::set_yaesu_fix_start` — the same write, without an Engine.
+    #[cfg(test)]
+    fn set_yaesu_fix_start_for_test(&mut self, band: &str, mhz: f64) {
+        let id = self.active_radio;
+        if let Some(p) = self.radios.iter_mut().find(|p| p.id == id) {
+            p.yaesu_fix_starts.insert(band.to_string(), mhz);
+        }
+    }
 }
 
 impl RadioProfilePatch {
@@ -2373,6 +2397,9 @@ impl RadioProfilePatch {
         p.flex_native_pan = self.flex_native_pan;
         if let Some(v) = self.yaesu_rf_scope {
             p.yaesu_rf_scope = v;
+        }
+        if let Some(v) = &self.yaesu_fix_starts {
+            p.yaesu_fix_starts = v.clone();
         }
         p.flex_native_audio = self.flex_native_audio;
     }
@@ -2466,6 +2493,7 @@ impl Default for RadioProfile {
             flex_radio_ip: String::new(),
             flex_native_pan: false,
             yaesu_rf_scope: false,
+            yaesu_fix_starts: Default::default(),
             flex_native_audio: false,
         }
     }
@@ -3063,6 +3091,7 @@ impl Settings {
             // rigs has at most one FT-710, and a global mirror would recreate exactly the
             // dual-representation problem the flat fields already are.
             yaesu_rf_scope: false,
+            yaesu_fix_starts: Default::default(),
             flex_native_audio: self.flex_native_audio,
         }
     }
@@ -3960,6 +3989,7 @@ mod tests {
             flex_radio_ip: "192.0.2.50".into(),
             flex_native_pan: true,
             yaesu_rf_scope: Some(false),
+            yaesu_fix_starts: None,
             flex_native_audio: true,
         };
 
@@ -4035,6 +4065,7 @@ mod tests {
             flex_radio_ip: String::new(),
             flex_native_pan: false,
             yaesu_rf_scope: Some(false),
+            yaesu_fix_starts: None,
             flex_native_audio: false,
         })
         .expect("patch serializes");
@@ -4108,6 +4139,7 @@ mod tests {
         };
         RadioProfilePatch {
             yaesu_rf_scope: Some(false),
+            yaesu_fix_starts: None,
             ..patch_of(&p)
         }
         .apply_to(&mut p);
@@ -4261,6 +4293,7 @@ mod tests {
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
             yaesu_rf_scope: Some(p.yaesu_rf_scope),
+            yaesu_fix_starts: Some(p.yaesu_fix_starts.clone()),
             flex_native_audio: p.flex_native_audio,
         }
     }
@@ -6870,4 +6903,38 @@ mod tests {
             "a fresh install keeps its shipped AI CW decoder"
         );
     }
+
+    /// The FIX start is kept PER BAND, and survives a save.
+    ///
+    /// The radio keeps one per band; carrying a 20 m start onto 40 m would draw a window somewhere
+    /// else entirely, and unlike most errors here it would persist, because a FIX window has no
+    /// reason to change. Operator asked for persistence (2026-08-20) after paying the click on every
+    /// band change.
+    #[test]
+    fn a_fix_start_is_kept_per_band_and_survives_a_round_trip() {
+        let mut s = Settings::default();
+        s.radios = vec![RadioProfile {
+            id: 0,
+            ..RadioProfile::default()
+        }];
+        s.active_radio = 0;
+        s.set_yaesu_fix_start_for_test("20m", 14.150);
+        s.set_yaesu_fix_start_for_test("40m", 7.050);
+        let json = serde_json::to_string(&s).expect("settings serialize");
+        let back: Settings = serde_json::from_str(&json).expect("settings parse");
+        let starts = &back.radios[0].yaesu_fix_starts;
+        assert_eq!(starts.get("20m"), Some(&14.150));
+        assert_eq!(starts.get("40m"), Some(&7.050), "each band keeps its own");
+        assert_eq!(starts.get("15m"), None, "a band never stated has none");
+    }
+
+    /// A settings file written before this existed still loads, with no starts.
+    #[test]
+    fn an_older_settings_file_loads_with_no_fix_starts() {
+        let profile: RadioProfile =
+            serde_json::from_str(r#"{"id":0,"name":"FT-710","rigModel":1049}"#)
+                .expect("an older per-radio block still parses");
+        assert!(profile.yaesu_fix_starts.is_empty());
+    }
+
 }

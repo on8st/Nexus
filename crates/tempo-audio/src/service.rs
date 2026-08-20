@@ -2516,8 +2516,6 @@ struct RadioLoop {
     /// Where a CURSOR sweep is centred — see `yaesu_wf_next_anchor`. `None` for CENTER (the dial
     /// is the centre) and for FIX (the window is a preset nothing reports).
     yaesu_wf_anchor: Option<f64>,
-    /// Where a FIX sweep starts, and the BAND that was stated for — see the read site.
-    yaesu_wf_fix_start: Option<(String, f64)>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2796,7 +2794,6 @@ impl RadioLoop {
             yaesu_wf_started: 0.0,
             yaesu_wf_retry_after: 0.0,
             yaesu_wf_anchor: None,
-            yaesu_wf_fix_start: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -3100,19 +3097,6 @@ impl RadioLoop {
             }
         }
 
-        // The operator stating where FIX starts. Stamped with the band it was stated on, because
-        // the radio keeps a start PER BAND and a 20 m window drawn on 40 m is not a small error.
-        let fix_request = engine_lock(engine).take_yaesu_fix_start_request();
-        if let Some(hz) = fix_request {
-            let b = engine_lock(engine).settings().band.clone();
-            self.yaesu_wf_fix_start = Some((b, hz));
-        }
-        // Show the operator what is in force. Without this a click that never reached the radio
-        // loop is indistinguishable from one that did — the waterfall stays on audio either way.
-        {
-            let start = self.yaesu_wf_fix_start.as_ref().map(|(_, hz)| hz / 1_000_000.0);
-            engine_lock(engine).set_scope_fix_start(start);
-        }
 
         // The scope POSITION, same shape as the span above and the same reason for the scope of
         // the lock. The code arrives ready-made from `mode_code_for`, which keeps the operator in
@@ -3135,11 +3119,18 @@ impl RadioLoop {
         // tuning across 20 m). The old comment claimed "the dial we already poll", which was true and
         // beside the point — it was polled and then not used until the next CAT read.
         let meta_before = self.yaesu_wf_meta.lock().ok().and_then(|g| *g);
-        let (dial_hz, band) = {
+        let (dial_hz, band, fix_start_mhz) = {
             let e = engine_lock(engine);
             let s = e.settings();
-            (s.dial_mhz * 1_000_000.0, s.band.clone())
+            let start = s
+                .radios
+                .iter()
+                .find(|p| p.id == s.active_radio)
+                .and_then(|p| p.yaesu_fix_starts.get(&s.band).copied());
+            (s.dial_mhz * 1_000_000.0, s.band.clone(), start)
         };
+        // Surface what is in force so the control can show it rather than always inviting a value.
+        engine_lock(engine).set_scope_fix_start(fix_start_mhz);
         // POLL FASTER WHILE THERE IS NOTHING ON SCREEN.
         //
         // The mode is read on a slow cadence because hammering rigctld is on record as harmful, and
@@ -3202,10 +3193,9 @@ impl RadioLoop {
             // one per band, so carrying a 20 m start onto 40 m would draw a window that is simply
             // somewhere else. A band change therefore makes it unknown until the operator says
             // where FIX starts there — the same refusal every other unknown gets here.
-            let fix_start = match &self.yaesu_wf_fix_start {
-                Some((b, hz)) if *b == band => Some(*hz),
-                _ => None,
-            };
+            // The FIX start comes from SETTINGS, keyed by band — the radio keeps one per band and
+            // so do we, so it survives a restart and a 20 m start is never drawn on 40 m.
+            let fix_start = fix_start_mhz.map(|mhz| mhz * 1_000_000.0);
             *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start);
             *guard
         };

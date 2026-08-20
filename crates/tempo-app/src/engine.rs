@@ -1993,8 +1993,6 @@ pub struct Engine {
     pending_scope_span: Option<u32>,
     /// Queued Yaesu scope position as an `SS` P3 code — see `request_yaesu_scope_mode`.
     pending_yaesu_scope_mode: Option<u8>,
-    /// Queued FIX start in Hz — see `request_yaesu_fix_start`.
-    pending_yaesu_fix_start: Option<f64>,
     pending_scope_ref: Option<i32>,
     pending_scope_fixed: Option<bool>,
     /// FlexRadio native-panadapter controls (read continuously by the FlexSpectrum worker, which
@@ -3682,7 +3680,6 @@ impl Engine {
             pending_passband: None,
             pending_scope_span: None,
             pending_yaesu_scope_mode: None,
-            pending_yaesu_fix_start: None,
             pending_scope_ref: None,
             flex_pan_span_hz: 200_000.0,
             flex_pan_ref_dbm: None,
@@ -6713,18 +6710,18 @@ impl Engine {
     pub fn request_scope_ref(&mut self, ref_tenths_db: i32) {
         self.pending_scope_ref = Some(ref_tenths_db);
     }
-    /// State where the rig's FIX sweep STARTS — its left edge, in Hz.
+    /// Record where the rig's FIX sweep starts on a given BAND, in MHz — persisted with the radio.
     ///
-    /// The radio reports this nowhere: the start is set by a long press on FIX, a front-panel-only
-    /// action, and the whole `EX` menu was searched without finding it. The operator therefore
-    /// states it, and the natural moment is right after the long press, when the dial IS the start.
-    pub fn request_yaesu_fix_start(&mut self, hz: f64) {
-        self.pending_yaesu_fix_start = Some(hz);
+    /// Replaces a transient request: settings are the single source of truth, so the radio loop reads
+    /// this rather than being handed it, and a restart keeps it. The operator states it once per band
+    /// because that is how the radio itself keeps it.
+    pub fn set_yaesu_fix_start(&mut self, band: &str, mhz: f64) {
+        let id = self.settings.active_radio;
+        if let Some(p) = self.settings.radios.iter_mut().find(|p| p.id == id) {
+            p.yaesu_fix_starts.insert(band.to_string(), mhz);
+        }
     }
-    /// Take the queued FIX start, if any.
-    pub fn take_yaesu_fix_start_request(&mut self) -> Option<f64> {
-        self.pending_yaesu_fix_start.take()
-    }
+
     /// Queue a Yaesu scope POSITION change from the UI — CENTER, CURSOR or FIX.
     ///
     /// Separate from `request_scope_fixed`, which is Icom's two-valued center/fixed. The FT-710 has
@@ -27418,6 +27415,7 @@ mod tests {
             flex_radio_ip: p.flex_radio_ip.clone(),
             flex_native_pan: p.flex_native_pan,
             yaesu_rf_scope: None,
+            yaesu_fix_starts: None,
             flex_native_audio: p.flex_native_audio,
         };
 
