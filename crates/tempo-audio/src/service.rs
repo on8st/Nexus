@@ -3259,6 +3259,34 @@ impl RadioLoop {
                 m.center_hz,
                 m.fix_start_hz,
             );
+            // SAY WHICH VALUE WAS MISSING, once per change of verdict — never the steady state,
+            // which would be ten lines a second. Four operator reports in a row had the same single
+            // symptom ("the panadapter went back to audio") and four different causes: a stale dial,
+            // a stale mode, a dropped reply, a missing FIX start. From outside they are
+            // indistinguishable, so each cost a round of guessing. This turns the next one into a
+            // line that can be pasted instead of a duration that has to be estimated.
+            if self.yaesu_wf_placed != Some(placed.is_some()) {
+                self.yaesu_wf_placed = Some(placed.is_some());
+                match placed {
+                    Some((lo, hi)) => eprintln!(
+                        "yaesu-wf: placing {:.4}-{:.4} MHz (mode {}, span {}, anchor {:?}, fix {:?})",
+                        lo / 1e6,
+                        hi / 1e6,
+                        m.mode_code as char,
+                        m.span_code as char,
+                        m.center_hz.map(|h| h / 1e6),
+                        m.fix_start_hz.map(|h| h / 1e6),
+                    ),
+                    None => eprintln!(
+                        "yaesu-wf: CANNOT place (mode {}, span {}, anchor {:?}, fix {:?}, dial {:.4})",
+                        m.mode_code as char,
+                        m.span_code as char,
+                        m.center_hz.map(|h| h / 1e6),
+                        m.fix_start_hz.map(|h| h / 1e6),
+                        m.dial_hz / 1e6,
+                    ),
+                }
+            }
             if placed.is_none() {
                 // And say what to DO about it, which differs per position. Sending a FIX operator to
                 // CENTER is the wrong advice now that stating a start is one click.
