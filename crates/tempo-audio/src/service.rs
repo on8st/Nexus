@@ -956,6 +956,18 @@ const YAESU_WF_GRACE_SECS: f64 = 6.0;
 /// one glance at the scope.
 const YAESU_WF_RETRY_SECS: f64 = 5.0;
 
+/// How long to leave the radio alone after WRITING a scope setting, before reading it back.
+///
+/// MEASURED, and it is not a guess about "settling": the FIRST read issued straight after an `SS`
+/// set comes back EMPTY, every time, and reads from about 0.2 s onward are normal (bench, FT-710,
+/// 2026-08-20 — set span to 100 kHz, then read at +0.0/+0.2/+0.5/+1.0/+2.0 s).
+///
+/// Reading back immediately therefore cost a visible fault: the empty reply is a failed poll, a
+/// failed poll means the sweep is UNKNOWN (deliberately — see `yaesu_wf_next_meta`), an unknown
+/// sweep clears the RF row, and the operator watched the panadapter drop to sound-card audio and
+/// come back a few seconds later every time they changed span.
+const YAESU_WF_SETTLE_SECS: f64 = 0.4;
+
 /// The bridge is not on the USB bus at all — or something else has it.
 const YAESU_WF_NO_BRIDGE: &str = "The FT-710's spectrum bridge could not be opened. If it is not on \
      USB at all, enable SCU-LAN10 in the radio's EX menu (Nexus cannot set it over CAT) and switch \
@@ -3006,7 +3018,9 @@ impl RadioLoop {
         if let Some(half_hz) = span_request {
             if let Some(code) = crate::yaesu_wf::span_code_for_hz(half_hz.saturating_mul(2)) {
                 rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
-                self.yaesu_wf_meta_after = 0.0; // re-read span/mode on the next tick, not in 5 s
+                // Read it back SOON, but not in this tick — the first read after a set is answered with
+                // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_SECS.
+                self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
             }
         }
 
@@ -3016,7 +3030,9 @@ impl RadioLoop {
         let mode_request = engine_lock(engine).take_yaesu_scope_mode_request();
         if let Some(code) = mode_request {
             rig.send_raw_set(&crate::yaesu_wf::set_mode_command(code));
-            self.yaesu_wf_meta_after = 0.0; // read it back on the next tick
+            // Read it back SOON, but not in this tick — the first read after a set is answered with
+            // nothing, and this loop reads that as "the sweep is unknown". See YAESU_WF_SETTLE_SECS.
+            self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
         }
 
         // THE DIAL IS REFRESHED EVERY TICK; only the span and the mode are rare.
