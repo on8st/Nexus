@@ -269,21 +269,31 @@ pub fn auto_fix_span_code(dial_hz: f64) -> Option<u8> {
 /// Where a FIX window starts, for the span ACTUALLY in force: the tuned band's centre, minus half
 /// that span.
 ///
-/// ⚠️ AN ASSUMPTION ABOUT THE RADIO, not a reading of it. The FIX start is settable only by a long
-/// press on the front panel — checked against all 56 CAT commands and the whole `EX` menu — and it
-/// cannot be read either. So Nexus computes the window it would want and labels the bins with it,
-/// because the operator asked for FIX to work with no clicking (2026-08-20) and this is the only
-/// reading of "the scope, centred on the tuned band, at the minimal span that shows the whole band"
-/// that needs nothing from them.
+/// MEASURED ON THE RADIO, no longer assumed. The FIX start cannot be read over CAT — it is settable
+/// only by a long press on the front panel, checked against all 56 CAT commands and the whole `EX`
+/// menu — so Nexus has to derive it. It used to derive the window it would WANT: the band centred,
+/// `centre - span/2`. The FT-710 does not do that. It starts the window at the BAND EDGE, read off
+/// the rig's own scale on two bands whose predictions differ (ON8ST, 2026-08-20):
+///
+///   20 m, 500 kHz span:  centre-based 13.925-14.425   radio 14.000-14.500   (75 kHz out)
+///   80 m, 500 kHz span:  centre-based  3.400- 3.900   radio  3.500- 4.000   (100 kHz out)
+///
+/// Both bands were chosen because the two rules disagree there. 40 m, 30 m, 17 m and 12 m cannot
+/// tell them apart at all — their width equals the covering rung, so `lo == centre - span/2` — and
+/// a test on one of those would have "confirmed" whichever rule was already written.
+///
+/// The consequence of the old rule was not a blank panadapter but a WRONG one: every signal drawn
+/// 75-100 kHz from where it actually is, with nothing in the protocol able to reveal it.
 ///
 /// Taking the span as an ARGUMENT is what keeps it consistent: the bins always arrive at the rig's
 /// span, so the start has to be computed from the same number, whatever `auto_fix_span_code` may
 /// have asked for and whether or not the radio has honoured it yet.
 pub fn auto_fix_start(dial_hz: f64, span_code: u8) -> Option<f64> {
-    let (lo, hi) = band_edges_hz(dial_hz)?;
-    let span = span_hz(span_code)?;
-    let start = (lo + hi) / 2.0 - span / 2.0;
-    (start >= 0.0).then_some(start)
+    let (lo, _hi) = band_edges_hz(dial_hz)?;
+    // The span code still has to be a real rung: an unknown one means we do not know the width,
+    // and a start without a width places nothing.
+    span_hz(span_code)?;
+    Some(lo)
 }
 
 /// Where the sweep sits relative to the dial. The operator-facing choice, three ways.
@@ -1429,10 +1439,10 @@ mod tests {
     fn twenty_metres_asks_for_the_narrowest_span_that_covers_it() {
         // 14.000-14.350 is 350 kHz wide: 200 kHz does not cover it, 500 kHz does.
         assert_eq!(auto_fix_span_code(14_074_000.0), Some(b'8'), "500 kHz");
-        // And at that span the window is the band, centred: 14.175 ± 250 kHz.
+        // And at that span the window starts at the BAND EDGE, as the radio does: 14.000-14.500.
         let start = auto_fix_start(14_074_000.0, b'8').expect("placeable");
-        assert_eq!(start, 13_925_000.0);
-        assert!(start < 14_000_000.0 && start + 500_000.0 > 14_350_000.0, "band inside");
+        assert_eq!(start, 14_000_000.0, "the radio starts FIX at the band edge");
+        assert!(start <= 14_000_000.0 && start + 500_000.0 >= 14_350_000.0, "band inside");
     }
 
     #[test]
@@ -1441,14 +1451,15 @@ mod tests {
         // from the span we merely asked for draws a window of the wrong width — and it looks
         // entirely plausible. Observed on the bench: a 500 kHz-derived start (13.925) paired with
         // the rig's real 200 kHz span drew 13.925-14.125, which is not the 20 m band by 225 kHz.
-        assert_eq!(auto_fix_start(14_074_000.0, b'8'), Some(13_925_000.0), "500 kHz: 14.175 ± 250k");
-        assert_eq!(auto_fix_start(14_074_000.0, b'7'), Some(14_075_000.0), "200 kHz: 14.175 ± 100k");
-        assert_eq!(auto_fix_start(14_074_000.0, b'9'), Some(13_675_000.0), "1 MHz: 14.175 ± 500k");
-        // Whatever the span, the band's centre stays in the middle of the window.
+        // The start is the band edge whatever the span; the SPAN still decides the width, which is
+        // what the bins arrive at. A start paired with the wrong width is the fault this pins.
         for code in [b'5', b'6', b'7', b'8', b'9'] {
-            let start = auto_fix_start(14_074_000.0, code).expect("placeable");
-            let span = span_hz(code).unwrap();
-            assert!((start + span / 2.0 - 14_175_000.0).abs() < 1.0, "centred at {}", code as char);
+            assert_eq!(
+                auto_fix_start(14_074_000.0, code),
+                Some(14_000_000.0),
+                "band edge at span {}",
+                code as char
+            );
         }
     }
 
@@ -1461,14 +1472,14 @@ mod tests {
     }
 
     #[test]
-    fn every_band_in_the_table_is_coverable_and_centred() {
+    fn every_band_in_the_table_is_coverable_from_its_edge() {
         for dial in [1_850_000.0, 3_600_000.0, 7_100_000.0, 14_074_000.0, 21_074_000.0, 24_915_000.0] {
             let (lo, hi) = band_edges_hz(dial).expect("a band");
             let code = auto_fix_span_code(dial).expect("coverable");
             let start = auto_fix_start(dial, code).expect("placeable");
             let end = start + span_hz(code).unwrap();
-            assert!(start <= lo && end >= hi, "band {lo}-{hi} inside {start}-{end}");
-            assert!(((lo - start) - (end - hi)).abs() < 1.0, "centred");
+            assert_eq!(start, lo, "the window starts at the band edge");
+            assert!(end >= hi, "band {lo}-{hi} inside {start}-{end}");
         }
         // 10 m (1.7 MHz) and 6 m (2 MHz) exceed the 1 MHz top rung: no window covers them, and
         // saying so beats drawing a third of the band as though it were all of it.
