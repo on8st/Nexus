@@ -75,6 +75,31 @@ const RF_SPANS = [
   { label: '±5k', lo: -5_000, hi: 5_000, title: '±5 kHz around your dial' },
 ] as const
 
+/** The FT-710's OWN span ladder (CAT reference, `SS` P2=5) — these command the RADIO, not a crop.
+ *
+ *  The operator's expectation, and it is the right one: the app's panadapter should reflect the
+ *  radio's, its settings and its width. Cropping the row client-side shows a narrower window of the
+ *  SAME sweep — ±5 kHz out of 200 kHz is ~42 of 850 bins stretched across the panel, which is why
+ *  it looked coarse. Asking the RADIO for a 10 kHz sweep puts all 850 bins across it: 12 Hz per bin
+ *  instead of 235.
+ *
+ *  `label` is the radio's own name for the rung (the FT-710 menu says "200 kHz", never "±100k").
+ *  `halfHz` is what goes on the wire, because `setScopeSpan` was written for Icom CI-V 27 15 and its
+ *  argument is ± half the sweep; the backend doubles it back. Every rung the rig has is offered —
+ *  a span it cannot sweep is refused rather than rounded, so the two ladders cannot drift apart. */
+const YAESU_SPANS = [
+  { label: '1k', halfHz: 500 },
+  { label: '2k', halfHz: 1_000 },
+  { label: '5k', halfHz: 2_500 },
+  { label: '10k', halfHz: 5_000 },
+  { label: '20k', halfHz: 10_000 },
+  { label: '50k', halfHz: 25_000 },
+  { label: '100k', halfHz: 50_000 },
+  { label: '200k', halfHz: 100_000 },
+  { label: '500k', halfHz: 250_000 },
+  { label: '1M', halfHz: 500_000 },
+] as const
+
 /** RIG scope-span presets (native Icom CI-V) — command the RADIO's real panadapter sweep width
  *  via CI-V 27 15, exactly as the Phone cockpit does. */
 const RIG_SPANS = [
@@ -352,6 +377,9 @@ export function CwCockpit({
     null,
   )
   const nativeRf = scopeFeed != null && isRfScopeSource(scopeFeed.source)
+  // The FT-710's span is commandable over plain CAT, so its row is the rig's own ladder rather
+  // than a client-side crop — the app then shows exactly what the radio sweeps. Mirror of Phone.
+  const yaesuRf = scopeFeed?.source === 'yaesu'
   const civScope = scopeFeed?.source === 'civ'
   const flexScope = scopeFeed?.source === 'flex'
   const [flexRefDbm, setFlexRefDbm] = useState(-80)
@@ -1341,7 +1369,23 @@ export function CwCockpit({
           <span className="ph-scope-head-label">Colors</span>
           <PalettePicker />
         </div>
-        {nativeRf && (
+        {yaesuRf && (
+          // The FT-710 sweeps its own span, so these command the RADIO (mirror of Phone).
+          <div className="ph-span" role="group" aria-label="Panadapter span">
+            {YAESU_SPANS.map((sp) => (
+              <button
+                key={sp.label}
+                type="button"
+                className="theme-chip"
+                title={`Sweep ${sp.label}Hz on the radio — the app follows what it reports`}
+                onClick={() => void setScopeSpan(sp.halfHz).then((s) => onSnap?.(s)).catch(() => {})}
+              >
+                {sp.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {nativeRf && !yaesuRf && (
           // Native RF panadapter: client-side RF-width zoom around the dial (mirror of Phone).
           <div className="ph-span" role="group" aria-label="Panadapter zoom">
             {RF_SPANS.map((sp) => (
@@ -1365,8 +1409,8 @@ export function CwCockpit({
           transmitting={snap.radio.transmitting}
           theme={theme}
           smeterDb={smeterDb}
-          viewLoHz={nativeRf ? rfSpan.lo : cwView.loHz}
-          viewHiHz={nativeRf ? rfSpan.hi : cwView.hiHz}
+          viewLoHz={yaesuRf ? -1e9 : nativeRf ? rfSpan.lo : cwView.loHz}
+          viewHiHz={yaesuRf ? 1e9 : nativeRf ? rfSpan.hi : cwView.hiHz}
           markerHz={nativeRf ? undefined : pitch}
           sideband={scopeMode}
           dialHz={snap.radio.dialMhz > 0 ? Math.round(snap.radio.dialMhz * 1e6) : null}

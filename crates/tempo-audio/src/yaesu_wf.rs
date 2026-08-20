@@ -157,6 +157,29 @@ pub fn span_hz(code: u8) -> Option<f64> {
     })
 }
 
+/// The `SS` SPAN code for a span in Hz, or `None` when the rig has no such step.
+///
+/// The inverse of [`span_hz`], and deliberately EXACT: the radio's ladder is a fixed set of ten
+/// steps (FT-710 CAT reference, `SS` P2=5), and asking for 15 kHz is not a request the rig can
+/// honour. Rounding to a neighbour would leave the app showing one width while the radio swept
+/// another — the same class of quiet mismatch this module exists to refuse.
+pub fn span_code_for_hz(hz: u32) -> Option<u8> {
+    (b'0'..=b'9').find(|&c| span_hz(c) == Some(hz as f64))
+}
+
+/// The raw CAT string that SETS the scope span. `SS<P1=0><P2=5><P3=code><P4..P7=0>;`
+///
+/// The rig does not answer a set (measured), so this goes out through `Rig::send_raw_set`.
+pub fn set_span_command(code: u8) -> String {
+    format!("SS05{}0000;", code as char)
+}
+
+/// The raw CAT string that SETS the scope mode — same shape, `P2=6`. `4` is W/F CENTER (NORMAL),
+/// the only family whose sweep edges this module can place on the band.
+pub fn set_mode_command(code: u8) -> String {
+    format!("SS06{}0000;", code as char)
+}
+
 /// Is the scope's `P3` MODE code one of the CENTER modes — i.e. is the span centred on the dial?
 ///
 /// `SS<P1>6;` reports it. CENTER (`3`, `4` for W/F; `0` for 3DSS) means the row is symmetric about
@@ -949,6 +972,55 @@ mod tests {
         let end = frame_end(&w).expect("the complete frame is found");
         assert_eq!(end, 1_234 + FRAME_BYTES);
         assert_eq!(w[end - FRAME_BYTES], 0x77, "cut starts at the frame, not in the tail");
+    }
+
+
+    // ── Commanding the radio's own span ─────────────────────────────────────────────────────────
+    //
+    // Operator, 2026-08-20: "I expect the panadapter in the app to reflect the panadapter in the
+    // radio (its settings and width)." Cropping the row client-side does the opposite — it shows a
+    // narrower window of the SAME coarse sweep, ~42 of 850 bins stretched across the panel.
+
+    #[test]
+    fn every_rung_of_the_rigs_ladder_round_trips() {
+        // The ladder is the radio's, not ours: 1, 2, 5, 10, 20, 50, 100, 200, 500 kHz and 1 MHz
+        // (FT-710 CAT reference, SS P2=5). A code that survives Hz and back is a code the rig has.
+        for c in b'0'..=b'9' {
+            let hz = span_hz(c).expect("every code 0-9 is a documented span");
+            assert_eq!(span_code_for_hz(hz as u32), Some(c), "code {}", c as char);
+        }
+    }
+
+    #[test]
+    fn a_span_the_radio_cannot_sweep_is_refused_not_rounded() {
+        // The whole point of an exact map. 15 kHz sits between two rungs; rounding it would leave
+        // the app drawing one width while the rig swept another, and nothing would report the
+        // difference — the app's axis would simply be wrong.
+        assert_eq!(span_code_for_hz(15_000), None);
+        assert_eq!(span_code_for_hz(0), None);
+        assert_eq!(span_code_for_hz(2_000_000), None);
+        // And the ones it CAN: the two the old client-side presets came closest to.
+        assert_eq!(span_code_for_hz(10_000), Some(b'3'));
+        assert_eq!(span_code_for_hz(50_000), Some(b'5'));
+        // And the doubling the caller does: the engine's span request is a ± HALF-width (Icom
+        // CI-V 27 15), while `SS` P2=5 names the full span. A UI chip labelled 200k sends 100k.
+        assert_eq!(span_code_for_hz(100_000u32 * 2), Some(b'7'), "±100k is the 200 kHz rung");
+        assert_eq!(span_code_for_hz(5_000u32 * 2), Some(b'3'), "±5k is the 10 kHz rung");
+    }
+
+    #[test]
+    fn a_set_command_has_the_shape_the_radio_answers_a_read_with() {
+        // `SS<P1><P2><P3><P4..P7>;` — P4..P7 fixed at 0. The read of the same field comes back in
+        // exactly this shape (`SS0570000;` measured on the bench), which is the cheapest available
+        // check that the set is well formed.
+        assert_eq!(set_span_command(b'7'), "SS0570000;");
+        assert_eq!(set_span_command(b'3'), "SS0530000;");
+        // Mode 4 = W/F CENTER (NORMAL), the family whose edges `sweep_edges` can place.
+        assert_eq!(set_mode_command(b'4'), "SS0640000;");
+        // A set is the read's shape with P3 filled in, so parsing it back must yield the code —
+        // the same function the reply path uses, pointed at what we are about to send.
+        assert_eq!(parse_ss_reply(&set_span_command(b'7'), b'5'), Some(b'7'));
+        assert_eq!(parse_ss_reply(&set_mode_command(b'4'), b'6'), Some(b'4'));
     }
 
 }

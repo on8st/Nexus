@@ -884,6 +884,36 @@ impl Rig {
     /// `read_mode` (the `m` command) can return the mode Hamlib *thinks* it set even when the
     /// rig never moved, whereas e.g. raw Yaesu `MD0;` returns the rig's TRUE current mode code
     /// off the wire. Diagnostic-only; `None` if not a CAT rig or no reply.
+    /// Send a raw CAT string that the rig does NOT answer — a SET.
+    ///
+    /// Measured against Hamlib 4.7.0 on an FT-710: a read (`w SS05;`) comes back as
+    /// `SS0570000;\0`, but a set (`w SS0570000;`) returns NOTHING AT ALL — not even an `RPRT`.
+    /// Putting a set through `send_raw` therefore burns the whole reply deadline, returns
+    /// TimedOut, and drops the CAT connection, which is a heavy price for a command that worked.
+    /// So this writes and does not wait. Any late bytes are harmless: `command_inner` drains
+    /// stale bytes before every command precisely so a straggler cannot be read as the next
+    /// command's answer.
+    ///
+    /// Returns whether the bytes went out — NOT whether the radio honoured them, which nothing
+    /// on this path can know. The caller confirms by reading the value back.
+    pub fn send_raw_set(&mut self, raw: &str) -> bool {
+        if self.control.is_none() {
+            return false;
+        }
+        let line = format!("w {raw}\n");
+        let Ok(stream) = self.ensure_connected() else {
+            return false;
+        };
+        use std::io::Write as _;
+        match stream.write_all(line.as_bytes()) {
+            Ok(()) => true,
+            Err(_) => {
+                self.stream = None; // force a clean reconnect, same as `command_with_deadline`
+                false
+            }
+        }
+    }
+
     pub fn send_raw(&mut self, raw: &str) -> Option<String> {
         self.control.as_ref()?;
         let reply = self.command(&format!("w {raw}\n")).ok()?;

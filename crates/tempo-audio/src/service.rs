@@ -2980,6 +2980,36 @@ impl RadioLoop {
             return; // not wanted, or the retry is not due yet — the message set above stands
         };
 
+        // Span requests from the UI, honoured on the RADIO rather than by cropping the row.
+        //
+        // The operator's expectation, and it is the right one: the app's panadapter should reflect
+        // the radio's — its settings and its width. Cropping an 850-bin sweep client-side to ±5 kHz
+        // out of 200 kHz leaves ~42 bins stretched across the panel, which is a coarse picture of
+        // the same sweep; asking the RADIO for 10 kHz puts all 850 bins across it, 12 Hz per bin
+        // instead of 235. Same request path the Icom scope uses (`take_scope_span_request`), which
+        // on a Yaesu is consumed here because there is no CI-V driver to consume it.
+        //
+        // A span the rig has no step for is DROPPED rather than rounded — see `span_code_for_hz`.
+        // The displayed width follows from the next `SS05;` read, so the app never claims a width
+        // it merely asked for.
+        //
+        // ⚠️ THE REQUEST IS A HALF-WIDTH. `set_scope_span` was written for Icom CI-V 27 15, whose
+        // argument is ± half the sweep, and its whole UI speaks in ±25k/±50k. Yaesu's `SS` P2=5
+        // names the FULL span (200 kHz, not ±100k), so it is doubled here rather than giving the
+        // one engine field two meanings depending on which radio is attached.
+        // The lock is taken and RELEASED before the CAT write, deliberately: an `if let` whose
+        // scrutinee is `engine_lock(...)` keeps the guard alive for the whole body, which would
+        // hold the engine mutex across blocking serial I/O. That is the exact stall this file
+        // already carries scars from — the boundary CAT block that froze the waterfall for ~1 s
+        // every 15 s in every mode. Clippy's `significant_drop_in_scrutinee` caught it here.
+        let span_request = engine_lock(engine).take_scope_span_request();
+        if let Some(half_hz) = span_request {
+            if let Some(code) = crate::yaesu_wf::span_code_for_hz(half_hz.saturating_mul(2)) {
+                rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
+                self.yaesu_wf_meta_after = 0.0; // re-read span/mode on the next tick, not in 5 s
+            }
+        }
+
         // THE DIAL IS REFRESHED EVERY TICK; only the span and the mode are rare.
         //
         // The dial costs nothing to read — it is Nexus's own state, not a CAT round-trip — and it

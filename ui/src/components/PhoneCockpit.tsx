@@ -203,6 +203,31 @@ const RF_SPANS = [
   { label: '±5k', lo: -5_000, hi: 5_000, title: '±5 kHz around your dial' },
 ] as const
 
+/** The FT-710's OWN span ladder (CAT reference, `SS` P2=5) — these command the RADIO, not a crop.
+ *
+ *  The operator's expectation, and it is the right one: the app's panadapter should reflect the
+ *  radio's, its settings and its width. Cropping the row client-side shows a narrower window of the
+ *  SAME sweep — ±5 kHz out of 200 kHz is ~42 of 850 bins stretched across the panel, which is why
+ *  it looked coarse. Asking the RADIO for a 10 kHz sweep puts all 850 bins across it: 12 Hz per bin
+ *  instead of 235.
+ *
+ *  `label` is the radio's own name for the rung (the FT-710 menu says "200 kHz", never "±100k").
+ *  `halfHz` is what goes on the wire, because `setScopeSpan` was written for Icom CI-V 27 15 and its
+ *  argument is ± half the sweep; the backend doubles it back. Every rung the rig has is offered —
+ *  a span it cannot sweep is refused rather than rounded, so the two ladders cannot drift apart. */
+const YAESU_SPANS = [
+  { label: '1k', halfHz: 500 },
+  { label: '2k', halfHz: 1_000 },
+  { label: '5k', halfHz: 2_500 },
+  { label: '10k', halfHz: 5_000 },
+  { label: '20k', halfHz: 10_000 },
+  { label: '50k', halfHz: 25_000 },
+  { label: '100k', halfHz: 50_000 },
+  { label: '200k', halfHz: 100_000 },
+  { label: '500k', halfHz: 250_000 },
+  { label: '1M', halfHz: 500_000 },
+] as const
+
 /** RIG scope-span presets (native Icom CI-V only) — these change the RADIO's real panadapter
  *  sweep width via CI-V 27 15 (± half-width in Hz), from the rig's own span table. Unlike the
  *  client-side RF zoom above, this commands the hardware. */
@@ -306,6 +331,10 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
   // framing (the "RX audio" label and the audio-Hz span chips) so the operator sees ONE unambiguous
   // display — the panadapter — instead of RF spectrum wrapped in audio-passband chrome.
   const nativeRf = scopeFeed != null && isRfScopeSource(scopeFeed.source)
+  // The FT-710 is the one native scope whose SPAN this app can command over plain CAT, so its
+  // control row is the rig's own ladder rather than a client-side crop. Icom/Flex keep the crop:
+  // their hardware span already has its own row (RIG_SPANS / FLEX_SPANS) further down.
+  const yaesuRf = scopeFeed?.source === 'yaesu'
   // True only when the rig's own Icom scope is streaming (span/ref are Icom CI-V commands; the
   // Flex panadapter has a different control path, so gate on 'civ' specifically, not any RF feed).
   const civScope = scopeFeed?.source === 'civ'
@@ -1179,7 +1208,23 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
           <PalettePicker />
         </div>
         <div className="ph-scope-wrap" ref={scopeRef} title="Scroll here to tune the VFO">
-          {nativeRf ? (
+          {yaesuRf ? (
+            // The FT-710 sweeps its own span, so these command the RADIO and the app draws whatever
+            // comes back — see YAESU_SPANS for why cropping the row was the wrong answer.
+            <div className="ph-span" role="group" aria-label="Panadapter span">
+              {YAESU_SPANS.map((sp) => (
+                <button
+                  key={sp.label}
+                  type="button"
+                  className="theme-chip"
+                  title={`Sweep ${sp.label}Hz on the radio — the app follows what it reports`}
+                  onClick={() => void setScopeSpan(sp.halfHz).then((s) => onSnap?.(s)).catch(() => {})}
+                >
+                  {sp.label}
+                </button>
+              ))}
+            </div>
+          ) : nativeRf ? (
             // Native RF panadapter: RF-width zoom around the dial (not audio-passband slices).
             <div className="ph-span" role="group" aria-label="Panadapter zoom">
               {RF_SPANS.map((sp) => (
@@ -1215,8 +1260,8 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
             transmitting={snap.radio.transmitting}
             theme={theme}
             smeterDb={smeterDb}
-            viewLoHz={nativeRf ? rfSpan.lo : 0}
-            viewHiHz={nativeRf ? rfSpan.hi : (span.widthHz || Math.min(4000, Math.max(800, filterHz ?? 4000)))}
+            viewLoHz={yaesuRf ? -1e9 : nativeRf ? rfSpan.lo : 0}
+            viewHiHz={yaesuRf ? 1e9 : nativeRf ? rfSpan.hi : (span.widthHz || Math.min(4000, Math.max(800, filterHz ?? 4000)))}
             carrierCentered={!nativeRf}
             sideband={commandedMode}
             dialHz={snap.radio.dialMhz > 0 ? Math.round(snap.radio.dialMhz * 1e6) : null}
