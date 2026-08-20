@@ -3149,7 +3149,7 @@ impl RadioLoop {
             meta_before.and_then(|m| crate::yaesu_wf::position_of(m.mode_code)),
             Some(crate::yaesu_wf::ScopePosition::Fix)
         ) {
-            if let Some((_, _, code)) = crate::yaesu_wf::auto_fix_window(dial_hz_for_span) {
+            if let Some(code) = crate::yaesu_wf::auto_fix_span_code(dial_hz_for_span) {
                 if meta_before.map(|m| m.span_code) != Some(code) {
                     rig.send_raw_set(&crate::yaesu_wf::set_span_command(code));
                     self.yaesu_wf_meta_after = now + YAESU_WF_SETTLE_SECS;
@@ -3259,9 +3259,11 @@ impl RadioLoop {
             // one they described: the tuned band, centred, in the narrowest span that covers it —
             // `start = centre - span/2`. A hand-written `yaesuFixStarts` entry still wins, as an
             // escape hatch for a radio whose own window does not match; nothing in the UI writes it.
-            let fix_start = fix_start_mhz
-                .map(|mhz| mhz * 1_000_000.0)
-                .or_else(|| crate::yaesu_wf::auto_fix_window(dial_hz).map(|(start, _, _)| start));
+            let fix_start = fix_start_mhz.map(|mhz| mhz * 1_000_000.0).or_else(|| {
+                // From the span the radio reports, not the one we asked for — see `auto_fix_start`.
+                let span = guard.map(|m| m.span_code).or(polled.and_then(|(s, _)| s))?;
+                crate::yaesu_wf::auto_fix_start(dial_hz, span)
+            });
             let keep_stale = now - self.yaesu_wf_read_ok <= YAESU_WF_STALE_SECS;
             *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start, keep_stale);
             *guard
