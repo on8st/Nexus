@@ -2517,7 +2517,11 @@ struct RadioLoop {
     /// is the centre) and for FIX (the window is a preset nothing reports).
     yaesu_wf_anchor: Option<f64>,
     /// Whether the sweep was placeable on the previous tick — so the log names TRANSITIONS only.
-    yaesu_wf_placed: bool,
+    ///
+    /// `None` means "not yet evaluated", and it exists so the FIRST verdict is always logged. With a
+    /// bare `bool` starting false, a sweep that was never placeable printed nothing at all — which is
+    /// precisely the case one wants to read about.
+    yaesu_wf_placed: Option<bool>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2796,7 +2800,7 @@ impl RadioLoop {
             yaesu_wf_started: 0.0,
             yaesu_wf_retry_after: 0.0,
             yaesu_wf_anchor: None,
-            yaesu_wf_placed: false,
+            yaesu_wf_placed: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -3203,8 +3207,8 @@ impl RadioLoop {
             *guard
         };
 
-        if meta_now.is_none() && self.yaesu_wf_placed {
-            self.yaesu_wf_placed = false;
+        if meta_now.is_none() && self.yaesu_wf_placed != Some(false) {
+            self.yaesu_wf_placed = Some(false);
             eprintln!("yaesu-wf: CANNOT place — span/mode unknown (a CAT read failed this tick)");
         }
         let mut e = engine_lock(engine);
