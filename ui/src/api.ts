@@ -1096,6 +1096,14 @@ export async function setFilterWidth(hz: number): Promise<AppSnapshot> {
 export async function setScopeSpan(hz: number): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('set_scope_span', { hz })
 }
+/** Tell Nexus where the FT-710's FIX sweep starts — its LEFT edge, in MHz.
+ *
+ * The radio reports this nowhere (it is set by a long press on FIX), so the operator states it and
+ * the span finishes the window. Held per band, as the radio holds it. */
+export async function setYaesuFixStart(mhz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_yaesu_fix_start', { mhz })
+}
+
 /** Set the FT-710 scope POSITION — 'center' | 'cursor' | 'fix'.
  *
  * The position travels by name and the rig's display family (3DSS / W-F EXPAND / W-F NORMAL) is

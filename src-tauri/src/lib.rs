@@ -10825,6 +10825,21 @@ fn set_filter_width(state: State<'_, SharedEngine>, hz: u32) -> Result<AppSnapsh
 }
 
 /// Set the native Icom scope SPAN (± half-width, Hz); applied to the rig by the radio loop.
+/// State where the FT-710's FIX sweep starts — its LEFT EDGE, in MHz.
+///
+/// Called right after the operator long-presses FIX on the radio, when the dial is the start. The
+/// rig's own scale reads `start` → `start + span`, so the span (which Nexus does read) finishes the
+/// window. Held against the current band, because the radio keeps one start per band.
+#[tauri::command(async)]
+fn set_yaesu_fix_start(state: State<'_, SharedEngine>, mhz: f64) -> Result<AppSnapshot, String> {
+    if !(mhz.is_finite() && mhz > 0.0) {
+        return Err(format!("implausible FIX start {mhz} MHz"));
+    }
+    let mut eng = engine_lock(&state);
+    eng.request_yaesu_fix_start(mhz * 1_000_000.0);
+    Ok(eng.snapshot())
+}
+
 /// Set the FT-710 scope POSITION — CENTER, CURSOR or FIX.
 ///
 /// The caller sends the position by name; the display family (3DSS / W-F EXPAND / W-F NORMAL) is
@@ -17345,6 +17360,7 @@ pub fn run() {
             set_filter_width,
             set_scope_span,
             set_yaesu_scope_mode,
+            set_yaesu_fix_start,
             set_scope_ref,
             set_flex_pan_span,
             set_flex_pan_ref,

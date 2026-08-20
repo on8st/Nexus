@@ -1036,11 +1036,13 @@ fn yaesu_wf_next_meta(
     dial_hz: f64,
     polled: Option<(Option<u8>, Option<u8>)>,
     anchor_hz: Option<f64>,
+    fix_start_hz: Option<f64>,
 ) -> Option<crate::yaesu_wf::SweepMeta> {
     match polled {
         Some((Some(span_code), Some(mode_code))) => Some(crate::yaesu_wf::SweepMeta {
             dial_hz,
             center_hz: anchor_hz,
+            fix_start_hz,
             span_code,
             mode_code,
         }),
@@ -1050,6 +1052,7 @@ fn yaesu_wf_next_meta(
             // The anchor is re-stated every tick, not inherited: it is owned by
             // `yaesu_wf_next_anchor`, which drops it the moment the mode stops being CURSOR.
             center_hz: anchor_hz,
+            fix_start_hz,
             ..m
         }),
     }
@@ -2503,6 +2506,8 @@ struct RadioLoop {
     /// Where a CURSOR sweep is centred — see `yaesu_wf_next_anchor`. `None` for CENTER (the dial
     /// is the centre) and for FIX (the window is a preset nothing reports).
     yaesu_wf_anchor: Option<f64>,
+    /// Where a FIX sweep starts, and the BAND that was stated for — see the read site.
+    yaesu_wf_fix_start: Option<(String, f64)>,
     /// Native FlexRadio DAX audio worker (Phase 2). `Some` only while `flex_native_audio` is on
     /// and a network Flex is active; its 12 kHz audio then replaces the soundcard as the RX source,
     /// and its `tx_tee` replaces the soundcard as the TX route (BOTH directions — see the
@@ -2781,6 +2786,7 @@ impl RadioLoop {
             yaesu_wf_started: 0.0,
             yaesu_wf_retry_after: 0.0,
             yaesu_wf_anchor: None,
+            yaesu_wf_fix_start: None,
             cur_tier: Tier::TempoFast,
             // Rebuilt on the first tick that disagrees; the clock below is
             // constructed from the same source of truth.
@@ -3084,6 +3090,14 @@ impl RadioLoop {
             }
         }
 
+        // The operator stating where FIX starts. Stamped with the band it was stated on, because
+        // the radio keeps a start PER BAND and a 20 m window drawn on 40 m is not a small error.
+        let fix_request = engine_lock(engine).take_yaesu_fix_start_request();
+        if let Some(hz) = fix_request {
+            let b = engine_lock(engine).settings().band.clone();
+            self.yaesu_wf_fix_start = Some((b, hz));
+        }
+
         // The scope POSITION, same shape as the span above and the same reason for the scope of
         // the lock. The code arrives ready-made from `mode_code_for`, which keeps the operator in
         // whichever display family the rig is already using.
@@ -3104,9 +3118,10 @@ impl RadioLoop {
         // sees a garbled spectrum rather than an honestly blank one (station report, 2026-08-19,
         // tuning across 20 m). The old comment claimed "the dial we already poll", which was true and
         // beside the point — it was polled and then not used until the next CAT read.
-        let dial_hz = {
+        let (dial_hz, band) = {
             let e = engine_lock(engine);
-            e.settings().dial_mhz * 1_000_000.0
+            let s = e.settings();
+            (s.dial_mhz * 1_000_000.0, s.band.clone())
         };
         let polled = if now >= self.yaesu_wf_meta_after {
             self.yaesu_wf_meta_after = now + YAESU_WF_META_SECS;
@@ -3142,7 +3157,15 @@ impl RadioLoop {
                 dial_hz,
             );
             self.yaesu_wf_anchor = anchor;
-            *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor);
+            // The FIX start is held against the BAND it was stated on: the radio keeps a separate
+            // one per band, so carrying a 20 m start onto 40 m would draw a window that is simply
+            // somewhere else. A band change therefore makes it unknown until the operator says
+            // where FIX starts there — the same refusal every other unknown gets here.
+            let fix_start = match &self.yaesu_wf_fix_start {
+                Some((b, hz)) if *b == band => Some(*hz),
+                _ => None,
+            };
+            *guard = yaesu_wf_next_meta(*guard, dial_hz, polled, anchor, fix_start);
             *guard
         };
 
@@ -21450,6 +21473,7 @@ mod tests {
         crate::yaesu_wf::SweepMeta {
             dial_hz: dial,
             center_hz: None,
+            fix_start_hz: None,
             span_code: span,
             mode_code: mode,
         }
@@ -21460,7 +21484,7 @@ mod tests {
         // The garbling: span/mode are polled every 5 s, the dial moves continuously. A tick with no
         // poll must still carry the CURRENT dial, or rows land where the operator used to be — on a
         // 200 kHz span, 70 kHz of tuning is a third of the width.
-        let out = yaesu_wf_next_meta(Some(meta(14_150_000.0, b'7', b'4')), 14_220_400.0, None, None)
+        let out = yaesu_wf_next_meta(Some(meta(14_150_000.0, b'7', b'4')), 14_220_400.0, None, None, None)
             .expect("a known sweep stays known");
         assert_eq!(out.dial_hz, 14_220_400.0, "the dial must follow the radio");
         assert_eq!((out.span_code, out.mode_code), (b'7', b'4'), "codes are not re-guessed");
@@ -21472,9 +21496,9 @@ mod tests {
         // rig's scope to FIX means every row keeps a centred assumption that is now false, and
         // `sweep_edges` never gets the chance to refuse it. Either read failing is enough.
         let prev = Some(meta(14_150_000.0, b'7', b'4'));
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4'))), None).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None)), None).is_none());
-        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, Some(b'4'))), None, None).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((Some(b'7'), None)), None, None).is_none());
+        assert!(yaesu_wf_next_meta(prev, 14_150_000.0, Some((None, None)), None, None).is_none());
     }
 
     #[test]
@@ -21483,6 +21507,7 @@ mod tests {
             Some(meta(14_150_000.0, b'7', b'4')),
             21_074_000.0,
             Some((Some(b'3'), Some(b'0'))),
+            None,
             None,
         )
         .expect("a complete read is a known sweep");
@@ -21496,7 +21521,7 @@ mod tests {
     fn an_unknown_sweep_is_not_invented_by_a_tick_that_asked_nothing() {
         // Before the first successful poll there is no span and no mode, and a tick that spends no
         // CAT round-trip learns neither. It must stay unknown — a dial alone places nothing.
-        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None).is_none());
+        assert!(yaesu_wf_next_meta(None, 14_150_000.0, None, None, None).is_none());
     }
 
 

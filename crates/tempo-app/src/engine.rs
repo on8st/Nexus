@@ -1993,6 +1993,8 @@ pub struct Engine {
     pending_scope_span: Option<u32>,
     /// Queued Yaesu scope position as an `SS` P3 code — see `request_yaesu_scope_mode`.
     pending_yaesu_scope_mode: Option<u8>,
+    /// Queued FIX start in Hz — see `request_yaesu_fix_start`.
+    pending_yaesu_fix_start: Option<f64>,
     pending_scope_ref: Option<i32>,
     pending_scope_fixed: Option<bool>,
     /// FlexRadio native-panadapter controls (read continuously by the FlexSpectrum worker, which
@@ -3678,6 +3680,7 @@ impl Engine {
             pending_passband: None,
             pending_scope_span: None,
             pending_yaesu_scope_mode: None,
+            pending_yaesu_fix_start: None,
             pending_scope_ref: None,
             flex_pan_span_hz: 200_000.0,
             flex_pan_ref_dbm: None,
@@ -6706,6 +6709,18 @@ impl Engine {
     /// Queue a native-scope REFERENCE-level change (tenths of a dB, −200..+200) from the UI.
     pub fn request_scope_ref(&mut self, ref_tenths_db: i32) {
         self.pending_scope_ref = Some(ref_tenths_db);
+    }
+    /// State where the rig's FIX sweep STARTS — its left edge, in Hz.
+    ///
+    /// The radio reports this nowhere: the start is set by a long press on FIX, a front-panel-only
+    /// action, and the whole `EX` menu was searched without finding it. The operator therefore
+    /// states it, and the natural moment is right after the long press, when the dial IS the start.
+    pub fn request_yaesu_fix_start(&mut self, hz: f64) {
+        self.pending_yaesu_fix_start = Some(hz);
+    }
+    /// Take the queued FIX start, if any.
+    pub fn take_yaesu_fix_start_request(&mut self) -> Option<f64> {
+        self.pending_yaesu_fix_start.take()
     }
     /// Queue a Yaesu scope POSITION change from the UI — CENTER, CURSOR or FIX.
     ///

@@ -42,6 +42,7 @@ import {
   setAgc,
   setScopeSpan,
   setYaesuScopeMode,
+  setYaesuFixStart,
   setScopeRef,
   setFlexPanSpan,
   setFlexPanRef,
@@ -1421,6 +1422,20 @@ export function CwCockpit({
               <option value="cursor">Cursor</option>
               <option value="fix">Fix</option>
             </select>
+            {yaesuPosition === 'fix' && (
+              // The radio reports no FIX start — it is set by a long press on FIX, front panel only —
+              // and its own scale reads start → start + span. So the operator states the start, and the
+              // moment to do it is right after the long press, when the dial IS the start. Held per
+              // band, as the radio holds it.
+              <button
+                type="button"
+                className="theme-chip"
+                title="Long-press FIX on the radio at the start frequency, then click this: Nexus takes your current dial as the left edge of the fixed window."
+                onClick={() => void setYaesuFixStart(snap.radio.dialMhz).then((s) => onSnap?.(s)).catch(() => {})}
+              >
+                FIX starts here
+              </button>
+            )}
           </div>
         ) : null}
         {nativeRf && !yaesuRf && (

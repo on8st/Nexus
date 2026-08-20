@@ -282,7 +282,7 @@ pub fn mode_is_centered(code: u8) -> bool {
 /// below 0 Hz. Every one of those is "we do not know where this row sits", and the honest response
 /// is to render no row rather than a mislabelled one.
 pub fn sweep_edges(dial_hz: f64, span_code: u8, mode_code: u8) -> Option<(f64, f64)> {
-    sweep_edges_anchored(dial_hz, span_code, mode_code, None)
+    sweep_edges_anchored(dial_hz, span_code, mode_code, None, None)
 }
 
 /// Absolute row edges, with an optional ANCHOR for a sweep that is not centred on the dial.
@@ -301,15 +301,24 @@ pub fn sweep_edges_anchored(
     span_code: u8,
     mode_code: u8,
     anchor_hz: Option<f64>,
+    fix_start_hz: Option<f64>,
 ) -> Option<(f64, f64)> {
+    let span = span_hz(span_code)?;
+    // FIX first, because it is the one position whose window is given by an EDGE. The rig's own
+    // scale reads `start` → `start + span`, so once the start is known the span finishes it — no
+    // centring, and no dial in the arithmetic at all: in FIX the operator may tune right out of the
+    // window and it stays where it is.
+    if matches!(position_of(mode_code), Some(ScopePosition::Fix)) {
+        let start = fix_start_hz?;
+        return (start >= 0.0).then_some((start, start + span));
+    }
     let centered = mode_is_centered(mode_code);
     let cursor = matches!(position_of(mode_code), Some(ScopePosition::Cursor));
     let center = match (centered, cursor, anchor_hz) {
         (true, _, _) => dial_hz,
         (false, true, Some(a)) => a,
-        _ => return None, // FIX, or CURSOR with no anchor established
+        _ => return None, // CURSOR with no anchor established, or a mode we do not know
     };
-    let span = span_hz(span_code)?;
     if !centered && (dial_hz - center).abs() > span / 2.0 {
         return None; // the dial has left the window — where it went next is not ours to guess
     }
@@ -395,6 +404,17 @@ pub struct SweepMeta {
     /// protocol reports no such value; this is knowable only because the transition is observed, or
     /// caused, by us.
     pub center_hz: Option<f64>,
+    /// Where a FIX sweep STARTS — its left edge, not its centre.
+    ///
+    /// Deliberately a second field rather than reuse of `center_hz`: a centre and a left edge are
+    /// different quantities, and conflating them puts every signal half a span out — which on the
+    /// FT-710's own scale (`start` → `start + span`, operator 2026-08-20) is exactly the mistake
+    /// available to anyone who assumes "anchor" means the middle.
+    ///
+    /// The radio reports this nowhere: the start is set by a LONG PRESS on FIX, a front-panel-only
+    /// action, and the whole `EX` menu was searched for it without result. So it is stated by the
+    /// operator and held against the band it was stated on.
+    pub fix_start_hz: Option<f64>,
     /// `P3` of `SS<P1>5;` — the SPAN code, as the ASCII byte the radio sent.
     pub span_code: u8,
     /// `P3` of `SS<P1>6;` — the MODE code, as the ASCII byte the radio sent.
@@ -419,7 +439,13 @@ pub fn pump(
     meta: SweepMeta,
 ) -> Pumped {
     let Some((lo_hz, hi_hz)) =
-        sweep_edges_anchored(meta.dial_hz, meta.span_code, meta.mode_code, meta.center_hz)
+        sweep_edges_anchored(
+            meta.dial_hz,
+            meta.span_code,
+            meta.mode_code,
+            meta.center_hz,
+            meta.fix_start_hz,
+        )
     else {
         return Pumped::Unavailable;
     };
@@ -857,6 +883,7 @@ mod tests {
         let meta = SweepMeta {
             dial_hz: 14_100_000.0,
             center_hz: None,
+            fix_start_hz: None,
             span_code: b'7', // 200 kHz — what the radio reported
             mode_code: b'4', // W/F CENTER (NORMAL) — likewise
         };
@@ -880,6 +907,7 @@ mod tests {
         let meta = SweepMeta {
             dial_hz: 14_100_000.0,
             center_hz: None,
+            fix_start_hz: None,
             span_code: b'7',
             mode_code: b'4',
         };
@@ -928,6 +956,7 @@ mod tests {
         let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
             dial_hz: 14_100_000.0,
             center_hz: None,
+            fix_start_hz: None,
             span_code: b'7',
             mode_code: b'4',
         })));
@@ -963,6 +992,7 @@ mod tests {
         let meta: SharedMeta = std::sync::Arc::new(std::sync::Mutex::new(Some(SweepMeta {
             dial_hz: 14_100_000.0,
             center_hz: None,
+            fix_start_hz: None,
             span_code: b'7',
             mode_code: b'4',
         })));
@@ -1159,7 +1189,7 @@ mod tests {
     #[test]
     fn an_anchored_cursor_window_stays_put_while_the_dial_moves_across_it() {
         // 200 kHz span anchored at 14.150; the dial moves 20 kHz and the EDGES do not.
-        let at = |dial: f64| sweep_edges_anchored(dial, b'7', b'7', Some(14_150_000.0));
+        let at = |dial: f64| sweep_edges_anchored(dial, b'7', b'7', Some(14_150_000.0), None);
         let a = at(14_150_000.0).expect("anchored cursor is placeable");
         let b = at(14_170_000.0).expect("still placeable after tuning");
         assert_eq!(a, b, "the window is fixed; the dial is what moves");
@@ -1170,30 +1200,30 @@ mod tests {
     fn a_cursor_sweep_with_no_anchor_is_refused() {
         // Before the transition is seen — e.g. Nexus started with the rig already in CURSOR — the
         // window is unknown, and unknown must not be drawn.
-        assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', b'7', None), None);
+        assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', b'7', None, None), None);
     }
 
     #[test]
     fn a_dial_that_has_left_the_cursor_window_makes_it_unknown_again() {
         // At the edge the radio does something — shift, re-centre, stop — and nothing tells us
         // which. Half of 200 kHz is 100 kHz, so 100.1 kHz away is outside.
-        assert!(sweep_edges_anchored(14_249_000.0, b'7', b'7', Some(14_150_000.0)).is_some());
-        assert_eq!(sweep_edges_anchored(14_251_000.0, b'7', b'7', Some(14_150_000.0)), None);
+        assert!(sweep_edges_anchored(14_249_000.0, b'7', b'7', Some(14_150_000.0), None).is_some());
+        assert_eq!(sweep_edges_anchored(14_251_000.0, b'7', b'7', Some(14_150_000.0), None), None);
     }
 
     #[test]
-    fn fix_is_refused_even_with_an_anchor_offered() {
-        // The anchor rule never produces one for FIX; this pins the geometry so a future caller
-        // cannot make FIX placeable by handing one in.
+    fn fix_is_refused_when_its_start_has_not_been_stated() {
+        // A cursor ANCHOR is not a FIX start — they are a centre and a left edge. Handing the
+        // anchor in must not make FIX placeable; only a stated start does that.
         for code in [b'2', b'9', b'A'] {
-            assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', code, Some(14_150_000.0)), None);
+            assert_eq!(sweep_edges_anchored(14_150_000.0, b'7', code, Some(14_150_000.0), None), None);
         }
     }
 
     #[test]
     fn a_center_sweep_ignores_any_anchor_and_follows_the_dial() {
-        let with = sweep_edges_anchored(14_150_000.0, b'7', b'4', Some(7_000_000.0));
-        let without = sweep_edges_anchored(14_150_000.0, b'7', b'4', None);
+        let with = sweep_edges_anchored(14_150_000.0, b'7', b'4', Some(7_000_000.0), None);
+        let without = sweep_edges_anchored(14_150_000.0, b'7', b'4', None, None);
         assert_eq!(with, without);
         assert_eq!(with, Some((14_050_000.0, 14_250_000.0)));
     }
@@ -1241,6 +1271,51 @@ mod tests {
         assert_eq!(parse_ex_reply("EX030126;", EX_SCU_LAN10), None, "no value at all");
         assert_eq!(parse_ex_reply("?;", EX_SCU_LAN10), None);
         assert_eq!(parse_ex_reply("", EX_SCU_LAN10), None);
+    }
+
+
+    // ── Placing a FIX sweep ─────────────────────────────────────────────────────────────────────
+    //
+    // Operator, 2026-08-20: "in fix the scale reads start to start plus span." That is the whole
+    // geometry, and the reason the start is a SEPARATE field from the cursor anchor: one is a left
+    // edge and the other a centre, and reading one as the other is a half-span error that looks
+    // entirely reasonable on screen.
+
+    #[test]
+    fn a_stated_fix_start_plus_the_span_is_the_window() {
+        // 10 kHz span starting at 14.070 → 14.070–14.080. Not centred on anything.
+        assert_eq!(
+            sweep_edges_anchored(14_074_000.0, b'3', b'A', None, Some(14_070_000.0)),
+            Some((14_070_000.0, 14_080_000.0))
+        );
+    }
+
+    #[test]
+    fn a_fix_window_does_not_move_when_the_dial_leaves_it() {
+        // The difference from CURSOR, and it is not an oversight: in FIX the operator may tune
+        // right out of the window and the window stays put, so the dial is not in the arithmetic.
+        let a = sweep_edges_anchored(14_074_000.0, b'3', b'A', None, Some(14_070_000.0));
+        let b = sweep_edges_anchored(14_200_000.0, b'3', b'A', None, Some(14_070_000.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn every_fix_family_uses_the_stated_start() {
+        // 3DSS FIX, W/F FIX (EXPAND) and W/F FIX (NORMAL) are the same geometry.
+        for code in [b'2', b'9', b'A'] {
+            assert_eq!(
+                sweep_edges_anchored(7_100_000.0, b'2', code, None, Some(7_050_000.0)),
+                Some((7_050_000.0, 7_055_000.0)),
+                "code {}", code as char
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_anchor_is_never_read_as_a_fix_start() {
+        // The half-span trap, pinned. If FIX read the anchor as a centre, this would come back
+        // 14.145–14.155 instead of nothing.
+        assert_eq!(sweep_edges_anchored(14_150_000.0, b'3', b'A', Some(14_150_000.0), None), None);
     }
 
 }
