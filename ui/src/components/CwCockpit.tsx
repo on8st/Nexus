@@ -1411,7 +1411,7 @@ export function CwCockpit({
               value={yaesuSpanLabel}
               onChange={(e) => {
                 const sp = YAESU_SPANS.find((x) => x.label === e.target.value)
-                if (sp) void setScopeSpan(sp.halfHz).then((s) => onSnap?.(s)).catch(() => {})
+                if (sp) void setScopeSpan(sp.halfHz).then((s) => onSnap?.(s)).catch((e) => pushToast(String(e), 'error'))
               }}
             >
               {YAESU_SPANS.map((sp) => (
@@ -1427,7 +1427,7 @@ export function CwCockpit({
               value={yaesuPosition}
               onChange={(e) => {
                 const pos = e.target.value as 'center' | 'cursor' | 'fix'
-                void setYaesuScopeMode(pos).then((s) => onSnap?.(s)).catch(() => {})
+                void setYaesuScopeMode(pos).then((s) => onSnap?.(s)).catch((e) => pushToast(String(e), 'error'))
               }}
             >
               <option value="center">Center</option>
@@ -1443,7 +1443,7 @@ export function CwCockpit({
                 type="button"
                 className="theme-chip"
                 title="Long-press FIX on the radio at the start frequency, then click this: Nexus takes your current dial as the left edge of the fixed window."
-                onClick={() => void setYaesuFixStart(snap.radio.dialMhz).then((s) => onSnap?.(s)).catch(() => {})}
+                onClick={() => void setYaesuFixStart(snap.radio.dialMhz).then((s) => onSnap?.(s)).catch((e) => pushToast(String(e), 'error'))}
               >
                 {/* The start IN FORCE, not just an invitation: a click that never reached the radio loop
                     is otherwise indistinguishable from one that did, since the waterfall stays on audio
