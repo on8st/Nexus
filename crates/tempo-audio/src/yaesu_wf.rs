@@ -1318,4 +1318,40 @@ mod tests {
         assert_eq!(sweep_edges_anchored(14_150_000.0, b'3', b'A', Some(14_150_000.0), None), None);
     }
 
+
+    #[test]
+    fn a_fix_sweep_with_a_stated_start_actually_publishes_a_row() {
+        // The chain, not just the geometry: metadata carrying a FIX mode AND a stated start must
+        // make `pump` PUBLISH, not report the row unplaceable. The operator saw the panadapter stay
+        // on sound-card audio after stating a start (2026-08-20), and the arithmetic below was
+        // already passing its own tests — so the gap, if any, is between them.
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let mut src = MockWaterfall::ramp();
+        let meta = SweepMeta {
+            dial_hz: 14_074_000.0,
+            center_hz: None,
+            fix_start_hz: Some(14_070_000.0),
+            span_code: b'3', // 10 kHz
+            mode_code: b'A', // W/F FIX (NORMAL)
+        };
+        assert_eq!(pump(&mut src, &feed, meta), Pumped::Published);
+        let row = feed.row().expect("a row reached the feed");
+        assert_eq!((row.lo_hz, row.hi_hz), (14_070_000.0, 14_080_000.0));
+        assert_eq!(row.source, SOURCE);
+    }
+
+    #[test]
+    fn a_fix_sweep_without_a_start_is_reported_unavailable_not_published() {
+        let feed = tempo_app::engine::SpectrumFeed::default();
+        let mut src = MockWaterfall::ramp();
+        let meta = SweepMeta {
+            dial_hz: 14_074_000.0,
+            center_hz: None,
+            fix_start_hz: None,
+            span_code: b'3',
+            mode_code: b'A',
+        };
+        assert_eq!(pump(&mut src, &feed, meta), Pumped::Unavailable);
+    }
+
 }

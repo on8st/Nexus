@@ -1153,6 +1153,8 @@ export interface RadioStatus {
   scopeError?: string | null
   /** The rig scope's MODE code (`SS` P3) as read back, or null before one is known. */
   scopeModeCode?: number | null
+  /** The FIX start the operator stated, in MHz — null until they do. */
+  scopeFixStartMhz?: number | null
   /** Set when two radios are on the same serial COM port (explains a red pill). */
   radioConfigWarning?: string | null
   /** The last per-QSO recording failed, with the path it failed at. Surfaced in the status lane;

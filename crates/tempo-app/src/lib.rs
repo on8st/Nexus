@@ -299,6 +299,7 @@ impl AppState {
                 audio_error: None,
                 scope_error: None,
             scope_mode_code: None,
+            scope_fix_start_mhz: None,
                 radio_config_warning: None,
                 recording_warning: None,
                 tx_even: true,

@@ -943,6 +943,10 @@ impl Default for RadioConfig {
 const YAESU_WF_INTERVAL_MS: u64 = 100;
 /// How often the span/mode are re-read over CAT. SLOW on purpose — see the field's comment.
 const YAESU_WF_META_SECS: f64 = 5.0;
+/// How often the span and mode are re-read while the sweep CANNOT be placed — so the app notices a
+/// return to CENTER promptly instead of leaving the operator on sound-card audio for most of the
+/// slow interval. Cheap, because nothing is being drawn to spend the link on.
+const YAESU_WF_META_FAST_SECS: f64 = 0.8;
 /// How long a reader may publish nothing before that becomes an operator-facing message. Long
 /// enough to cover an FT4222 that is simply slow to first frame, short enough to be useful.
 const YAESU_WF_GRACE_SECS: f64 = 6.0;
@@ -3097,6 +3101,12 @@ impl RadioLoop {
             let b = engine_lock(engine).settings().band.clone();
             self.yaesu_wf_fix_start = Some((b, hz));
         }
+        // Show the operator what is in force. Without this a click that never reached the radio
+        // loop is indistinguishable from one that did — the waterfall stays on audio either way.
+        {
+            let start = self.yaesu_wf_fix_start.as_ref().map(|(_, hz)| hz / 1_000_000.0);
+            engine_lock(engine).set_scope_fix_start(start);
+        }
 
         // The scope POSITION, same shape as the span above and the same reason for the scope of
         // the lock. The code arrives ready-made from `mode_code_for`, which keeps the operator in
@@ -3118,13 +3128,38 @@ impl RadioLoop {
         // sees a garbled spectrum rather than an honestly blank one (station report, 2026-08-19,
         // tuning across 20 m). The old comment claimed "the dial we already poll", which was true and
         // beside the point — it was polled and then not used until the next CAT read.
+        let meta_before = self.yaesu_wf_meta.lock().ok().and_then(|g| *g);
         let (dial_hz, band) = {
             let e = engine_lock(engine);
             let s = e.settings();
             (s.dial_mhz * 1_000_000.0, s.band.clone())
         };
+        // POLL FASTER WHILE THERE IS NOTHING ON SCREEN.
+        //
+        // The mode is read on a slow cadence because hammering rigctld is on record as harmful, and
+        // that is right while a sweep is being drawn. It is exactly wrong when it is NOT: switching
+        // the rig back to CENTER left the operator watching sound-card audio for three or four
+        // seconds before the app noticed (report, 2026-08-20) — the whole delay was this interval.
+        // While the sweep is unplaceable we are spending no CAT on rows and showing nothing, so the
+        // budget goes here instead.
+        let placeable = meta_before
+            .and_then(|m: crate::yaesu_wf::SweepMeta| {
+                crate::yaesu_wf::sweep_edges_anchored(
+                    m.dial_hz,
+                    m.span_code,
+                    m.mode_code,
+                    m.center_hz,
+                    m.fix_start_hz,
+                )
+            })
+            .is_some();
+        let interval = if placeable {
+            YAESU_WF_META_SECS
+        } else {
+            YAESU_WF_META_FAST_SECS
+        };
         let polled = if now >= self.yaesu_wf_meta_after {
-            self.yaesu_wf_meta_after = now + YAESU_WF_META_SECS;
+            self.yaesu_wf_meta_after = now + interval;
             let span = rig
                 .send_raw("SS05;")
                 .and_then(|r| crate::yaesu_wf::parse_ss_reply(&r, b'5'));

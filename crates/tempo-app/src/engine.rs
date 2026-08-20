@@ -2093,6 +2093,8 @@ pub struct Engine {
     scope_error: Option<String>,
     /// See `RadioStatus::scope_mode_code`.
     scope_mode_code: Option<u32>,
+    /// See `RadioStatus::scope_fix_start_mhz`.
+    scope_fix_start_mhz: Option<f64>,
     /// The last per-QSO recording that failed, with the path. Set by the shell (which owns the
     /// file write), carried out in the snapshot, cleared by the next recording that succeeds.
     recording_warning: Option<String>,
@@ -3709,6 +3711,7 @@ impl Engine {
             audio_error: None,
             scope_error: None,
             scope_mode_code: None,
+            scope_fix_start_mhz: None,
             recording_warning: None,
             qsy,
             rtty_armed: false,
@@ -13009,6 +13012,10 @@ impl Engine {
     pub fn set_scope_mode_code(&mut self, code: Option<u32>) {
         self.scope_mode_code = code;
     }
+    /// Record the FIX start now in force — see `RadioStatus::scope_fix_start_mhz`.
+    pub fn set_scope_fix_start(&mut self, mhz: Option<f64>) {
+        self.scope_fix_start_mhz = mhz;
+    }
     pub fn set_scope_error(&mut self, err: Option<String>) {
         self.scope_error = err;
     }
@@ -13521,6 +13528,7 @@ impl Engine {
         s.radio.audio_error = self.audio_error.clone();
         s.radio.scope_error = self.scope_error.clone();
         s.radio.scope_mode_code = self.scope_mode_code;
+        s.radio.scope_fix_start_mhz = self.scope_fix_start_mhz;
         s.radio.recording_warning = self.recording_warning.clone();
         s.radio.radio_config_warning =
             crate::settings::serial_port_conflicts(&self.settings.radios)

@@ -77,6 +77,7 @@
     "rxOffsetHz": 1500.0,
     "rxRangesMhz": [],
     "scopeError": null,
+    "scopeFixStartMhz": null,
     "scopeModeCode": null,
     "sideband": "USB",
     "sidebandOverride": null,

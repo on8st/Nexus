@@ -763,6 +763,12 @@ pub struct RadioStatus {
     /// the FT-710 carries all three positions inside each of three display families — so a request
     /// to change position can keep the operator in the family they are already using.
     pub scope_mode_code: Option<u32>,
+    /// The FIX start the operator stated, in MHz — `None` until they do.
+    ///
+    /// Surfaced because the operator cannot otherwise tell a click that landed from one that did
+    /// not: stating a start and seeing the waterfall stay on sound-card audio has two very
+    /// different causes, and the control should say which side of it we are on.
+    pub scope_fix_start_mhz: Option<f64>,
     /// Set when two enabled radios are configured on the SAME serial COM port — the
     /// monitor radio's CAT can't open the busy port and shows a confusing red pill.
     /// A config warning (self-clears once the ports differ); surfaced in the status lane.

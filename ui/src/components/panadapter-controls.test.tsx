@@ -13,7 +13,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import type { AppSnapshot } from '../types'
-import type { PanelLayoutApi } from '../features/paneLayout'
 import { PhoneCockpit } from './PhoneCockpit'
 import { CwCockpit } from './CwCockpit'
 
@@ -48,50 +47,50 @@ vi.mock('../api', () => ({
   getSettings: vi.fn(async () => ({ macros: { cwProfiles: [], activeCwProfile: 0 } })),
   setSettings: vi.fn(async () => ({})),
   sendCw: vi.fn(async () => {}),
-  setCwKeyer: vi.fn(async () => null),
+  setCwKeyer: vi.fn(async () => ({})),
   setCwWpm: vi.fn(async () => {}),
   stopCw: vi.fn(async () => {}),
-  cwDecode: vi.fn(async () => decodeState),
+  cwDecode: vi.fn(async () => ({})),
   cwClear: vi.fn(async () => {}),
   setAiCw: vi.fn(async () => {}),
-  selectPeer: vi.fn(async () => null),
-  previewCw: vi.fn(async (t: string) => t),
+  selectPeer: vi.fn(async () => ({})),
+  previewCw: vi.fn(async () => ({})),
   pointRotatorAtCall: vi.fn(async () => 0),
   // The real CockpitHeader hosts RotorStrip, which polls these on mount.
-  readRotator: vi.fn(async () => null),
+  readRotator: vi.fn(async () => ({})),
   stopRotator: vi.fn(async () => ({})),
   getDeclination: vi.fn(async () => 0),
-  getSatTrackStatus: vi.fn(async () => null),
-  getSatTransponder: vi.fn(async () => null),
+  getSatTrackStatus: vi.fn(async () => ({})),
+  getSatTransponder: vi.fn(async () => ({})),
   setSatTransponder: vi.fn(async () => {}),
   stopSatTrack: vi.fn(async () => ({})),
-  getRttyState: vi.fn(async () => rttyState),
+  getRttyState: vi.fn(async () => ({})),
   getLicensedBandPlan: vi.fn(async () => []),
-  rttyArm: vi.fn(async () => rttyState),
-  rttySend: vi.fn(async () => rttyState),
-  rttyStop: vi.fn(async () => rttyState),
-  rttyClear: vi.fn(async () => rttyState),
-  rttyAfcReset: vi.fn(async () => rttyState),
-  rttyNet: vi.fn(async () => rttyState),
-  rttySetAuto: vi.fn(async () => rttyState),
-  rttyAutoCq: vi.fn(async () => rttyState),
-  rttyAutoAnswer: vi.fn(async () => rttyState),
-  rttyAutoAbort: vi.fn(async () => rttyState),
-  getPskState: vi.fn(async () => pskState),
-  pskArm: vi.fn(async () => pskState),
-  pskAutoArm: vi.fn(async () => pskState),
-  pskClear: vi.fn(async () => pskState),
-  pskAfcReset: vi.fn(async () => pskState),
-  pskNet: vi.fn(async () => pskState),
-  pskSend: vi.fn(async () => pskState),
-  pskSetLatched: vi.fn(async () => pskState),
-  pskType: vi.fn(async () => pskState),
-  pskStop: vi.fn(async () => pskState),
-  getSstvState: vi.fn(async () => sstvState),
-  sstvArm: vi.fn(async () => sstvState),
-  sstvAutoArm: vi.fn(async () => sstvState),
-  sstvSend: vi.fn(async () => sstvState),
-  sstvStop: vi.fn(async () => sstvState),
+  rttyArm: vi.fn(async () => ({})),
+  rttySend: vi.fn(async () => ({})),
+  rttyStop: vi.fn(async () => ({})),
+  rttyClear: vi.fn(async () => ({})),
+  rttyAfcReset: vi.fn(async () => ({})),
+  rttyNet: vi.fn(async () => ({})),
+  rttySetAuto: vi.fn(async () => ({})),
+  rttyAutoCq: vi.fn(async () => ({})),
+  rttyAutoAnswer: vi.fn(async () => ({})),
+  rttyAutoAbort: vi.fn(async () => ({})),
+  getPskState: vi.fn(async () => ({})),
+  pskArm: vi.fn(async () => ({})),
+  pskAutoArm: vi.fn(async () => ({})),
+  pskClear: vi.fn(async () => ({})),
+  pskAfcReset: vi.fn(async () => ({})),
+  pskNet: vi.fn(async () => ({})),
+  pskSend: vi.fn(async () => ({})),
+  pskSetLatched: vi.fn(async () => ({})),
+  pskType: vi.fn(async () => ({})),
+  pskStop: vi.fn(async () => ({})),
+  getSstvState: vi.fn(async () => ({})),
+  sstvArm: vi.fn(async () => ({})),
+  sstvAutoArm: vi.fn(async () => ({})),
+  sstvSend: vi.fn(async () => ({})),
+  sstvStop: vi.fn(async () => ({})),
   setOperatingMode: vi.fn(async () => ({})),
 }))
 vi.mock('../toast', () => ({
@@ -133,13 +132,12 @@ const radio = {
   phoneSegLo: null,
   phoneSegHi: null,
 }
-const snap = { mycall: 'KD9TAW', radio } as unknown as AppSnapshot
 
 
-function panelsWith<P extends string>(removed: readonly P[]): PanelLayoutApi<P> {
+function panelsWith(removed: readonly string[]) {
   return {
     layout: { v: 1, state: {}, share: {} },
-    stateOf: (id) => (removed.includes(id) ? 'removed' : 'docked'),
+    stateOf: (id: string) => (removed.includes(id) ? 'removed' : 'docked'),
     setPanelState: () => {},
     shareOf: () => 1,
     setShare: () => {},
@@ -148,10 +146,10 @@ function panelsWith<P extends string>(removed: readonly P[]): PanelLayoutApi<P> 
     canUndo: false,
     undoRemoves: [],
     reset: () => {},
-  }
+  } as never
 }
 
-const panels = panelsWith<string>([])
+const panels = panelsWith([])
 
 /** A snapshot whose radio reports the rig's scope MODE — the `SS` P3 byte, widened for JSON. */
 function snapWithMode(code: number): AppSnapshot {
