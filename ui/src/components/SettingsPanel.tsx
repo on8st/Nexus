@@ -834,6 +834,40 @@ export function SettingsPanel({
       pushToast(t('settings.backup.restore.done'), 'success')
     }, t('settings.backup.restore.failed'))
   }
+
+  // Reset everything to factory defaults. Destructive, immediate, and the one control in this
+  // block an operator can reach by accident, so it confirms through the same danger dialog the
+  // restore uses — and the wording points AT the backup beside it, because the machinery that
+  // makes this reversible is one button away and there is no excuse not to name it.
+  //
+  // Reloads the form from the backend rather than trusting the returned snapshot: `reset_settings`
+  // runs `ensure_radio_profiles` and friends, so what LANDED is not the bare `Settings::default()`
+  // this asked for, and a form seeded from anything else would show a roster the engine is not
+  // driving.
+  const handleResetConfig = async () => {
+    if (
+      !(await confirmDialog({
+        title: t('settings.backup.reset.confirm.title'),
+        body: t('settings.backup.reset.confirm.body'),
+        confirmLabel: t('settings.backup.reset.confirm.action'),
+        danger: true,
+      }))
+    ) {
+      return
+    }
+    const snap = await withErrorToast(
+      () => resetSettings(),
+      t('settings.backup.reset.failed'),
+    )
+    if (snap) {
+      const fresh = await getSettings()
+      setForm(fresh)
+      setEditingRadioId(fresh.activeRadio)
+      dirtyRef.current = false
+      onSaved?.()
+      pushToast(t('settings.backup.reset.done'), 'success')
+    }
+  }
   const [form, setForm] = useState<Settings | null>(null)
   // The blocklist editor's text — its OWN write path (apiSetBlockedCalls, the narrow
   // verb), never the form save: the engine deliberately ignores blockedCalls in a
@@ -2073,33 +2107,6 @@ export function SettingsPanel({
     onSaved?.()
     pushToast(t('settings.profiles.loaded', { name: p.name }), 'success')
   }
-  // Reset everything to factory defaults. Destructive, immediate, and the one action here an
-  // operator can reach by accident, so it confirms — and it offers the backup FIRST, because the
-  // machinery to make this reversible is one click away and there is no excuse not to point at it.
-  const handleResetConfig = async () => {
-    if (
-      !(await confirmDialog({
-        title: 'Reset ALL settings to factory defaults?',
-        body:
-          'Your radios, audio devices, callsign and preferences are erased. Your LOGBOOK is not ' +
-          'touched, and stored passwords stay in the keychain. This cannot be undone — back up ' +
-          'first if you have not.',
-        confirmLabel: 'Reset everything',
-        danger: true,
-      }))
-    ) {
-      return
-    }
-    const snap = await withErrorToast(() => resetSettings(), 'Could not reset the configuration')
-    if (snap) {
-      const fresh = await getSettings()
-      setForm(fresh)
-      setEditingRadioId(fresh.activeRadio)
-      dirtyRef.current = false
-      onSaved?.()
-      pushToast('Settings reset to defaults', 'success')
-    }
-  }
 
   const handleDeleteProfile = () => {
     if (!selectedProfile) return
@@ -2680,76 +2687,72 @@ export function SettingsPanel({
           {/* ---- Workspace (UI-only prefs, applied live like the theme) ---- */}
           {tab === 'configurations' && (
             <fieldset className="settings-section" id="settings-configurations">
-              <legend>Backup &amp; reset</legend>
+              <legend>{t('settings.configurations.legend')}</legend>
               <p className="settings-note">
-                Your whole setup in one file — for a new computer, before a rebuild, or to get back
-                to a known-good state. These used to live under <em>Radio → Transmit limits &amp;
-                sharing</em>, where nobody found them.
+                <T k="settings.configurations.note" tags={{ em: <em /> }} />
               </p>
-            {/* Back up / restore the whole station (#28 item 4). Until now there was no way
-                to keep a copy of any of this: settings.json sits in a config folder most
-                operators never open, and the honest answer to "how do I move to a new laptop"
-                was to go and find it. */}
-            <div className="settings-field">
-              <span className="settings-label">Back up your setup</span>
-              <div className="rig-share-row">
-                <button
-                  type="button"
-                  className="settings-linkbtn"
-                  onClick={() =>
-                    withErrorToast(async () => {
-                      const text = await exportSettingsBundle()
-                      const stamp = new Date().toISOString().slice(0, 10)
-                      const path = await saveTextToDownloads(`nexus-settings-${stamp}.json`, text)
-                      pushToast(t('settings.backup.export.done', { path }), 'success')
-                    }, 'Backup failed')
-                  }
-                  title="Save your radios, preferences, memory channels and watchlist to a file"
-                >
-                  Back up
-                </button>
-                <input
-                  ref={backupFileRef}
-                  type="file"
-                  accept=".json,application/json"
-                  style={{ display: 'none' }}
-                  onChange={onRestoreBackup}
-                />
-                <button
-                  type="button"
-                  className="settings-linkbtn"
-                  onClick={() => backupFileRef.current?.click()}
-                  title="Replace your current setup with a saved backup"
-                >
-                  Restore…
-                </button>
-              </div>
-              <span className="settings-hint">
-                Your radios, operating preferences, memory channels, watchlist and chase sets in
-                one file — for a new computer, or before a rebuild. <strong>It holds no
-                passwords or API keys</strong>: those stay in your operating system&apos;s
-                keychain, so a restore asks for them again, and the file is safe to keep on a USB
-                stick. Your contact log is separate — export that from the Logbook. Restoring
-                replaces your current setup.
-              </span>
-            </div>
+              {/* Back up / restore the whole station (#28 item 4). MOVED here from Radio →
+                  Transmit limits & sharing, unchanged: same handlers, same catalog keys, same
+                  markup. Backing up a whole station has nothing to do with transmit limits, and
+                  that mismatch is why operators did not find it — the registry's own comment on
+                  that section already said so. */}
               <div className="settings-field">
-                <span className="settings-label">Start over</span>
+                <span className="settings-label">{t('settings.transmit.backup.label')}</span>
+                <div className="rig-share-row">
+                  <button
+                    type="button"
+                    className="settings-linkbtn"
+                    onClick={() =>
+                      withErrorToast(async () => {
+                        const text = await exportSettingsBundle()
+                        const stamp = new Date().toISOString().slice(0, 10)
+                        // The FILE NAME is invariant (batch 8): a translated word in it would
+                        // reduce a non-Latin locale's backup to `nexus-settings-.json`.
+                        const path = await saveTextToDownloads(`nexus-settings-${stamp}.json`, text)
+                        pushToast(t('settings.transmit.backup.done', { path }), 'success')
+                      }, t('settings.transmit.backup.failed'))
+                    }
+                    title={t('settings.transmit.backup.title')}
+                  >
+                    {t('settings.transmit.backup.action')}
+                  </button>
+                  <input
+                    ref={backupFileRef}
+                    type="file"
+                    accept=".json,application/json"
+                    style={{ display: 'none' }}
+                    onChange={onRestoreBackup}
+                  />
+                  <button
+                    type="button"
+                    className="settings-linkbtn"
+                    onClick={() => backupFileRef.current?.click()}
+                    title={t('settings.transmit.restore.title')}
+                  >
+                    {t('settings.transmit.restore.action')}
+                  </button>
+                </div>
+                <span className="settings-hint">
+                  <T k="settings.transmit.backup.hint" tags={{ b: <strong /> }} />
+                </span>
+              </div>
+
+                {/* Start over. Deliberately the LAST thing in this tab: an operator who arrives
+                    here wanting a clean slate reads the backup affordance on the way past. */}
+              <div className="settings-field">
+                <span className="settings-label">{t('settings.configurations.reset.label')}</span>
                 <div className="rig-share-row">
                   <button
                     type="button"
                     className="settings-linkbtn danger"
                     onClick={handleResetConfig}
-                    title="Erase all settings and return to factory defaults"
+                    title={t('settings.configurations.reset.title')}
                   >
-                    Reset all settings…
+                    {t('settings.configurations.reset.action')}
                   </button>
                 </div>
                 <span className="settings-hint">
-                  Erases your radios, audio devices, callsign and preferences. Your{' '}
-                  <strong>logbook is not touched</strong>, and stored passwords stay in your
-                  keychain (clear those individually under Logging &amp; Connectors). Back up first
-                  — this cannot be undone.
+                  <T k="settings.configurations.reset.hint" tags={{ b: <strong /> }} />
                 </span>
               </div>
             </fieldset>
@@ -5188,52 +5191,6 @@ export function SettingsPanel({
 
                 The address existed all along — `rigctld_port` is per-radio and validated
                 unique — and was simply never shown to anyone. That is the whole defect. */}
-
-
-            {/* Back up / restore the whole station (#28 item 4). Until now there was no way
-                to keep a copy of any of this: settings.json sits in a config folder most
-                operators never open, and the honest answer to "how do I move to a new laptop"
-                was to go and find it. */}
-            <div className="settings-field">
-              <span className="settings-label">{t('settings.transmit.backup.label')}</span>
-              <div className="rig-share-row">
-                <button
-                  type="button"
-                  className="settings-linkbtn"
-                  onClick={() =>
-                    withErrorToast(async () => {
-                      const text = await exportSettingsBundle()
-                      const stamp = new Date().toISOString().slice(0, 10)
-                      // The FILE NAME is invariant (batch 8): a translated word in it would
-                      // reduce a non-Latin locale's backup to `nexus-settings-.json`.
-                      const path = await saveTextToDownloads(`nexus-settings-${stamp}.json`, text)
-                      pushToast(t('settings.transmit.backup.done', { path }), 'success')
-                    }, t('settings.transmit.backup.failed'))
-                  }
-                  title={t('settings.transmit.backup.title')}
-                >
-                  {t('settings.transmit.backup.action')}
-                </button>
-                <input
-                  ref={backupFileRef}
-                  type="file"
-                  accept=".json,application/json"
-                  style={{ display: 'none' }}
-                  onChange={onRestoreBackup}
-                />
-                <button
-                  type="button"
-                  className="settings-linkbtn"
-                  onClick={() => backupFileRef.current?.click()}
-                  title={t('settings.transmit.restore.title')}
-                >
-                  {t('settings.transmit.restore.action')}
-                </button>
-              </div>
-              <span className="settings-hint">
-                <T k="settings.transmit.backup.hint" tags={{ b: <strong /> }} />
-              </span>
-            </div>
 
             {/* THE share affordance (#53) — one block, and it advertises the CAT BROKER, not the
                 Hamlib daemon's port. The daemon is torn down by Test CAT and every CAT-config

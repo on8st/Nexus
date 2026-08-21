@@ -7507,12 +7507,13 @@ fn get_settings(state: State<'_, SharedEngine>) -> Result<Settings, String> {
     Ok(s)
 }
 
+
 /// Reset the configuration to factory defaults, keeping the logbook and stored credentials.
 ///
 /// There was no reset at all, so a clean start meant deleting files by hand — and doing THAT
 /// while the app runs does not reset anything: the engine holds the old configuration in memory
-/// and writes it straight back on the next save. So this goes through `apply_settings`, the same
-/// path a backup restore uses, which is what makes every side effect (the radio loop
+/// and writes it straight back on the next save. So this goes through the ordinary save path, the
+/// same one a backup restore uses, which is what makes every side effect (the radio loop
 /// reconfiguring, the profile mirrors re-syncing) happen exactly as it would for any other
 /// settings change.
 ///
@@ -7539,7 +7540,6 @@ fn reset_settings(
     // Reuse the ordinary save path in full rather than reimplementing its side effects.
     set_settings(state, spots, live_paths, region_paths, health, cache, fresh)
 }
-
 /// Apply + persist new settings. Returns the refreshed snapshot.
 ///
 /// Also lazily starts the live network feeds: if this change supplies a real

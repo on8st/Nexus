@@ -7,8 +7,7 @@
 // model and audio devices onto radio 1's profile, persisted. Operator report, 2026-07-25: with
 // two radios configured, both ended up on one set of comm ports.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { confirmDialog } from '../confirm'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { SettingsPanel } from './SettingsPanel'
 import type { FeaturesApi } from '../useFeatures'
 import defaultSettings from './__fixtures__/defaultSettings.json'
@@ -16,25 +15,32 @@ import defaultSettings from './__fixtures__/defaultSettings.json'
 const api = vi.hoisted(() => {
   // SettingsPanel pulls ~50 verbs from ../api. They all resolve null, which is enough for a
   // mount — the assertions here are about WHICH save verb gets called, not what it returns.
+  const VERBS = [
+    'clearCloudlogKey', 'clearClublogPassword', 'clearEqslPassword', 'clearHamqthPassword',
+    'clearHrdlogCode', 'clearLotwPassword', 'clearQrzLogbookKey', 'clearQrzPassword', 'detectRigs',
+    'downloadEqslReport', 'downloadLotwReport', 'getAllRigModels', 'getAudioDevices', 'resetSettings', 'audioDevicesForPort', 'getBandPlan',
+    'getRigModels', 'getSerialPortsDetailed', 'getSettings', 'setCloudlogKey', 'setClublogPassword',
+    'setEqslPassword', 'setHamqthPassword', 'setHrdlogCode', 'setLotwPassword', 'setQrzLogbookKey',
+    'setQrzPassword', 'setRepeaterbookToken', 'setRxGain', 'setSettings', 'setTxLevel', 'addRadio',
+    'removeRadio', 'renameRadio', 'setActiveRadio', 'setRadioBands', 'updateRadioProfile', 'testCat',
+    'probeCatPorts', 'qrzTestConnection', 'syncQrz', 'n3fjpTestConnection', 'getConnectionLog',
+    'getCredentialsStatus', 'fetchLotwUsers', 'getLotwUsersStatus', 'fetchFccStates',
+    'getFccStatesStatus', 'getTleStatus', 'fetchTlesNow', 'importTles', 'discoverFlex', 'civDiagnosticLog', 'civDiagnosticStatus',
+    'allTxtLocation', 'revealAllTxt', 'recordingsLocation', 'revealRecordings', 'appVersion', 'getSpectrumRow', 'setFrequency',
+    'getWatchlist', 'setWatchlist', 'openPanelWindow', 'getAssistanceJournal',
+    'setUnassistedMode',
+  ]
   const spies: Record<string, ReturnType<typeof vi.fn>> = {}
   const get = (name: string) => {
     if (!spies[name]) spies[name] = vi.fn(() => Promise.resolve(null))
     return spies[name]
   }
-  return { spies, get }
+  return { spies, get, VERBS }
 })
 
-// Mock EVERY export of `../api`, derived from the real module rather than a hand-kept list.
-// A verb missing from a literal list makes the panel THROW ON MOUNT, which reads as a behaviour
-// regression rather than the out-of-date mock it is.
-// window.confirm is INERT in the Tauri webview, so destructive actions now go through the
-// in-app dialog (src/confirm.tsx). Mock THAT -- mocking window.confirm tested a dialog the real
-// app never shows, which is exactly how the dead-confirm bug survived a green suite.
-vi.mock('../confirm', () => ({
-  confirmDialog: vi.fn(() => Promise.resolve(true)),
-  ConfirmHost: () => null,
-}))
-
+// Derive the mock from the REAL module rather than a hand-kept verb list (upstream #79): a list
+// goes stale the moment the panel calls a verb nobody added to it, and the failure is a crash
+// inside an effect, not a missing-mock message. `getPortlessRigModels` was exactly that.
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   const mod: Record<string, unknown> = {}
@@ -163,9 +169,12 @@ beforeEach(() => {
 afterEach(cleanup)
 
 
-describe('Config tab: backup, restore and reset', () => {
+describe('Config tab: a findable home for backup and restore', () => {
   const openTab = async () => fireEvent.click(await screen.findByRole('tab', { name: 'Config' }))
 
+  // The RESET cases that used to live here are now SettingsPanel.reset.test.tsx, which drives
+  // the real confirm dialog. They were written against `window.confirm` — inert in this webview
+  // — so they passed while the button they described would have done nothing on macOS.
   it('exists as its own tab — Backup and Restore were unfindable under Radio > Transmit limits', async () => {
     renderPanel()
     await openTab()
@@ -174,37 +183,23 @@ describe('Config tab: backup, restore and reset', () => {
     expect(await screen.findByRole('button', { name: /reset all settings/i })).toBeTruthy()
   })
 
-  it('Reset asks first, and does nothing when declined', async () => {
-    const confirmSpy = vi.mocked(confirmDialog).mockResolvedValue(false)
+  it('takes them OUT of Radio — a move that leaves a copy behind is not a move', async () => {
+    // The duplicate is the failure mode a merge produces on its own: both parents render the
+    // block, both look right in isolation, and the operator gets two of everything.
     renderPanel()
-    await openTab()
-    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
-    expect(api.get('resetSettings')).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    await screen.findByText('Transmit limits & sharing')
+    expect(screen.queryByRole('button', { name: 'Back up' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restore…' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /reset all settings/i })).toBeNull()
   })
 
-  it('the confirmation states what survives — the logbook and the keychain', async () => {
-    const confirmSpy = vi.mocked(confirmDialog).mockResolvedValue(false)
+  it('says where they moved from, once — an operator who knew the old place is not left hunting', async () => {
     renderPanel()
     await openTab()
-    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalled())
-    // "Reset" is the word an operator fears for their QSOs. The prompt must answer that before
-    // they have to wonder.
-    const call = confirmSpy.mock.calls[0]?.[0]
-    const msg = `${call?.title ?? ''} ${call?.body ?? ''}`
-    expect(msg).toMatch(/LOGBOOK is not touched/i)
-    expect(msg).toMatch(/keychain/i)
-    expect(msg).toMatch(/cannot be undone/i)
-  })
-
-  it('accepted, it resets through the backend verb', async () => {
-    vi.mocked(confirmDialog).mockResolvedValue(true)
-    renderPanel()
-    await openTab()
-    fireEvent.click(await screen.findByRole('button', { name: /reset all settings/i }))
-    await waitFor(() => expect(api.get('resetSettings')).toHaveBeenCalled())
-    // Never by deleting the settings file: a running app holds the old config in memory and
-    // writes it straight back, so a file-delete "reset" silently un-resets itself.
+    const note = document.querySelector('#settings-configurations .settings-note')?.textContent ?? ''
+    expect(note).toMatch(/Transmit limits & sharing/)
+    // Rendered through <T>, so an entity in the catalog would surface as literal characters.
+    expect(note).not.toContain('&amp;')
   })
 })
