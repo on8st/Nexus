@@ -19,11 +19,11 @@
  * unproven, and neither may ever be the reason a save is refused. A caller that passes no
  * topology gets exactly the checks that existed before it, unchanged. The bias is deliberate:
  * a topology finding that turns out to be wrong on somebody's station must cost them a sentence,
- * never their configuration. *
+ * never their configuration.
+ *
  * ⚠️ THIS FILE IS ON THE MIGRATED LIST (i18n/hardcoded-strings.test.ts). Every message comes
  * from the catalog. What does NOT: the port name itself, which is interpolated as the operator's
  * own `COM5` / `/dev/cu.usbserial-A` — a device name, never translated and never reformatted.
-
  *
  * WHAT IS DELIBERATELY NOT HERE — two ports collide (two profiles on one serial port). The
  * backend already decides that, in `settings::serial_port_conflicts`, and App.tsx already puts
@@ -38,7 +38,6 @@
 import type { SerialPortInfo } from './api'
 import type { AudioDevices } from './types'
 import { t } from './i18n'
-
 
 export type RigCheck = { level: 'error' | 'warning'; message: string }
 
@@ -144,9 +143,9 @@ export function checkRigForm(
     out.push({
       level: 'warning',
       message: t('settings.radio.check.secondInterface', {
-          port,
-          n: info.interfaceIndex + 1,
-        }),
+        port,
+        n: info.interfaceIndex + 1,
+      }),
     })
   }
 
@@ -182,17 +181,17 @@ export function checkRigForm(
         out.push({
           level: 'warning',
           message:
-              field === 'Input'
-                ? t('settings.radio.check.audioNotOnRig.input', {
-                    chosen,
-                    port,
-                    paired: info.pairedAudio,
-                  })
-                : t('settings.radio.check.audioNotOnRig.output', {
-                    chosen,
-                    port,
-                    paired: info.pairedAudio,
-                  }),
+            field === 'Input'
+              ? t('settings.radio.check.audioNotOnRig.input', {
+                  chosen,
+                  port,
+                  paired: info.pairedAudio,
+                })
+              : t('settings.radio.check.audioNotOnRig.output', {
+                  chosen,
+                  port,
+                  paired: info.pairedAudio,
+                }),
         })
       }
     }

@@ -7,6 +7,9 @@ import { redockAllStalePopouts } from './features/panelState'
 import { loadDurable } from './features/durableStore'
 import { initLocale, installCatalog } from './i18n'
 import { DE } from './i18n/de'
+import { ES } from './i18n/es'
+import { FR } from './i18n/fr'
+import { JA } from './i18n/ja'
 import { installExternalLinkInterceptor } from './externalLinks'
 import { isTauri, openExternalUrl } from './api'
 import { pushToast } from './toast'
@@ -104,6 +107,9 @@ void loadDurable().finally(() => {
   // catalog. Static imports, never a fetch: a catalog that arrives over the network is a
   // catalog that is absent in a field-day tent.
   installCatalog('de', DE)
+  installCatalog('es', ES)
+  installCatalog('fr', FR)
+  installCatalog('ja', JA)
   initLocale()
   createRoot(document.getElementById('root')!).render(tree)
 })

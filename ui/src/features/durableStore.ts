@@ -58,19 +58,50 @@ export const DURABLE_KEYS: readonly string[] = [
   // scoping and its guard. The audit in #28 named both; the codebase has since split them, and
   // the split wins. The cap is the station-wide ceiling and is global.
   'nexus-ui-scale-cap',
+  // WHICH MODES THE OPERATOR RUNS. Turning CW, SSTV, RTTY and the rest off is a deliberate
+  // setup of the station, not a preference — an operator who has pruned the rail to the four
+  // things he actually uses should not find all fifteen back after an upgrade. Reported
+  // 2026-08-21 against 1.7.5, alongside the panel layout below: settings.json survived and
+  // these did not, which is exactly the split this file exists to correct.
+  'nexus.features.v1',
 ]
+
+/** The MAIN window's pane layout is durable; a detached panel's is not.
+ *
+ *  Panel keys are `nexus.panels.<view>.<instance>` ([`panelStorageKey`]), and the instance is
+ *  what decides. Which panes you have hidden in the main window is a deliberate arrangement
+ *  that takes real time to rebuild — the same operator report that moved `nexus.features.v1`
+ *  above lost it on an upgrade. A POPPED-OUT panel's layout is genuinely per-surface chrome,
+ *  which is what this file's header means by "the right home for a collapsed-panel flag", and
+ *  it stays in localStorage where a second window's arrangement cannot fight the first's.
+ *
+ *  A prefix rule rather than an entry per view, because the alternative is a list that must be
+ *  edited every time a cockpit is added — and the cockpit that gets forgotten is the one whose
+ *  operator loses their layout. */
+function isMainWindowPanelLayout(key: string): boolean {
+  return key.startsWith('nexus.panels.') && key.endsWith('.main')
+}
 
 const durable = new Set(DURABLE_KEYS)
 
 /** In-memory mirror of `ui-state.json`. `null` until `loadDurable()` has run — distinct from an
  *  empty map, which is a real and normal first-run answer. */
 let cache: Record<string, string> | null = null
+/** Writes and removes that arrived BEFORE `loadDurable` filled the cache (`null` = remove).
+ *  Without this buffer such a write reached `localStorage` only — the cache was `null` — and
+ *  the loaded file then SHADOWED it for the whole session, because `durableGet` prefers the
+ *  cache: the stale file value was served, and every flush re-persisted it. That is #205 to
+ *  the letter: boot hygiene re-docks a stale popped-out pane before the store loads, and the
+ *  waterfall came up "popped out" with no window on every launch, forever. The load applies
+ *  these LAST, so a this-session write beats the file copy — the same
+ *  whichever-copy-is-newer-wins contract every post-load write already has. */
+let preLoad: Map<string, string | null> | null = null
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 let flushing = false
 
 /** Is this a key we promise to keep? */
 export function isDurable(key: string): boolean {
-  return durable.has(key)
+  return durable.has(key) || isMainWindowPanelLayout(key)
 }
 
 /**
@@ -85,8 +116,13 @@ export async function loadDurable(): Promise<void> {
   try {
     loaded = (await uiStateLoad()) ?? {}
   } catch {
-    // No bridge, or the store could not be read. Fall back to localStorage entirely.
+    // No bridge, or the store could not be read. Fall back to localStorage entirely — but
+    // this-session pre-load writes still land in the cache, so reads keep seeing them.
     cache = {}
+    if (preLoad) {
+      for (const [k, v] of preLoad) if (v !== null) cache[k] = v
+      preLoad = null
+    }
     return
   }
   // Migration: adopt what is only in localStorage. Absent-from-store is the test, NOT
@@ -101,8 +137,42 @@ export async function loadDurable(): Promise<void> {
       migrated = true
     }
   }
+  // The panel layouts cannot be walked from DURABLE_KEYS — they are matched by PREFIX, and
+  // the set of views is not known here. So the migration walks localStorage itself for them.
+  // Without this the promotion would be worthless to every EXISTING operator: their layout is
+  // sitting in localStorage right now, and a rule that only protects future writes protects
+  // nobody who already has one.
+  for (const key of safeLocalKeys()) {
+    if (!isMainWindowPanelLayout(key) || key in loaded) continue
+    const local = safeLocalGet(key)
+    if (local !== null) {
+      loaded[key] = local
+      migrated = true
+    }
+  }
+  // This-session writes that arrived before the load beat the file copy (see `preLoad`) —
+  // applied AFTER the migration walk, so a pre-load remove also wins over a localStorage
+  // copy the migration would otherwise adopt.
+  if (preLoad) {
+    for (const [k, v] of preLoad) {
+      if (v === null) delete loaded[k]
+      else loaded[k] = v
+    }
+    preLoad = null
+    migrated = true
+  }
   cache = loaded
   if (migrated) scheduleFlush()
+}
+
+/** Every `localStorage` key, or an empty list where storage is unavailable (private modes
+ *  throw on access — the same guard `safeLocalGet` carries). */
+function safeLocalKeys(): string[] {
+  try {
+    return Object.keys(window.localStorage)
+  } catch {
+    return []
+  }
 }
 
 /** Read a durable key: the store first, then `localStorage`. */
@@ -118,9 +188,18 @@ export function durableSet(key: string, value: string): void {
   } catch {
     // Quota or a disabled store — the durable copy below is then the only one, which is fine.
   }
+  // ⚠️ NON-DURABLE KEYS STOP HERE, and that check belongs in this function rather than at the
+  // call sites. Since the panel layouts became durable BY PREFIX, one module now calls this
+  // with keys that are durable (the main window) and keys that are deliberately not (a
+  // detached panel). Without this line, `durableSet` would quietly promote whatever it was
+  // handed — which is how per-surface chrome ends up in a per-profile store, fighting the
+  // scoping it was given on purpose. `isDurable` is the single authority; callers just call.
+  if (!isDurable(key)) return
   if (cache) {
     cache[key] = value
     scheduleFlush()
+  } else {
+    ;(preLoad ??= new Map()).set(key, value)
   }
 }
 
@@ -131,9 +210,13 @@ export function durableRemove(key: string): void {
   } catch {
     /* see durableSet */
   }
-  if (cache && key in cache) {
-    delete cache[key]
-    scheduleFlush()
+  if (cache) {
+    if (key in cache) {
+      delete cache[key]
+      scheduleFlush()
+    }
+  } else if (isDurable(key)) {
+    ;(preLoad ??= new Map()).set(key, null)
   }
 }
 
@@ -173,6 +256,7 @@ function safeLocalGet(key: string): string | null {
 /** Test seam: forget everything loaded, so a case can start from a known state. */
 export function __resetDurableForTest(): void {
   cache = null
+  preLoad = null
   if (flushTimer) clearTimeout(flushTimer)
   flushTimer = null
   flushing = false

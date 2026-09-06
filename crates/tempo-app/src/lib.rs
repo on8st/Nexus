@@ -14,8 +14,12 @@
 
 pub mod alltxt;
 pub mod bandplan;
+pub mod connect_web;
 pub mod dto;
 pub mod engine;
+pub mod fd_scoreboard;
+pub mod fdbridge;
+pub mod fdevent;
 pub mod keyboard;
 pub mod privileges;
 pub mod station;
@@ -248,6 +252,7 @@ impl AppState {
                 rig_keyed: false,
                 hrd_link_up: None,
                 hrd_queued: 0,
+                amp: None,
                 transmitting: false,
                 // Nobody holds the transmitter at construction — the engine recomputes this
                 // from `tx_owner()` every snapshot.
@@ -275,6 +280,9 @@ impl AppState {
                 notch: None,
                 comp: None,
                 vox: None,
+                manual_notch: None,
+                comp_level: None,
+                notch_freq_hz: None,
                 atu: None, // engine fills from the CAT TUNER probe (None = no ATU on this rig)
                 filter_width_hz: None, // engine fills from the CAT `m` passband read-back
                 rit_hz: 0,
@@ -284,6 +292,7 @@ impl AppState {
                 tx_level: 0.9,
                 tx_enabled: true,
                 tx_allowed: true,
+                tx_emission_mhz: None,
                 tuning: false,
                 tx_watchdog: false,
                 decode_depth: 3,
@@ -298,6 +307,7 @@ impl AppState {
                 split_tx_mhz: None,
                 audio_error: None,
                 radio_config_warning: None,
+                tx_power_zero: false,
                 recording_warning: None,
                 tx_even: true,
                 tx_cycle_auto: true,
@@ -870,6 +880,7 @@ impl AppState {
             grid_rarity: None,
             freq_hz: h.freq_hz,
             calling: h.calling.clone(),
+            cq_dir: h.cq_dir.clone(),
             // Stamped by the engine from the subdivision resolver; None at this layer.
             state: None,
         }
@@ -917,6 +928,7 @@ impl AppState {
             recent_decodes: Vec::new(),
             highlights: Vec::new(),
             clear_tick: 0,
+            logged_tick: 0,
             hunt: None,
             // Filled by the engine while coordinated QSY is enabled; None here.
             qsy: None,

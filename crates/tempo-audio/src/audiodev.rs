@@ -361,6 +361,10 @@ pub fn devices_from_cpal_names(names: Vec<String>) -> Vec<AudioDevice> {
 ///
 /// Windows/macOS only in practice — ALSA PCM names are unique, so the Linux path
 /// disambiguates LABELS instead ([`disambiguate_labels`]) and leaves names alone.
+/// `pub(crate)` for `usbtopo`, which must apply the SAME " #2" disambiguation before it can
+/// match a device name to a topology entry — the names it looks up are the disambiguated ones
+/// the pickers show, so a second copy of this rule would silently stop matching the moment
+/// either changed.
 pub(crate) fn disambiguate_names(names: Vec<String>) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     names

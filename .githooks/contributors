@@ -40,6 +40,10 @@ g0fqb1@gmail.com
 # the macOS pass (linker paths, rigctld run-check, tty/cu dedup, golden portability)
 258096273+on8st@users.noreply.github.com
 
+# PR #177 — the eQSL InBox preamble check (#176): found the failing payload, diagnosed the
+# prefix test, and wrote the fix
+69276965+KR8MER@users.noreply.github.com
+
 # ── Fork-local (on8st/Nexus). Not upstream's; do not carry this into a PR. ──
 # GitHub's committer on merges made in the web UI. on8st's upstream PRs were merged in the
 # browser, so they return into this fork with GitHub as COMMITTER and on8st as author. Not a

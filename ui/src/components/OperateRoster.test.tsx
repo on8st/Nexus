@@ -249,7 +249,7 @@ describe('OperateRoster composes the surface gate with strongest-need ranking', 
   it('ranks from the strongest CLOSABLE need, not the strongest overall', () => {
     renderWith('30m', 'FT8')
     expect(screen.queryByText('MODE')).toBeNull() // the CW need is withheld here
-    expect(screen.queryByText('QSL')).not.toBeNull() // the closable one survives (short form of NEEDS QSL)
+    expect(screen.queryByText('LoTW')).not.toBeNull() // the closable one survives (the confirm chip)
     // The row names the need it actually ranked from.
     expect(screen.queryByLabelText(/needed Confirm/)).not.toBeNull()
     expect(screen.queryByLabelText(/needed NewMode/)).toBeNull()
@@ -350,6 +350,33 @@ describe('the roster says who each station is calling, and what state they are i
     ])
     expect(cell('BUSY', '.or-calling')).toBe('K1ABC')
     expect(cell('FREE', '.or-calling')).toBe('CQ')
+  })
+
+  /// Operator request 2026-08-21: "station calling CQ listed in the Call Roster, so I click to
+  /// begin process, thennnn I look over at the Band Activity and see the station is calling CQ
+  /// DX (wanting DX land, not me CONUS). Would like to see it say his full CQ info."
+  ///
+  /// A directed CQ is not a call you can answer from just anywhere, and the roster showed the
+  /// same bare "CQ" for both — so the only way to find out was to look somewhere else, after
+  /// committing. The parser has carried the modifier all along.
+  it('shows the CQ modifier, so a directed call is not mistaken for a general one', () => {
+    withCols([
+      { call: 'DXONLY', calling: null, cqDir: 'DX' },
+      { call: 'POTASTA', calling: null, cqDir: 'POTA' },
+      { call: 'ANYONE', calling: null, cqDir: null },
+    ])
+    expect(cell('DXONLY', '.or-calling')).toBe('CQ DX')
+    expect(cell('POTASTA', '.or-calling')).toBe('CQ POTA')
+    // CONTROL: an undirected CQ is unchanged — the modifier must not invent one, and without
+    // this a rule that always appended something would pass the two assertions above.
+    expect(cell('ANYONE', '.or-calling')).toBe('CQ')
+  })
+
+  it('does not show a modifier for a station that is working somebody', () => {
+    // `cq_dir` is cleared when the last frame is not a CQ, but a stale value must not paint
+    // over the call being worked even if one arrives.
+    withCols([{ call: 'BUSY2', calling: 'K1ABC', cqDir: 'DX' }])
+    expect(cell('BUSY2', '.or-calling')).toBe('K1ABC')
   })
 
   it('shows the state OR province as a pill, and a bare em dash when there is neither', () => {

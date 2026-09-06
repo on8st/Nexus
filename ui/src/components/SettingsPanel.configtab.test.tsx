@@ -18,7 +18,7 @@ const api = vi.hoisted(() => {
   const VERBS = [
     'clearCloudlogKey', 'clearClublogPassword', 'clearEqslPassword', 'clearHamqthPassword',
     'clearHrdlogCode', 'clearLotwPassword', 'clearQrzLogbookKey', 'clearQrzPassword', 'detectRigs',
-    'downloadEqslReport', 'downloadLotwReport', 'getAllRigModels', 'getAudioDevices', 'resetSettings', 'audioDevicesForPort', 'getBandPlan',
+    'downloadEqslReport', 'downloadLotwReport', 'getAllRigModels', 'getAudioDevices', 'resetSettings', 'getBandPlan',
     'getRigModels', 'getSerialPortsDetailed', 'getSettings', 'setCloudlogKey', 'setClublogPassword',
     'setEqslPassword', 'setHamqthPassword', 'setHrdlogCode', 'setLotwPassword', 'setQrzLogbookKey',
     'setQrzPassword', 'setRepeaterbookToken', 'setRxGain', 'setSettings', 'setTxLevel', 'addRadio',

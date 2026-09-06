@@ -16,6 +16,7 @@ import { BandPicker } from './BandPicker'
 import { BandStrip } from './BandStrip'
 import { TuningStrip } from './TuningStrip'
 import { CockpitHeader } from './CockpitHeader'
+import { ZeroBeat } from './ZeroBeat'
 import { CockpitPaneFrame } from './panes/CockpitPaneFrame'
 import { MemoryStrip } from './MemoryStrip'
 import { IS_MAC, FN_KEY_HINT } from '../platform'
@@ -59,9 +60,11 @@ import {
   haltTx,
   startQsoRecording,
   stopQsoRecording,
+  getCatCwUnprovenRigModels,
 } from '../api'
 import { bandLabelForMhz, sidebandForQsy } from '../band'
 import { pushToast, withErrorToast } from '../toast'
+import { SplitControl } from './SplitControl'
 import { RotorStrip } from './RotorStrip'
 import { useWheelTune } from '../useWheelTune'
 import { useScopeTune } from '../useScopeTune'
@@ -69,6 +72,7 @@ import { useRegionCols } from '../useRegionCols'
 import { usePinnedScroll } from '../usePinnedScroll'
 import { cwScopeWindow, isRfScopeSource, sidebandSign, TRACE_HOLD_MS, NO_NATIVE_SCOPE_REASON } from '../waterfall'
 import { t } from '../i18n'
+import { T } from '../i18n/T'
 import type { MessageKey } from '../i18n'
 
 /** This cockpit's INVARIANT vocabulary — the words that are the mode's own technical tokens
@@ -86,19 +90,30 @@ const AGC = 'AGC'
 const BW = 'BW'
 const CAT = 'CAT'
 const WINKEYER = 'WinKeyer'
-const SPLIT_PLATE = 'SPLIT ▲'
 const REC = 'REC'
 /** The BW nudge and the AI decoder's audio window, as the tooltips print them — figures, so
  *  they are supplied to the message rather than written in it. */
 const FILTER_STEP_HZ = 50
 const AI_WINDOW_HZ = '400–1200'
 
+/** The AGC chips, in the order `Engine::AGC_SPEEDS` lists them: AUTO left of the three time
+ *  constants, OFF right of them — most-automatic through to no AGC at all. The `id` is the
+ *  token that goes on the wire and the label is a KEY, not a word: `t()` runs when the row
+ *  RENDERS, so a locale switch relabels the chips and the chip is still compared on its id
+ *  (the same split RF_SPANS makes, and for the same reason). */
+const AGC_CHIPS = [
+  { id: 'auto', labelKey: 'cw.rxDsp.agc.auto' },
+  { id: 'fast', labelKey: 'cw.rxDsp.agc.fast' },
+  { id: 'mid', labelKey: 'cw.rxDsp.agc.mid' },
+  { id: 'slow', labelKey: 'cw.rxDsp.agc.slow' },
+  { id: 'off', labelKey: 'cw.rxDsp.agc.off' },
+] as const satisfies readonly { id: string; labelKey: MessageKey }[]
+
 /** Client-side RF-zoom presets for a native panadapter (mirror of the Phone cockpit).
  *  The ± labels are measurements and stay written here; `Full` is a word. Both it and every
  *  title resolve when the row RENDERS (a module constant would freeze the first locale
  *  loaded), so the chips are keyed and compared on `id` — the preset itself rather than the
  *  word printed on it. */
-
 const RF_SPANS = [
   {
     id: 'full',
@@ -196,6 +211,9 @@ interface Props {
   /** Open Settings at a section id (see settings/registry.ts). Absent ⇒ the surfaces that
    * point at Settings stay plain text. */
   onOpenSettings?: (target: string) => void
+  /** Open the Logbook filtered to a callsign (#192) — handed to the log strip's recall card,
+   *  whose previous-contact rows become clickable when it is present. Omitted ⇒ inert rows. */
+  onOpenLogbook?: (call: string) => void
   /** Panel visibility/resize record — host-owned (App) so it survives this view's remounts.
    *  Optional: without it every pane shows and there's no ⊞ menu. */
   panels?: PanelLayoutApi<CwPanelId>
@@ -254,7 +272,7 @@ const DEFAULT_MACROS: CwMacro[] = [
  * The engine fills {EXCH} = "{CLASS} {SECTION}" (e.g. "3A WI") from the FD settings, so
  * one template serves both events. Contest cadence: F1 CQ FD → F2 answer with your call →
  * F3 send the exchange (twice, for copy) → F4 confirm + TU. */
-const DEFAULT_FD_MACROS: CwMacro[] = [
+export const DEFAULT_FD_MACROS: CwMacro[] = [
   { key: 'F1', label: 'CQ FD', text: 'CQ FD DE {MYCALL} {MYCALL} K' },
   { key: 'F2', labelKey: 'cw.macro.call.label', text: '! DE {MYCALL} K' },
   { key: 'F3', labelKey: 'cw.macro.exch.label', text: '! DE {MYCALL} {EXCH} {EXCH} K' },
@@ -298,6 +316,7 @@ export function CwCockpit({
   onRecallMemory,
   onOpenMemories,
   onOpenSettings,
+  onOpenLogbook,
   panels,
 }: Props) {
   // Live S-meter (shared 100 ms poll, lock-free backend) — used to arrive via the 300 ms
@@ -558,6 +577,13 @@ export function CwCockpit({
   // exchange tokens) while FD mode is on. Keep the full settings so the switcher can
   // persist the new active-profile index without dropping other fields.
   const [cwSettings, setCwSettings] = useState<Settings | null>(null)
+  // Models whose CAT CW keyer is UNPROVEN and cannot report its own failure. Fetched from the
+  // backend, which owns the rule (`rigmodels::cat_cw_unproven_rig_models`) — the SAME list
+  // Settings ▸ CW reads, never a second copy here: membership changes as backends are fixed
+  // upstream, and two sources of truth is how the two surfaces come to disagree about a radio.
+  // Empty = rule unread (built without the `radio` feature, or the command failed), and no
+  // caution is shown — an unreadable rule must not warn an operator off a keyer that works.
+  const [catCwUnproven, setCatCwUnproven] = useState<number[]>([])
   const [profiles, setProfiles] = useState<{ name: string; macros: { key: string; label: string; text: string }[] }[]>(
     [],
   )
@@ -570,6 +596,11 @@ export function CwCockpit({
         setCwSettings(s)
         setProfiles(s.macros?.cwProfiles ?? [])
         setActiveProfile(s.macros?.activeCwProfile ?? 0)
+      })
+      .catch(() => {})
+    void getCatCwUnprovenRigModels()
+      .then((m) => {
+        if (alive && Array.isArray(m)) setCatCwUnproven(m)
       })
       .catch(() => {})
     return () => {
@@ -657,6 +688,13 @@ export function CwCockpit({
   // The four back-end descriptions, read once per render — the select wears the SELECTED
   // one's and each <option> wears its own.
   const keyerHelpText = keyerHelp()
+  // CAT KEYING IS UNPROVEN ON THIS RADIO (field report 2026-08-28, Yaesu FTX-1: "Try send a cw,
+  // never went to tx"). The rig's Hamlib backend reports success whether or not it keyed, so the
+  // keyer-error banner below can never light for this fault — the operator is told UP FRONT
+  // instead. Read off the LIVE `keyer` state, not the saved setting, because this header switch
+  // is where a backend gets changed without Settings ever being opened.
+  const catCwUnprovenHere =
+    keyer === 'cat' && !!cwSettings && catCwUnproven.includes(cwSettings.rigModel)
   const [text, setText] = useState('')
   // Sidetone pitch — local for instant marker response; persisted via set_cw_keyer.
   const [pitch, setPitch] = useState(pitchHz)
@@ -1073,25 +1111,15 @@ export function CwCockpit({
                 title={t('cw.rxDsp.agc.title')}
               >
                 <span className="ph-dsplev-lbl">{AGC}</span>
-                {(['auto', 'fast', 'mid', 'slow', 'off'] as const).map((sp) => (
-
+                {AGC_CHIPS.map(({ id, labelKey }) => (
                   <button
-                    key={sp}
+                    key={id}
                     type="button"
-                    className={`theme-chip${agc === sp ? ' active' : ''}`}
-                    aria-pressed={agc === sp}
-                    onClick={() => changeAgc(sp)}
+                    className={`theme-chip${agc === id ? ' active' : ''}`}
+                    aria-pressed={agc === id}
+                    onClick={() => changeAgc(id)}
                   >
-                        {sp === 'auto'
-                          ? t('cw.rxDsp.agc.auto')
-                          : sp === 'fast'
-                            ? t('cw.rxDsp.agc.fast')
-                            : sp === 'mid'
-                              ? t('cw.rxDsp.agc.mid')
-                              : sp === 'slow'
-                                ? t('cw.rxDsp.agc.slow')
-                                : t('cw.rxDsp.agc.off')}
-
+                    {t(labelKey)}
                   </button>
                 ))}
               </div>
@@ -1176,6 +1204,7 @@ export function CwCockpit({
           pane grid made this pane's .pane-body the scroller, so the FULL recall card (photo /
           bearing / history) can no longer crush the cockpit the way it did pre-overhaul. */}
       <LogEntry
+        onOpenLogbook={onOpenLogbook}
         snap={snap}
         mode="CW"
         defaultRst="599"
@@ -1379,13 +1408,23 @@ export function CwCockpit({
               )
           }
         />
-        {snap.radio.splitTxMhz != null && (
-          <span
-            className="cw-mode-badge"
-            title={t('cw.split.title', { freq: snap.radio.splitTxMhz.toFixed(4) })}
-          >
-            {SPLIT_PLATE}
-          </span>
+        {/* ⭐ A REAL SPLIT CONTROL, not a read-only plate. Until 2026-08-26 this header only
+            DISPLAYED that split was on; there was no way to set it from the CW cockpit at all.
+            A General working a DX in the Extra-only CW bottom — RX 14.015, TX 14.026, which is
+            simply how DX is worked — had to reach for the radio's front panel and then found
+            Nexus refusing to key, because the privilege gate had no way to learn where he was
+            transmitting. Fixing the gate without this left the fix unreachable by the operator
+            who reported it, and he was a CW operator.
+
+            Gated on `catOk` like Phone's: with no CAT there is nothing to command, and the
+            header is width-critical at 1024 (see the density note above), so it costs nothing
+            when there is no radio to talk to. NOT a stop control — see SplitControl's header. */}
+        {catOk && (
+          <SplitControl
+            snap={snap}
+            onSnap={onSnap}
+            onError={(m) => pushToast(m, 'error')}
+          />
         )}
         {/* Dot + "REC", the same `.ph-rec` class Phone uses. This header already carries the band
             picker, tuning strip, Tune, Stop TX, speed, pitch, macros, BW, memories and the rotator,
@@ -1412,6 +1451,17 @@ export function CwCockpit({
       {keyerError && (
         <div className="cw-keyer-warn" role="alert">
           ⚠ {keyerError}
+        </div>
+      )}
+
+      {/* The standing caution, BELOW a live error because an error outranks a notice. Same
+          sanctioned `.cw-keyer-warn` shell-child kind (the census admits one alert kind here,
+          not two), warning-toned rather than error-toned via `.caution`: this never blocks and
+          never disables the keyer, which keeps working if it works. The sentence is the SAME
+          catalog string Settings ▸ CW renders. */}
+      {catCwUnprovenHere && (
+        <div className="cw-keyer-warn caution" role="status">
+          ⚠ <T k="settings.cw.keyer.unproven" tags={{ b: <strong /> }} />
         </div>
       )}
 
@@ -1443,6 +1493,14 @@ export function CwCockpit({
             {nativeRf ? t('cw.scope.nativeRf.label') : t('cw.scope.audio.label')}{' '}
             <span className="ph-scope-sub">{scopeSub}</span>
           </span>
+          {/* ⭐ THE ZERO-BEAT INDICATOR sits in the SCOPE HEAD, beside the marker it
+              completes: the scope below draws your pitch, this says where the received
+              tone actually is, and its needle runs in the scope's own axis so the two can
+              never disagree. It is chrome in an existing row — no new shell child, no new
+              pane, no ⊞ id — and it is a display only: nothing here can move the radio. It
+              goes with the scope when the strip is hidden, which is right, because it is
+              the other half of that picture. */}
+          <ZeroBeat targetHz={pitch} filterHz={filterHz} />
           <span className="ph-scope-head-label">{t('cw.scope.colors.label')}</span>
           <PalettePicker />
         </div>

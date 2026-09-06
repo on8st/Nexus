@@ -8,9 +8,9 @@
 // ClubLog auto-revokes once it becomes public. If the wording and the redaction ever drift
 // apart, the wording is the one that gets believed.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { confirmDialog } from '../confirm'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { SettingsPanel } from './SettingsPanel'
+import { ConfirmHost } from '../confirm'
 import type { FeaturesApi } from '../useFeatures'
 import defaultSettings from './__fixtures__/defaultSettings.json'
 
@@ -31,14 +31,6 @@ const api = vi.hoisted(() => {
 // defined on the mock"), which presents as a behaviour regression in whichever test happened to
 // run -- not as the out-of-date mock it actually is. Reading the real module's export names makes
 // that failure impossible by construction.
-// window.confirm is INERT in the Tauri webview, so destructive actions now go through the
-// in-app dialog (src/confirm.tsx). Mock THAT -- mocking window.confirm tested a dialog the real
-// app never shows, which is exactly how the dead-confirm bug survived a green suite.
-vi.mock('../confirm', () => ({
-  confirmDialog: vi.fn(() => Promise.resolve(true)),
-  ConfirmHost: () => null,
-}))
-
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   const mod: Record<string, unknown> = {}
@@ -117,8 +109,13 @@ const features: FeaturesApi = {
   setProfile: vi.fn(),
 } as unknown as FeaturesApi
 
+/** The panel WITH the confirm host, which is how App renders it. #89 moved the destructive
+ *  paths off `window.confirm` (inert in this webview) onto the in-app dialog, so a test that
+ *  stubbed `window.confirm` would now pass while exercising nothing — the very shape of the
+ *  bug #89 fixed. Mounting the host makes Restore's question real and clickable. */
 function renderPanel() {
   return render(
+    <>
     <SettingsPanel
       activeRadioId={0}
       scale={1 as never}
@@ -130,7 +127,9 @@ function renderPanel() {
       onDensityChange={() => {}}
       onResetLayout={() => {}}
       features={features}
-    />,
+      />
+      <ConfirmHost />
+    </>,
   )
 }
 
@@ -178,20 +177,26 @@ describe('backing up the station', () => {
   }
 
   // RESTORE MUST REFRESH WHAT IS ON SCREEN. `import_settings_bundle` used to hand-roll
-  // `eng.apply_settings()` and return nothing, instead of routing through `set_settings` the way
-  // `reset_settings` does. So it applied the bundle to the running engine, persisted nothing, and
-  // handed the panel no snapshot -- which went on rendering the PRE-restore form. To the operator
-  // (2026-08-14) Restore appeared to do nothing at all.
+  // `eng.apply_settings()` and return nothing, so it applied the bundle to the running engine,
+  // persisted nothing, and handed the panel no snapshot -- which went on rendering the
+  // PRE-restore form. To the operator (2026-08-14) Restore appeared to do nothing at all.
   //
   // And the stale form stayed live, so the next Save wrote the OLD values back over the restored
   // ones: a silent revert of an explicit, confirmed, "this cannot be undone" action. Nothing
   // tested this path at all -- there was not one reference to importSettingsBundle in the suite.
   it('re-reads the settings after a restore, so the panel cannot show stale values', async () => {
-    vi.mocked(confirmDialog).mockResolvedValue(true)
     const { container } = renderPanel()
+    // CONFIG, not Radio. This test arrived with the restore fix (#85), when Backup and Restore
+    // still lived under Radio ▸ Transmit limits & sharing; this branch is the one that moves them.
+    // Left pointing at Radio it fails on an absent file input — a real signal, not a flake, and
+    // the reason the tab is named here rather than the input hunted for across the panel.
     fireEvent.click(await screen.findByRole('tab', { name: 'Config' }))
 
-    const input = container.querySelector('input[type="file"]') as HTMLInputElement
+    // NOT the first file input: the TLE importer is also one and comes first in the DOM.
+    // Pick the restore input by what it accepts, or this drives the wrong feature entirely.
+    const input = container.querySelector(
+      'input[type="file"][accept*="json"]',
+    ) as HTMLInputElement
     expect(input).toBeTruthy()
 
     // The real command returns the refreshed AppSnapshot; the blanket mock returns null for
@@ -202,6 +207,15 @@ describe('backing up the station', () => {
     const file = new File([bundle], 'nexus-backup.json', { type: 'application/json' })
     const before = api.get('getSettings').mock.calls.length
     fireEvent.change(input, { target: { files: [file] } })
+
+    // The handler ASKS FIRST and only imports on an explicit yes, so the dialog has to be answered
+    // or nothing happens at all. Asserting the question appears is half the value of this test:
+    // a destructive restore that skipped it would pass every other assertion here.
+    await waitFor(() =>
+      expect(screen.getByText(/Replace your current setup with nexus-backup\.json\?/)).toBeTruthy(),
+    )
+    expect(api.get('importSettingsBundle')).not.toHaveBeenCalled()
+    screen.getByRole('button', { name: 'Restore' }).click()
 
     await waitFor(() => expect(api.get('importSettingsBundle')).toHaveBeenCalled())
     // The point: settings are re-read AFTER the import, not left to the stale form.

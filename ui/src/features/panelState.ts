@@ -227,6 +227,7 @@
 // are all census-only for that reason); and that a NEWLY ADDED stop control reached its
 // cockpit's sweep list is a human step, named in each sweep.
 import { useCallback, useMemo, useState } from 'react'
+import { durableGet, durableSet } from './durableStore'
 import { windowInstance } from './windowScope'
 
 export type PanelState = 'docked' | 'popped' | 'removed'
@@ -312,7 +313,10 @@ export function coercePanelLayout<P extends string>(
 
 export function savePanelLayout<P extends string>(key: string, layout: PanelLayout<P>): void {
   try {
-    window.localStorage.setItem(key, JSON.stringify(layout))
+    // The MAIN window's layout is durable (it survives a reinstall); a detached panel's is
+    // not. `durableSet` decides from the key itself — see `isMainWindowPanelLayout` — so this
+    // call site does not have to know which surface it is on, and cannot get it wrong.
+    durableSet(key, JSON.stringify(layout))
   } catch {
     /* full/unavailable — in-memory state still applies this session */
   }
@@ -360,7 +364,7 @@ export function loadPanelLayout<P extends string>(
   const key = panelStorageKey(spec.view, instance)
   let layout = emptyPanelLayout<P>()
   try {
-    const raw = window.localStorage.getItem(key)
+    const raw = durableGet(key)
     if (raw != null) layout = coercePanelLayout(spec, JSON.parse(raw))
   } catch {
     /* malformed — fall through (matches loadPlacement) */
@@ -772,8 +776,9 @@ export const ALL_PANEL_VOCABULARIES: readonly PanelVocabulary<string>[] = [
  * Operate is the only cockpit that ever WRITES 'popped' into a visibility record —
  * OperateCockpit's waterfall pop-out holds the app's single `setPanelState(id, 'popped')`
  * call — and the only one with a re-dock bar. Pop-out AFFORDANCES are not rare, and an earlier
- * version of this note implied they were: DetachedPanel dispatches ten panel kinds (waterfall,
- * needed, memories, connect, dxped, sats, fieldday, operate, bandmapPhone, bandmapCw), and
+ * version of this note implied they were: DetachedPanel dispatches twelve panel kinds (waterfall,
+ * needed, memories, connect, dxped, sats, pota, fieldday, fdclub, operate, bandmapPhone,
+ * bandmapCw), and
  * Phone's and CW's band-map panes each carry one. Those call `openPanelWindow` directly and
  * never touch the record, which is exactly why they leave no stale 'popped' behind. In the
  * other four vocabularies a stored 'popped' renders the pane DOCKED while its ⊞ entry reads

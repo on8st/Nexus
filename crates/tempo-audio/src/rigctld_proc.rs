@@ -88,6 +88,82 @@ impl LineState {
             _ => LineState::Low,
         }
     }
+
+    /// Parse `Settings::cat_ptt_line_state` — the KEYING line's idle state (#145), whose safe
+    /// default is the OPPOSITE of [`from_setting`](LineState::from_setting)'s.
+    ///
+    /// The two differ on purpose. For a line Nexus may freely hold, [`Low`](LineState::Low) is
+    /// the safe answer and the 1.0.2 fix. For the line Hamlib is KEYING with, we have never
+    /// emitted anything at all and Hamlib refuses it on most backends anyway, so the safe answer
+    /// is that same silence — [`Untouched`](LineState::Untouched). An unrecognised or empty
+    /// value therefore changes nothing, exactly as it does there.
+    pub fn from_keying_setting(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => LineState::Low,
+            "high" => LineState::High,
+            _ => LineState::Untouched,
+        }
+    }
+}
+
+/// The rig's serial HANDSHAKE as the operator DECLARED it (`Settings::cat_serial_handshake`) —
+/// as distinct from the handshake Nexus INFERS, which is what [`ControlLines::handshake_none`]
+/// carries.
+///
+/// ⚠️ #145 IS WHY A DECLARATION EXISTS AT ALL. The inference has been wrong three times, and its
+/// third failure is structural rather than a mistuned threshold: with serial-RTS PTT on the CAT
+/// port, [`settable_lines_for`] reports RTS unsettable *because it is the keying line*, which
+/// makes `rts_taken_by_handshake` false — so [`resolve_lines`]'s override cannot fire, no
+/// `serial_handshake` is emitted, no `rts_state` is emitted either, and rigctld launches saying
+/// nothing whatever about RTS. A fourth inference would be a fourth guess about a cable only the
+/// operator can see (the [`ControlLines::handshake_none`] ⚠️ has the full history).
+///
+/// #200 AMENDED THE STRUCTURAL HALF (2026-09-01): when the dump positively reports BOTH keyed
+/// RTS and a HARDWARE handshake, the silence itself keyed a TS-2000 from launch to exit on
+/// Windows, and freeing the handshake there is not a cable guess — the operator's own PTT
+/// declaration makes the collision certain. That narrow case now rides
+/// [`SettableLines::keying_rts_on_hardware_handshake`]; the declaration remains the answer for
+/// every other shape, exactly as before.
+///
+/// [`Auto`](Handshake::Auto) is the default and is today's behaviour to the byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Handshake {
+    /// Say nothing of our own; let [`resolve_lines`] infer it exactly as before.
+    #[default]
+    Auto,
+    /// `-C serial_handshake=None` — no flow control, so RTS is ours to hold.
+    None,
+    /// `-C serial_handshake=Hardware` — RTS/CTS flow control, RTS is the rig's.
+    Hardware,
+    /// `-C serial_handshake=XONXOFF` — software flow control; RTS is free.
+    XonXoff,
+}
+
+impl Handshake {
+    /// The exact Hamlib `serial_handshake` token, or `None` for "say nothing". The spellings are
+    /// [`HANDSHAKE_RTS_FREE`]/[`HANDSHAKE_RTS_TAKEN`] — Hamlib's own combo vocabulary, which
+    /// `conf.c` matches with `strcmp`, so a wrong case is `Invalid parameter` and rigctld exits 2
+    /// (see [`LineState::value`], which is the same discipline for the same reason).
+    fn value(self) -> Option<&'static str> {
+        match self {
+            Handshake::Auto => Option::None,
+            Handshake::None => Some("None"),
+            Handshake::Hardware => Some("Hardware"),
+            Handshake::XonXoff => Some("XONXOFF"),
+        }
+    }
+
+    /// Parse the operator's stored setting (`Settings::cat_serial_handshake`). Anything
+    /// unrecognised — including the empty string an older settings file or a half-wired UI can
+    /// produce — means [`Auto`](Handshake::Auto), i.e. change nothing.
+    pub fn from_setting(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Handshake::None,
+            "hardware" => Handshake::Hardware,
+            "xonxoff" => Handshake::XonXoff,
+            _ => Handshake::Auto,
+        }
+    }
 }
 
 /// What the operator wants each of the two control lines held at.
@@ -95,6 +171,28 @@ impl LineState {
 pub struct ControlLines {
     pub rts: LineState,
     pub dtr: LineState,
+    /// The operator's own declaration about this port's flow control — it REPLACES the
+    /// inference below when it is anything but [`Handshake::Auto`]. See [`Handshake`].
+    pub handshake: Handshake,
+    /// What the KEYING line (serial RTS/DTR PTT) is held at while idle
+    /// (`Settings::cat_ptt_line_state`).
+    ///
+    /// ⚠️ THIS IS THE LINE THAT KEYS THE TRANSMITTER (#145), and it is deliberately NOT `rts` /
+    /// `dtr` above: those two are never emitted for the keying line, because Hamlib's `rig_open`
+    /// refuses `<line>_state` on the line it is keying with (refusal #1 in [`SettableLines`]) —
+    /// so today the keying line's idle level is whatever `rig_open` and the USB-serial driver
+    /// leave it at, which on a CP210x can be ASSERTED, i.e. the rig keyed from launch.
+    ///
+    /// [`Untouched`](LineState::Untouched) is the default and means "say nothing", which is
+    /// today's behaviour. Anything else is emitted for the keying line, and that is the
+    /// operator overriding a Hamlib refusal on purpose.
+    ///
+    /// ⚠️ NEEDS-BENCH. Refusal #1 is the SILENT kind — `rig_open` returns `-RIG_ECONF` and
+    /// rigctld does not exit, so it serves a rig it never opened: CAT that connects and does
+    /// nothing. There is no serial rig on this machine and CI cannot reproduce a pin, so which
+    /// backends take it and which lose CAT to it is unknown here. Default-safe is the whole
+    /// design: an operator who never opens the setting cannot reach any of it.
+    pub keying_line: LineState,
     /// Emit `-C serial_handshake=None`, so RTS stops being flow control and CAN be held.
     ///
     /// Set only by [`resolve_lines`], and only when the hardware-handshake declaration is the
@@ -129,11 +227,13 @@ pub struct ControlLines {
 }
 
 impl ControlLines {
-    /// The safety default: both lines held low.
+    /// The safety default: both lines held low, and neither #145 declaration made.
     pub fn hold_low() -> Self {
         Self {
             rts: LineState::Low,
             dtr: LineState::Low,
+            handshake: Handshake::Auto,
+            keying_line: LineState::Untouched,
             handshake_none: false,
         }
     }
@@ -184,6 +284,24 @@ pub struct SettableLines {
     /// a real conflict, and a backend that offers no `rts_state` at all has nothing to set.
     /// Drives [`ControlLines::handshake_none`].
     pub rts_taken_by_handshake: bool,
+    /// The keyed-RTS collision (issue #200): the dump positively said BOTH that RTS is the
+    /// keying line (`ptt_type: RTS`) and that the backend declares HARDWARE handshake. The
+    /// two uses of the pin are incoherent in every configuration — flow control and PTT
+    /// cannot share it — and on Windows the collision is not latent: handshake=Hardware maps
+    /// to `RTS_CONTROL_HANDSHAKE`, the driver asserts RTS (the key line) from the moment the
+    /// daemon opens the port, and Hamlib's own un-key at rig_open (`ser_set_rts(pttp, 0)`)
+    /// is an `EscapeCommFunction(CLRRTS)` the driver refuses and Hamlib's termios shim
+    /// swallows (4.7.1 lib/termios.c:3305-3321, 3590 — returns 0 regardless). A TS-2000 on a
+    /// Digirig sat keyed from launch to exit. Unlike refusal #2's override this needs no
+    /// `rts_deliberate` gate: the operator's own PTT declaration on this very port IS the
+    /// deliberateness, at its strongest.
+    ///
+    /// Not folded into `rts_taken_by_handshake`, which means "the ORDINARY override can lift
+    /// this" and is deliberately false for the keying line (its consumers hold an operator
+    /// WISH for the line; the keyed case has no wish to deliver — only the handshake to
+    /// free). Same stale-vocabulary discipline as everything here: positively `Hardware` per
+    /// the pinned vocabulary, or the field claims nothing.
+    pub keying_rts_on_hardware_handshake: bool,
 }
 
 /// Narrow the operator's wishes to what this rig's Hamlib will actually accept. A line we
@@ -243,10 +361,29 @@ fn resolve_lines(
     // DELIBERATE thing (`rts_deliberate`): the blanket hold-low safety default must never be
     // the reason a rig loses its declared handshake. See [`ControlLines::handshake_none`] —
     // the KD9TAW bench regression (2026-08-09) is why this gate exists.
-    let free_rts = !settable.rts
-        && settable.rts_taken_by_handshake
-        && want.rts != LineState::Untouched
-        && rts_deliberate;
+    //
+    // …unless the operator DECLARED the handshake (#145), in which case their declaration
+    // replaces the whole inference — a declared `None`/`XONXOFF` frees RTS, a declared
+    // `Hardware` says it is the rig's and no override applies. See [`Handshake`] for why a
+    // fourth inference was not the answer.
+    let free_rts = match want.handshake {
+        Handshake::Auto => {
+            (!settable.rts
+                && settable.rts_taken_by_handshake
+                && want.rts != LineState::Untouched
+                && rts_deliberate)
+                // The keyed-RTS collision (#200): hardware flow control on the line the
+                // operator declared as PTT keys the rig from port-open on Windows, and only
+                // freeing the handshake lets rig_open's own un-key move the pin. No
+                // `rts_deliberate` gate — the PTT declaration on this very port is the
+                // deliberateness — and no `want.rts` gate: there is no wish to deliver on a
+                // keying line (rigctld_args refuses `rts_state` for it regardless); the
+                // handshake is the whole trade.
+                || settable.keying_rts_on_hardware_handshake
+        }
+        Handshake::None | Handshake::XonXoff => true,
+        Handshake::Hardware => false,
+    };
     ControlLines {
         rts: if settable.rts || free_rts {
             want.rts
@@ -258,7 +395,12 @@ fn resolve_lines(
         } else {
             LineState::Untouched
         },
-        handshake_none: free_rts,
+        // Both declarations pass through untouched: narrowing them against what the daemon
+        // says it accepts is exactly what silenced the keying line in the first place, and a
+        // declaration the operator made about their own cable is not ours to narrow.
+        handshake: want.handshake,
+        keying_line: want.keying_line,
+        handshake_none: free_rts && want.handshake == Handshake::Auto,
     }
 }
 
@@ -348,9 +490,16 @@ pub fn rigctld_args(
         // applies every -C before rig_open, and rig_open is where both are read — but it reads
         // as the precondition it is, and the daemon's own log line then shows why RTS was
         // settable on a backend that declares otherwise.
-        if lines.handshake_none {
+        // ONE `serial_handshake` argument, whichever decided it: the operator's declaration
+        // first (#145), else the inference's `None` override. They are mutually exclusive by
+        // construction — `resolve_lines` only sets `handshake_none` on the `Auto` arm.
+        if let Some(h) = lines.handshake.value().or(if lines.handshake_none {
+            Some("None")
+        } else {
+            None
+        }) {
             args.push("-C".to_string());
-            args.push("serial_handshake=None".to_string());
+            args.push(format!("serial_handshake={h}"));
         }
         if ptt_line != Some(crate::rig::SerialLine::Rts) {
             if let Some(v) = lines.rts.value() {
@@ -362,6 +511,16 @@ pub fn rigctld_args(
             if let Some(v) = lines.dtr.value() {
                 args.push("-C".to_string());
                 args.push(format!("dtr_state={v}"));
+            }
+        }
+        // …and the KEYING line, which the two guards above deliberately skip (#145). Emitted
+        // ONLY on an explicit declaration — `Untouched` is the default and says nothing, which
+        // is what every release up to now did. See [`ControlLines::keying_line`] for the
+        // NEEDS-BENCH warning: Hamlib refuses this on the line it keys with, silently.
+        if let Some(line) = ptt_line {
+            if let Some(v) = lines.keying_line.value() {
+                args.push("-C".to_string());
+                args.push(format!("{}_state={v}", line_state_param(line)));
             }
         }
     }
@@ -384,6 +543,16 @@ pub fn ptt_type_token(line: crate::rig::SerialLine) -> &'static str {
     match line {
         crate::rig::SerialLine::Rts => "RTS",
         crate::rig::SerialLine::Dtr => "DTR",
+    }
+}
+
+/// The Hamlib conf-parameter NAME for a line's held state — `rts_state` / `dtr_state`. Kept as a
+/// function for the same reason [`ptt_type_token`] is: the spelling is what
+/// [`parse_settable_lines`] looks for in the dump, so it must exist in exactly one place.
+fn line_state_param(line: crate::rig::SerialLine) -> &'static str {
+    match line {
+        crate::rig::SerialLine::Rts => "rts",
+        crate::rig::SerialLine::Dtr => "dtr",
     }
 }
 
@@ -1113,19 +1282,85 @@ fn path_has(path_var: &std::ffi::OsStr, bin_name: &str) -> bool {
 /// hang Nexus, so it is killed and treated as unusable rather than waited on.
 #[cfg(unix)]
 fn runs_ok(bin: &std::ffi::OsStr) -> bool {
+    runs_ok_within(bin, std::time::Duration::from_millis(2_000))
+}
+
+/// [`runs_ok`] with the wait budget supplied.
+///
+/// ⚠️ SPLIT OUT FOR THE TEST, AND THE PRODUCTION BUDGET IS UNCHANGED. The 2 s bound is right on
+/// the CAT-connect path — a candidate that hangs must not hang Nexus — but it is a WALL CLOCK,
+/// and a wall clock in a test is a race against the machine. Under a full `cargo test
+/// --workspace`, with every core busy on other crates, spawning `/bin/sh` and collecting its exit
+/// can take longer than two seconds; the child is then killed and a perfectly good binary reports
+/// as unrunnable. That is what made
+/// `runs_ok_accepts_a_nonzero_exit_and_rejects_only_a_signal` fail only in the full run and pass
+/// alone, serially or in parallel — measured, after it went red on two consecutive workspace runs
+/// while its own module passed every way it could be run on its own.
+///
+/// The test passes a generous budget so it measures the VERDICT LOGIC — ran vs died by signal vs
+/// could not exec — which is the thing it exists to pin. Nothing about what ships changes.
+#[cfg(unix)]
+fn runs_ok_within(bin: &std::ffi::OsStr, budget: std::time::Duration) -> bool {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
-    let mut child = match Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+    // ⚠️ "COULD NOT EXEC RIGHT NOW" IS NOT "THIS BINARY IS UNUSABLE", and collapsing the two is
+    // the same mistake EINTR was on the CAT read path. This function's verdict decides whether
+    // Nexus ABANDONS an operator's deliberately chosen rigctld and substitutes its own guess, so
+    // every transient must be retried rather than answered.
+    //
+    // Three are transient, and the third is the one that was actually biting:
+    //   WouldBlock   EAGAIN from `fork` — the system is briefly out of process/thread slots.
+    //   Interrupted  EINTR — a signal landed mid-call.
+    //   ExecutableFileBusy  ETXTBSY — someone holds the file OPEN FOR WRITING. On Linux `execve`
+    //                refuses that, and the writer does not have to be us: a fork in ANOTHER
+    //                thread between a `File::create` and its close hands the child an inherited
+    //                write descriptor, and the exec fails until that child's fd goes away. So it
+    //                is a property of the moment, not of the binary — and it is exactly what a
+    //                fresh install hits, where Nexus has just unpacked rigctld and is probing it.
+    //
+    // ETXTBSY was found by a flaky test rather than reasoned out: the assertion prints the raw
+    // spawn error, and after 12 runs it said `kind=ExecutableFileBusy err=Text file busy`. An
+    // earlier pass had guessed a fork/timeout cause and its own control DISPROVED it. Retrying
+    // the wrong errno would have left this exactly as broken while looking fixed.
+    //
+    // ENOENT / EACCES / bad arch are real answers about the binary and still return immediately.
+    let spawn = |_: ()| {
+        Command::new(bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut child = match spawn(()) {
         Ok(c) => c,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ExecutableFileBusy
+            ) =>
+        {
+            // A few short retries, not one: ETXTBSY lasts as long as some other process holds
+            // the write descriptor, which is a fork's worth of time and can outlast a single
+            // 50 ms nap. Bounded so a genuinely busy file still answers quickly.
+            let mut got = None;
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Ok(c) = spawn(()) {
+                    got = Some(c);
+                    break;
+                }
+            }
+            match got {
+                Some(c) => c,
+                None => return false,
+            }
+        }
         Err(_) => return false, // not executable at all (ENOENT / EACCES / bad arch)
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+    let deadline = std::time::Instant::now() + budget;
     loop {
         match child.try_wait() {
             // Exited on its own terms — ANY code, see above. Only signal death disqualifies.
@@ -1207,6 +1442,108 @@ fn resolve_hamlib_bin_in(
     bin_name.into()
 }
 
+/// Every place a **bundled** Hamlib tool can sit, relative to the directory holding the Nexus
+/// executable, most-specific first. `exe_name` is the executable's own file name, which is also
+/// the directory Tauri names on Linux (`usr/lib/<productName>/`).
+///
+/// ⚠️ **THE LINUX AND macOS ENTRIES ARE NOT DECORATION — until 2026-08-24 they were missing and
+/// the AppImage shipped Hamlib's five licence texts and no Hamlib.** The Windows installer has
+/// always carried rigctld, and the entries above covered it because Tauri puts the Windows
+/// resources beside the .exe. Every other platform puts them somewhere else, so the bundled copy
+/// was unreachable even once the build staged it:
+///
+/// | bundle          | executable                  | resources                              |
+/// |-----------------|-----------------------------|----------------------------------------|
+/// | Windows NSIS    | `<root>/Nexus.exe`          | `<root>/resources/`                    |
+/// | Linux deb + App | `usr/bin/Nexus`             | `usr/lib/Nexus/resources/`             |
+/// | macOS .app      | `Contents/MacOS/Nexus`      | `Contents/Resources/`                  |
+///
+/// Kept as ONE list because the three resolvers (`rigctld`, `rotctld`, `rigctl`) held three
+/// verbatim copies of it, which is how the two new entries would have gone into two of them.
+fn bundled_candidates(exe_name: &str, tool: &str) -> Vec<String> {
+    vec![
+        format!("hamlib/{tool}.exe"),
+        format!("resources/hamlib/{tool}.exe"),
+        format!("{tool}.exe"),
+        format!("hamlib/{tool}"),
+        format!("resources/hamlib/{tool}"),
+        // Linux .deb and AppImage: usr/bin/<exe> → usr/lib/<exe>/resources/
+        format!("../lib/{exe_name}/resources/hamlib/{tool}"),
+        // macOS .app: Contents/MacOS/<exe> → Contents/Resources/resources/
+        //
+        // ⚠️ THE `resources/` COMPONENT IS NOT OPTIONAL (#190). tauri.conf.json maps
+        // "resources/hamlib/*" → "resources/hamlib/", and that destination is relative to the
+        // bundle's own resource dir, so the tools land at Contents/Resources/resources/hamlib/.
+        // Shipping only the shorter path meant the correctly-staged, correctly-signed Hamlib
+        // inside every .app was never looked at: the resolver fell through to PATH and the
+        // Homebrew/MacPorts dirs, and on a Mac that had never installed Hamlib the spawn
+        // failed with "could not start its own rigctl" — i.e. NO CAT on 100% of fresh macOS
+        // installs, while Windows and Linux (both of which carry the component) were fine.
+        format!("../Resources/resources/hamlib/{tool}"),
+        // The pre-#190 path, kept as a harmless fallback: it costs one stat, and an older or
+        // hand-assembled bundle that really does put them here still resolves.
+        format!("../Resources/hamlib/{tool}"),
+    ]
+}
+
+/// The first bundled candidate for `tool` that exists under `dir`, or `None`.
+///
+/// Split from [`resolve_rigctld`] and its two siblings so the layouts above can be driven by a
+/// fixture directory in tests — `current_exe()` cannot be pointed at one.
+fn find_bundled_in(
+    dir: &std::path::Path,
+    exe_name: &str,
+    tool: &str,
+) -> Option<std::ffi::OsString> {
+    for cand in bundled_candidates(exe_name, tool) {
+        let p = dir.join(&cand);
+        if p.is_file() {
+            return Some(p.into_os_string());
+        }
+    }
+    None
+}
+
+/// [`find_bundled_in`] against the running executable's own directory.
+fn find_bundled(tool: &str) -> Option<std::ffi::OsString> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let name = exe.file_stem()?.to_str()?.to_string();
+    find_bundled_in(dir, &name, tool)
+}
+
+/// Admit a bundled candidate only if it can actually RUN — existence is not resolution.
+///
+/// ⚠️ WHY — the mac 1.10.0 CAT regression. "Found the bundled copy" SUPPRESSES the
+/// PATH/[`HAMLIB_SEARCH_DIRS`] fallback, so a bundled binary that dies before `main` costs
+/// more than nothing: it silently discards the operator's own working Hamlib. Concretely:
+/// fetch-hamlib-unix.sh repointed the libusb reference in the four TOOLS but not in
+/// libhamlib.4.dylib itself, so the shipped library still named
+/// /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib — present on every CI runner (the #190
+/// release gate ran `rigctld --version` there and stayed green) and absent on a Mac that
+/// never installed Homebrew's libusb, where dyld killed rigctld AND every one-shot rigctl
+/// ladder rung with SIGABRT before `main`. 1.9.2 had worked on the same machine because the
+/// pre-#190 resolver never FOUND the bundled tools and fell through to the operator's
+/// brew/MacPorts copy; #190 made it find them, and existence-only resolution turned a
+/// packaging defect into "the rig never answered at any speed". PATH and search-dir
+/// candidates have cleared [`runs_ok`] since 2026-08-13 for exactly this reason; this closes
+/// the same hole for the bundled branch. (Unix-only by construction, like `runs_ok`: the
+/// failure class — an absolute install-name into a package manager's prefix — does not exist
+/// in PE loading, and Windows keeps its existence-only resolution untouched.)
+#[cfg(unix)]
+fn bundled_if_runnable(tool: &str, p: std::ffi::OsString) -> Option<std::ffi::OsString> {
+    if runs_ok(&p) {
+        return Some(p);
+    }
+    crate::civ::diag::note(&format!(
+        "{tool}: the bundled copy at {} cannot run (killed by a signal — typically a library \
+         it needs is missing or unloadable); trying PATH and the package-manager directories \
+         instead",
+        p.to_string_lossy()
+    ));
+    None
+}
+
 /// Locate the `rigctld` binary. Prefers one **bundled next to the app** — the
 /// Windows installer ships Hamlib under the install dir (with its DLLs), so CAT
 /// works with no separate Hamlib install — then whatever `rigctld` the process's own `PATH`
@@ -1215,27 +1552,18 @@ fn resolve_hamlib_bin_in(
 /// `Command` the bare name. Launching the bundled exe by full path lets Windows resolve its
 /// co-located DLLs (libhamlib-4.dll etc.) from the exe's own directory.
 fn resolve_rigctld() -> std::ffi::OsString {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                "hamlib/rigctld.exe",
-                "resources/hamlib/rigctld.exe",
-                "rigctld.exe",
-                "hamlib/rigctld",
-            ] {
-                let p = dir.join(cand);
-                if p.is_file() {
-                    return p.into_os_string();
-                }
-            }
-        }
-    }
     #[cfg(unix)]
     {
+        if let Some(p) = find_bundled("rigctld").and_then(|p| bundled_if_runnable("rigctld", p)) {
+            return p;
+        }
         resolve_hamlib_bin("rigctld")
     }
     #[cfg(not(unix))]
     {
+        if let Some(p) = find_bundled("rigctld") {
+            return p;
+        }
         std::ffi::OsString::from("rigctld")
     }
 }
@@ -1258,18 +1586,27 @@ fn resolve_rigctld() -> std::ffi::OsString {
 /// file that was never shipped.
 pub fn hamlib_missing_for(mac: bool, tool: &str, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
+        // Nexus SHIPS Hamlib on every platform since 2026-08-24, so reaching this at all means
+        // the bundled copy could not be launched either — a different fault from "you never
+        // installed it", and the sentence has to say so or it sends the operator to install
+        // something they already have. The system-install cure stays as the fallback: it is
+        // still the answer for a source build, a distro package, or a bundle whose Hamlib the
+        // machine refuses (wrong architecture, noexec mount, security policy).
         if mac {
             return format!(
-                "Hamlib's {tool} isn't installed. In Terminal: brew install hamlib, then \
-                 restart Nexus (Homebrew itself is at brew.sh). WSJT-X or a logger working \
-                 proves only the Hamlib LIBRARY is there — Nexus needs the {tool} program. ({e})"
+                "Nexus could not start its own {tool}, and there is no Hamlib {tool} installed \
+                 to fall back on. If you built Nexus yourself, the bundled Hamlib may be \
+                 missing; otherwise install one with: brew install hamlib, then restart Nexus \
+                 (Homebrew is at brew.sh). WSJT-X or a logger working proves only the Hamlib \
+                 LIBRARY is there — Nexus needs the {tool} program. ({e})"
             );
         }
         return format!(
-            "Hamlib's {tool} isn't installed. On Debian/Ubuntu: sudo apt install \
-             libhamlib-utils (the Nexus .deb pulls it in; the AppImage can't, so it has to be \
-             installed once by hand). WSJT-X working proves only the Hamlib LIBRARY is there — \
-             Nexus needs the {tool} program. ({e})"
+            "Nexus could not start its own {tool}, and there is no Hamlib {tool} installed to \
+             fall back on. If you built Nexus yourself, the bundled Hamlib may be missing; \
+             otherwise on Debian/Ubuntu: sudo apt install libhamlib-utils, then restart Nexus. \
+             WSJT-X working proves only the Hamlib LIBRARY is there — Nexus needs the {tool} \
+             program. ({e})"
         );
     }
     format!("Could not launch {tool} (Hamlib): {e}")
@@ -1310,27 +1647,18 @@ pub fn rotctld_args(model: u32, port: &str, baud: u32, tcp_port: u16) -> Vec<Str
 /// The bundled `rotctld` (ships beside rigctld in the Hamlib bundle), then the same
 /// [`HAMLIB_SEARCH_DIRS`] fallback, then PATH — same resolution as [`resolve_rigctld`].
 fn resolve_rotctld() -> std::ffi::OsString {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                "hamlib/rotctld.exe",
-                "resources/hamlib/rotctld.exe",
-                "rotctld.exe",
-                "hamlib/rotctld",
-            ] {
-                let p = dir.join(cand);
-                if p.is_file() {
-                    return p.into_os_string();
-                }
-            }
-        }
-    }
     #[cfg(unix)]
     {
+        if let Some(p) = find_bundled("rotctld").and_then(|p| bundled_if_runnable("rotctld", p)) {
+            return p;
+        }
         resolve_hamlib_bin("rotctld")
     }
     #[cfg(not(unix))]
     {
+        if let Some(p) = find_bundled("rotctld") {
+            return p;
+        }
         std::ffi::OsString::from("rotctld")
     }
 }
@@ -1533,27 +1861,18 @@ pub(crate) fn daemon_dump(args: &[&str]) -> Option<String> {
 /// headless `cargo clippy --workspace --all-targets -- -D warnings` CI job fails it as dead code.
 #[cfg(feature = "serial")]
 pub(crate) fn resolve_rigctl() -> std::ffi::OsString {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                "hamlib/rigctl.exe",
-                "resources/hamlib/rigctl.exe",
-                "rigctl.exe",
-                "hamlib/rigctl",
-            ] {
-                let p = dir.join(cand);
-                if p.is_file() {
-                    return p.into_os_string();
-                }
-            }
-        }
-    }
     #[cfg(unix)]
     {
+        if let Some(p) = find_bundled("rigctl").and_then(|p| bundled_if_runnable("rigctl", p)) {
+            return p;
+        }
         resolve_hamlib_bin("rigctl")
     }
     #[cfg(not(unix))]
     {
+        if let Some(p) = find_bundled("rigctl") {
+            return p;
+        }
         std::ffi::OsString::from("rigctl")
     }
 }
@@ -1638,9 +1957,63 @@ fn parse_settable_lines(show_conf: &str) -> SettableLines {
         rts_taken_by_handshake: rts_offered
             && not_keying_rts
             && handshake.is_some_and(|h| HANDSHAKE_RTS_TAKEN.contains(&h)),
+        // The #200 collision — the same positive-Hardware test, on the keyed side of
+        // `not_keying_rts`. `rts_offered` keeps it serial-only, same as everything above.
+        keying_rts_on_hardware_handshake: rts_offered
+            && !not_keying_rts
+            && handshake.is_some_and(|h| HANDSHAKE_RTS_TAKEN.contains(&h)),
     }
 }
 
+/// Is `tcp_port` already held by something? `Some(err)` if it is, and that error is what the
+/// caller should surface verbatim.
+///
+/// WHY THIS EXISTS. Nothing checked, so Nexus would spawn a daemon onto a port another daemon
+/// already had. rigctld exits almost immediately when it cannot bind — but "almost" is the
+/// problem: for the moment before it does, [`RigctldProc::is_alive`] answers `true`, the caller
+/// connects, and it reaches the FOREIGN daemon holding the port. That daemon may be driving a
+/// DIFFERENT RADIO, which is the crossed-CAT fault `is_alive`'s own doc warns about.
+///
+/// Observed on macOS 2026-08-17, on a two-radio station: an earlier Nexus exited leaving its
+/// rigctld running (macOS has no equivalent of the Windows kill-on-close Job Object, and `Drop`
+/// does not run on an app quit). The next launch spawned a SECOND daemon for the same rig on the
+/// same already-held serial device and the same already-bound TCP port, left the other radio with
+/// no daemon at all, and reported nothing anywhere. From the operator's chair: one radio dead,
+/// one radio possibly answering as the other, and no error to explain either.
+///
+/// **A refusal here is the honest answer, not a workaround.** Nexus must not kill the process on
+/// that port: the rig-share feature (#48) exists precisely so OTHER programs can hold a rigctld,
+/// and a radio may be configured against an external daemon deliberately. So the port's owner is
+/// left strictly alone and the operator is told which port and what to do about it.
+///
+/// Only `AddrInUse` refuses. Any other bind error (a privileged port, an exhausted descriptor
+/// table) is NOT evidence that a daemon is there, so it falls through and lets rigctld try and
+/// report in its own words — a guard that refuses on the wrong evidence is worse than no guard.
+fn port_already_held(tcp_port: u16) -> Option<std::io::Error> {
+    match std::net::TcpListener::bind(("127.0.0.1", tcp_port)) {
+        Ok(l) => {
+            drop(l); // free it again immediately — rigctld is the one that must own it
+            None
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "rigctld port {tcp_port} is already in use — another rigctld or program is \
+                 holding it. Nexus did not start a second daemon on it, because it would have \
+                 talked to that one instead of this radio. Stop the other program, or give this \
+                 radio a different rigctld port in Settings ▸ Radio."
+            ),
+        )),
+        Err(_) => None,
+    }
+}
+
+/// Spawn `rigctld` for `model` on `serial_port`@`baud`, listening on
+/// `tcp_port`. Returns a kill-on-drop handle. Uses the bundled Hamlib if present
+/// (see [`resolve_rigctld`]), otherwise a `rigctld` on `PATH`.
+///
+/// `want` is the operator's per-line control-line choice ([`ControlLines`]); it is narrowed
+/// to what this rig's Hamlib will actually accept before anything is emitted.
 /// What a rigctld found on the process list says it is serving.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServedRig {
@@ -1754,55 +2127,6 @@ pub fn parse_ps_for_port(ps_output: &str, tcp_port: u16) -> Option<ServedRig> {
     None
 }
 
-/// Is `tcp_port` already held by something? `Some(err)` if it is, and that error is what the
-/// caller should surface verbatim.
-///
-/// WHY THIS EXISTS. Nothing checked, so Nexus would spawn a daemon onto a port another daemon
-/// already had. rigctld exits almost immediately when it cannot bind — but "almost" is the
-/// problem: for the moment before it does, [`RigctldProc::is_alive`] answers `true`, the caller
-/// connects, and it reaches the FOREIGN daemon holding the port. That daemon may be driving a
-/// DIFFERENT RADIO, which is the crossed-CAT fault `is_alive`'s own doc warns about.
-///
-/// Observed on macOS 2026-08-17, on a two-radio station: an earlier Nexus exited leaving its
-/// rigctld running (macOS has no equivalent of the Windows kill-on-close Job Object, and `Drop`
-/// does not run on an app quit). The next launch spawned a SECOND daemon for the same rig on the
-/// same already-held serial device and the same already-bound TCP port, left the other radio with
-/// no daemon at all, and reported nothing anywhere. From the operator's chair: one radio dead,
-/// one radio possibly answering as the other, and no error to explain either.
-///
-/// **A refusal here is the honest answer, not a workaround.** Nexus must not kill the process on
-/// that port: the rig-share feature (#48) exists precisely so OTHER programs can hold a rigctld,
-/// and a radio may be configured against an external daemon deliberately. So the port's owner is
-/// left strictly alone and the operator is told which port and what to do about it.
-///
-/// Only `AddrInUse` refuses. Any other bind error (a privileged port, an exhausted descriptor
-/// table) is NOT evidence that a daemon is there, so it falls through and lets rigctld try and
-/// report in its own words — a guard that refuses on the wrong evidence is worse than no guard.
-fn port_already_held(tcp_port: u16) -> Option<std::io::Error> {
-    match std::net::TcpListener::bind(("127.0.0.1", tcp_port)) {
-        Ok(l) => {
-            drop(l); // free it again immediately — rigctld is the one that must own it
-            None
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!(
-                "rigctld port {tcp_port} is already in use — another rigctld or program is \
-                 holding it. Nexus did not start a second daemon on it, because it would have \
-                 talked to that one instead of this radio. Stop the other program, or give this \
-                 radio a different rigctld port in Settings ▸ Radio."
-            ),
-        )),
-        Err(_) => None,
-    }
-}
-
-/// Spawn `rigctld` for `model` on `serial_port`@`baud`, listening on
-/// `tcp_port`. Returns a kill-on-drop handle. Uses the bundled Hamlib if present
-/// (see [`resolve_rigctld`]), otherwise a `rigctld` on `PATH`.
-///
-/// `want` is the operator's per-line control-line choice ([`ControlLines`]); it is narrowed
-/// to what this rig's Hamlib will actually accept before anything is emitted.
 pub fn spawn_rigctld(
     model: u32,
     addr: &str,
@@ -1922,43 +2246,6 @@ mod tests {
         );
     }
 
-    /// A daemon states which radio it serves in its own launch arguments — the model AND the
-    /// device. Real `ps` output from the station this was written on (2026-08-17).
-    const PS: &str = "\
-  501 /Users/x/.local/bin/rigctld -m 1 -T 127.0.0.1 -t 4534
-  502 rigctld -vvv -m 1049 -r /dev/cu.usbserial-01AF7FED0 -s 38400 -T 127.0.0.1 -t 4533
-  503 rigctld -vvv -m 1051 -r /dev/cu.usbserial-01A98F800 -s 38400 -T 127.0.0.1 -t 45340
-  504 /Applications/Nexus.app/Contents/MacOS/Nexus";
-
-    #[test]
-    fn a_daemons_arguments_say_which_radio_it_is_driving() {
-        let ft710 = parse_ps_for_port(PS, 4533).expect("the daemon on 4533");
-        assert_eq!(ft710.model, Some(1049));
-        assert_eq!(
-            ft710.device.as_deref(),
-            Some("/dev/cu.usbserial-01AF7FED0"),
-            "the DEVICE is what separates two identical rigs"
-        );
-
-        // The stray that caused this: a dummy, launched with no -r at all.
-        let stray = parse_ps_for_port(PS, 4534).expect("the daemon on 4534");
-        assert_eq!(stray.model, Some(1));
-        assert_eq!(stray.device, None);
-        assert_eq!(stray.describe(), "Hamlib model 1");
-
-        // `-t 4534` must not match `-t 45340` — a substring match would have called the FTX-1's
-        // daemon the stray's and refused a perfectly good rig.
-        assert_eq!(
-            parse_ps_for_port(PS, 45340).and_then(|d| d.model),
-            Some(1051)
-        );
-
-        // A port nothing serves is "cannot tell", NOT "foreign".
-        assert!(parse_ps_for_port(PS, 4599).is_none());
-        // And a process list with no rigctld in it at all is the same answer.
-        assert!(parse_ps_for_port("  1 /sbin/launchd\n  2 /usr/bin/ssh-agent", 4533).is_none());
-    }
-
     /// TWO IDENTICAL RIGS — the case `\dump_state` structurally cannot decide, because both
     /// answer the same model. The device is the whole difference.
     #[test]
@@ -2072,25 +2359,84 @@ mod tests {
     fn runs_ok_accepts_a_nonzero_exit_and_rejects_only_a_signal() {
         // Exits 9 for an unknown flag — the shape of the service.rs fixture and of real wrappers.
         let picky = stub_script("picky", "#!/bin/sh\n[ \"$1\" = \"-vvv\" ] || exit 9\n");
+        // A generous budget on purpose — see `runs_ok_within`. This test is about the verdict,
+        // not about how fast a loaded machine can fork a shell.
+        let budget = std::time::Duration::from_secs(30);
+        // ⚠️ IF THIS FAILS, READ THE DIAGNOSIS BEFORE ASSUMING THE VERDICT LOGIC BROKE. This
+        // assertion went red on two consecutive full-workspace runs (2026-08-23) while passing
+        // every way the module could be run on its own — serially, in parallel, and under a
+        // saturated CPU. Neither a wall-clock timeout nor CPU contention reproduced it, so the
+        // cause is still unproven and the next occurrence should not cost another investigation.
+        // Spawning the script directly here separates "the system would not fork" from "the
+        // verdict logic is wrong", which are the two candidates.
+        let diag = match std::process::Command::new(picky.as_os_str())
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut c) => format!("spawn ok, wait={:?}", c.wait()),
+            Err(e) => format!("SPAWN FAILED: kind={:?} err={e}", e.kind()),
+        };
         assert!(
-            runs_ok(picky.as_os_str()),
+            runs_ok_within(picky.as_os_str(), budget),
             "a stand-in that exits non-zero for --version still RUNS; rejecting it lets Nexus \
-             override an operator's or a test's deliberate choice of binary"
+             override an operator's or a test's deliberate choice of binary. \
+             Direct spawn of the same script says: {diag}"
         );
 
         // Killed by SIGABRT — how a binary whose dylibs cannot be loaded dies.
         let aborts = stub_script("aborts", "#!/bin/sh\nkill -ABRT $$\n");
         assert!(
-            !runs_ok(aborts.as_os_str()),
+            !runs_ok_within(aborts.as_os_str(), budget),
             "signal death is the unloadable-library signature and must be rejected"
         );
 
         // Not executable at all.
         assert!(
-            !runs_ok(std::ffi::OsStr::new("/nonexistent-nexus-test-dir/rigctld")),
+            !runs_ok_within(
+                std::ffi::OsStr::new("/nonexistent-nexus-test-dir/rigctld"),
+                budget
+            ),
             "a path that cannot be spawned is not usable"
         );
 
+        for p in [picky, aborts] {
+            if let Some(d) = p.parent() {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    /// Repro for the mac 1.10.0 CAT regression: a BUNDLED tool that dies by signal — how
+    /// `dyld` reports an unloadable library, and exactly how the shipped 1.10.0 tools died on
+    /// a Mac without Homebrew's libusb (libhamlib.4.dylib still named
+    /// /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib) — must NOT win the resolution, because
+    /// "found the bundled copy" suppresses the PATH/package-dir fallback that would have found
+    /// the operator's own working Hamlib, the one 1.9.2 was happily using. And the other
+    /// verdict matters as much: a candidate that merely exits non-zero for `--version` still
+    /// RUNS (the 2026-08-13 PATH-branch regression class) and must be kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundled_tool_that_dies_by_signal_is_skipped_not_resolved() {
+        let aborts = stub_script("bundled-aborts", "#!/bin/sh\nkill -ABRT $$\n");
+        assert_eq!(
+            bundled_if_runnable("rigctld", aborts.clone().into_os_string()),
+            None,
+            "signal death is the unloadable-library signature; admitting this candidate \
+             suppresses the fallback that finds a working Hamlib on the same machine"
+        );
+        let picky = stub_script(
+            "bundled-picky",
+            "#!/bin/sh\n[ \"$1\" = \"-vvv\" ] || exit 9\n",
+        );
+        assert_eq!(
+            bundled_if_runnable("rigctld", picky.clone().into_os_string()).as_deref(),
+            Some(picky.as_os_str()),
+            "a nonzero exit for --version still runs; rejecting it would discard a \
+             perfectly good bundled copy"
+        );
         for p in [picky, aborts] {
             if let Some(d) = p.parent() {
                 let _ = std::fs::remove_dir_all(d);
@@ -2840,6 +3186,189 @@ mod tests {
         assert!(holds(&args, "dtr", "OFF"), "{args:?}");
     }
 
+    /// ⭐ #145 ON THE COMMAND LINE, AS AMENDED BY #200 — the scene the reporter runs: PTT
+    /// method = serial RTS with the PTT port left blank, so keying rides the CAT port.
+    ///
+    /// The first half of this test used to pin the pre-#145 bug itself ("rigctld is launched
+    /// saying nothing whatever about RTS … and it must not change under an upgrade"), on the
+    /// #145 ruling that a fourth inference would be a fourth guess about a cable. #200 (a
+    /// TS-2000 keyed from launch to exit on Windows) is the field proof that for the
+    /// HARDWARE-handshake backends the silence was the transmitter-keying bug, and the
+    /// narrow keyed-RTS exception is not a cable guess: the operator's own PTT declaration
+    /// makes the flow-control collision certain. What still holds from the old pin:
+    /// `rts_state` is never emitted for the keying line — only the handshake is spoken for.
+    #[test]
+    fn keying_on_the_cat_port_frees_the_handshake_and_still_says_no_rts_state() {
+        let ptt = Some(crate::rig::SerialLine::Rts);
+        let settable = parse_settable_lines(&show_conf("RTS", Some("Hardware")));
+        // The shipped hold-low default with neither declaration made: the handshake is freed
+        // (that is the #200 fix), and RTS itself still goes unmentioned.
+        let lines = resolve_lines(settable, ControlLines::hold_low(), true);
+        let args = rigctld_args(1035, "COM5", 38400, 4532, false, ptt, lines);
+        assert!(
+            says_nothing_about(&args, "rts"),
+            "no rts_state on the keying line, ever: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-C" && w[1] == "serial_handshake=None"),
+            "the #200 un-key: hardware flow control must not hold the key line up: {args:?}"
+        );
+
+        // THE FIX — the operator declares what only they can see, and both reach the daemon.
+        let declared = ControlLines {
+            handshake: Handshake::None,
+            keying_line: LineState::Low,
+            ..ControlLines::hold_low()
+        };
+        let lines = resolve_lines(settable, declared, true);
+        let args = rigctld_args(1035, "COM5", 38400, 4532, false, ptt, lines);
+        assert!(
+            holds(&args, "rts", "OFF"),
+            "the keying line's idle state is now stated, not left to the driver: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-C" && w[1] == "serial_handshake=None"),
+            "and the declared handshake goes with it: {args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("serial_handshake="))
+                .count(),
+            1,
+            "exactly ONE serial_handshake argument, whichever decided it: {args:?}"
+        );
+    }
+
+    /// The declaration is a DECLARATION, not another guess: each of the four handshake values
+    /// reaches Hamlib verbatim, `auto` still infers, and `Hardware` refuses to free RTS even
+    /// where the inference would have.
+    #[test]
+    fn a_declared_handshake_replaces_the_inference_in_both_directions() {
+        // The vk6mo case the inference DOES reach: a Digirig-class cable on a hardware-handshake
+        // rig, RTS not the keying line. `auto` still frees RTS, exactly as before.
+        let settable = parse_settable_lines(&show_conf("RIG", Some("Hardware")));
+        let inferred = resolve_lines(settable, ControlLines::hold_low(), true);
+        assert!(
+            inferred.handshake_none,
+            "control: the inference still fires"
+        );
+        assert!(holds(
+            &rigctld_args(1042, "COM5", 38400, 4532, false, None, inferred),
+            "rts",
+            "OFF"
+        ));
+
+        // …and an operator who declares Hardware keeps their flow control, override or not.
+        let hw = resolve_lines(
+            settable,
+            ControlLines {
+                handshake: Handshake::Hardware,
+                ..ControlLines::hold_low()
+            },
+            true,
+        );
+        assert!(
+            !hw.handshake_none,
+            "a declared Hardware handshake is never overridden by the inference"
+        );
+        let args = rigctld_args(1042, "COM5", 38400, 4532, false, None, hw);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-C" && w[1] == "serial_handshake=Hardware"),
+            "{args:?}"
+        );
+        assert!(
+            says_nothing_about(&args, "rts"),
+            "RTS stays theirs: {args:?}"
+        );
+
+        // Every token is Hamlib's own spelling — `conf.c` matches with `strcmp`, and a wrong
+        // case is `Invalid parameter`, which exits rigctld with status 2 before it listens.
+        for (setting, token) in [
+            ("none", "None"),
+            ("hardware", "Hardware"),
+            ("xonxoff", "XONXOFF"),
+        ] {
+            let lines = ControlLines {
+                handshake: Handshake::from_setting(setting),
+                ..ControlLines::hold_low()
+            };
+            let args = rigctld_args(1042, "COM5", 38400, 4532, false, None, lines);
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "-C" && w[1] == format!("serial_handshake={token}")),
+                "{setting} must reach Hamlib as {token}: {args:?}"
+            );
+        }
+        // Anything unreadable — an empty string, a half-wired UI, a hand-edited file — is
+        // `Auto`, i.e. change nothing.
+        for junk in ["", "  ", "AUTO", "yes please"] {
+            assert_eq!(Handshake::from_setting(junk), Handshake::Auto, "{junk:?}");
+        }
+    }
+
+    /// The keying line's idle state: emitted only for the line we are actually keying with,
+    /// only on an explicit declaration, and never over a transport that has no control lines.
+    #[test]
+    fn the_keying_lines_idle_state_is_emitted_only_where_it_means_something() {
+        let declared = ControlLines {
+            keying_line: LineState::High,
+            ..ControlLines::hold_low()
+        };
+        // DTR keying → `dtr_state`, and RTS keeps the ordinary hold-low.
+        let args = rigctld_args(
+            1035,
+            "COM5",
+            38400,
+            4532,
+            false,
+            Some(crate::rig::SerialLine::Dtr),
+            declared,
+        );
+        assert!(
+            holds(&args, "dtr", "ON"),
+            "the keying line is DTR: {args:?}"
+        );
+        assert!(
+            holds(&args, "rts", "OFF"),
+            "and the non-keying line still takes the operator's own hold: {args:?}"
+        );
+        // No keying line at all: nothing to say about one.
+        let args = rigctld_args(1035, "COM5", 38400, 4532, false, None, declared);
+        assert!(holds(&args, "rts", "OFF") && holds(&args, "dtr", "OFF"));
+        assert_eq!(
+            args.iter().filter(|a| a.contains("_state=")).count(),
+            2,
+            "no third line appears from nowhere: {args:?}"
+        );
+        // A network rig has no control lines — the same gate the other two flags sit behind.
+        let args = rigctld_args(
+            2,
+            "192.168.1.50:4992",
+            38400,
+            4532,
+            true,
+            Some(crate::rig::SerialLine::Rts),
+            declared,
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("_state=")),
+            "a TCP rig has no RTS pin: {args:?}"
+        );
+        // And the default says nothing, which is every release up to now.
+        for junk in ["", "auto", "untouched", "nonsense"] {
+            assert_eq!(
+                LineState::from_keying_setting(junk),
+                LineState::Untouched,
+                "{junk:?}"
+            );
+        }
+        assert_eq!(LineState::from_keying_setting("low"), LineState::Low);
+        assert_eq!(LineState::from_keying_setting("HIGH"), LineState::High);
+    }
+
     /// The `rts_deliberate` answer itself: a Digirig enumerates as a keying interface, a
     /// rig's own USB port does not, and an unknown port claims nothing.
     #[test]
@@ -2897,31 +3426,89 @@ mod tests {
         );
     }
 
-    /// Keying with RTS is refusal #1, and no handshake override can lift it — Hamlib refuses
-    /// `rts_state` on the keying line whatever the flow control is. Trading the operator's
-    /// handshake away here would buy nothing at all.
+    /// Issue #200 (TS-2000 + Digirig, Windows): keying with RTS on a backend that declares
+    /// HARDWARE handshake must free the handshake, or the rig is keyed from the moment the
+    /// port opens. Windows maps handshake=Hardware to RTS_CONTROL_HANDSHAKE — the driver
+    /// asserts RTS (the key line) continuously, and Hamlib's own un-key at rig_open
+    /// (`ser_set_rts(pttp, 0)`) is an EscapeCommFunction the driver refuses and Hamlib's
+    /// termios shim swallows (hamlib-4.7.1 lib/termios.c:3305-3321, 3590). With
+    /// `serial_handshake=None` on the argv, the same rig_open un-key genuinely drives the
+    /// pin, and PTT toggles it from then on. `rts_state` stays unemittable on the keying
+    /// line — that half of the old rule was and is true.
     #[test]
-    fn keying_with_rts_is_not_something_the_override_can_rescue() {
+    fn keying_with_rts_on_a_hardware_handshake_backend_frees_the_handshake() {
         let settable = parse_settable_lines(&show_conf("RTS", Some("Hardware")));
         assert!(
-            !settable.rts_taken_by_handshake,
-            "the handshake is not why this line is unavailable — the keying is"
+            settable.keying_rts_on_hardware_handshake,
+            "the dump positively said both: RTS is the keying line AND the handshake is Hardware"
         );
         let lines = resolve_lines(settable, ControlLines::hold_low(), true);
+        assert!(
+            lines.handshake_none,
+            "the incoherent flow control must be dropped"
+        );
         let args = rigctld_args(
-            1042,
-            "COM5",
-            38400,
+            2014,
+            "COM4",
+            19200,
             4532,
             false,
             Some(crate::rig::SerialLine::Rts),
             lines,
         );
         assert!(
-            !args.iter().any(|a| a.starts_with("serial_handshake")),
-            "no handshake was given up for a line we still cannot set: {args:?}"
+            args.windows(2)
+                .any(|w| w[0] == "-C" && w[1] == "serial_handshake=None"),
+            "the un-key at rig_open only works once RTS stops being flow control: {args:?}"
         );
         assert!(says_nothing_about(&args, "rts"), "{args:?}");
+    }
+
+    /// The #200 override is not a blanket one either. A backend whose handshake already
+    /// leaves RTS free has nothing to drop; an operator-DECLARED Hardware handshake outranks
+    /// the inference (#145 — their declaration is about their cable, not ours to trade); and
+    /// an unclassifiable handshake token claims nothing, exactly as everywhere else in this
+    /// module.
+    #[test]
+    fn the_keyed_rts_handshake_override_fires_only_on_a_positive_hardware_declaration() {
+        // Backend says None: nothing to free.
+        let free = parse_settable_lines(&show_conf("RTS", Some("None")));
+        assert!(!free.keying_rts_on_hardware_handshake);
+        let lines = resolve_lines(free, ControlLines::hold_low(), true);
+        assert!(!lines.handshake_none, "the line was already ours");
+        // Operator declared Hardware: the declaration wins, keyed line or not.
+        let hw = parse_settable_lines(&show_conf("RTS", Some("Hardware")));
+        let declared = resolve_lines(
+            hw,
+            ControlLines {
+                handshake: Handshake::Hardware,
+                ..ControlLines::hold_low()
+            },
+            true,
+        );
+        assert!(
+            !declared.handshake_none,
+            "a declared Hardware handshake is the operator's to keep"
+        );
+        // Unclassifiable token: the stale-vocabulary discipline claims nothing.
+        let odd = show_conf("RTS", Some("Hardware")).replace("Hardware", "RtsCtsPlus");
+        assert!(!parse_settable_lines(&odd).keying_rts_on_hardware_handshake);
+    }
+
+    /// ⚠️ REWRITTEN FOR #200 — the old name here was `keying_with_rts_is_not_something_the_
+    /// override_can_rescue`, and its premise ("trading the operator's handshake away here
+    /// would buy nothing at all") was FALSIFIED by a field report: it buys the un-key at
+    /// rig_open. What SURVIVES of the old rule is pinned above (`rts_state` still never
+    /// emitted for the keying line) and here: `rts_taken_by_handshake` stays false when
+    /// keying with RTS, because that field means "the ORDINARY override can lift this", and
+    /// the keyed case rides its own flag with its own narrower conditions.
+    #[test]
+    fn keying_with_rts_still_does_not_masquerade_as_the_ordinary_handshake_refusal() {
+        let settable = parse_settable_lines(&show_conf("RTS", Some("Hardware")));
+        assert!(
+            !settable.rts_taken_by_handshake,
+            "keyed-RTS is refusal #1, not refusal #2 — it must not enable the ordinary override"
+        );
     }
 
     /// An operator who asked for `Untouched` keeps their flow control. The override exists to
@@ -2933,7 +3520,7 @@ mod tests {
             ControlLines {
                 rts: LineState::Untouched,
                 dtr: LineState::Low,
-                handshake_none: false,
+                ..ControlLines::default()
             },
             true,
         );
@@ -3419,6 +4006,92 @@ mod tests {
         }
         eprintln!("swept every model; keyed by a serial line: {keyed_by_a_line:?}");
     }
+
+    /// THE APPIMAGE SHIPPED HAMLIB'S LICENCE TEXTS AND NO HAMLIB, and this is the test that
+    /// makes that unrepresentable.
+    ///
+    /// The bundled-tool search only ever knew the WINDOWS layout (resources beside the .exe).
+    /// Linux and macOS put them elsewhere, so a bundled rigctld was unreachable no matter what
+    /// the build staged — the resolver fell straight through to PATH, and an AppImage user with
+    /// no `libhamlib-utils` installed had no CAT at all. Both layouts are pinned here against
+    /// fixture trees shaped like the real bundles.
+    #[test]
+    fn finds_a_bundled_tool_in_every_shipped_bundle_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "nexus-bundle-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Each entry: the dir holding the executable, and where that bundle puts resources.
+        let layouts: [(&str, &str); 3] = [
+            // Windows NSIS: resources sit beside the .exe.
+            ("win", "win/resources/hamlib"),
+            // Linux .deb + AppImage: usr/bin/Nexus, usr/lib/Nexus/resources/.
+            ("linux/usr/bin", "linux/usr/lib/Nexus/resources/hamlib"),
+            // macOS .app: Contents/MacOS/Nexus, and resources land under
+            // Contents/Resources/**resources**/ — tauri.conf.json maps
+            // "resources/hamlib/*" to "resources/hamlib/", which is relative to the bundle's
+            // own resource dir. The fixture used to say Contents/Resources/hamlib, which is
+            // what the CODE assumed rather than what the BUILD produces, so this test
+            // confirmed the resolver against itself and passed while every fresh macOS
+            // install had no CAT at all (#190). release.yml opens the real shipped .app at
+            // Contents/Resources/resources/deepcw/model.onnx — a sibling entry of identical
+            // shape — which is the layout pinned here.
+            (
+                "mac/Contents/MacOS",
+                "mac/Contents/Resources/resources/hamlib",
+            ),
+        ];
+
+        for (exe_dir, res_dir) in layouts {
+            let exe_dir = root.join(exe_dir);
+            let res_dir = root.join(res_dir);
+            std::fs::create_dir_all(&exe_dir).unwrap();
+            std::fs::create_dir_all(&res_dir).unwrap();
+
+            // The control: nothing staged yet, so nothing is found.
+            assert_eq!(
+                find_bundled_in(&exe_dir, "Nexus", "rigctld"),
+                None,
+                "{exe_dir:?} matched before anything was staged"
+            );
+
+            std::fs::write(res_dir.join("rigctld"), b"#!/bin/sh\n").unwrap();
+            let found = find_bundled_in(&exe_dir, "Nexus", "rigctld")
+                .unwrap_or_else(|| panic!("bundled rigctld unreachable from {exe_dir:?}"));
+            assert_eq!(
+                std::fs::canonicalize(std::path::Path::new(&found)).unwrap(),
+                std::fs::canonicalize(res_dir.join("rigctld")).unwrap(),
+            );
+
+            // A tool that was NOT staged stays a miss — the layout is not a blanket yes.
+            assert_eq!(find_bundled_in(&exe_dir, "Nexus", "rotctld"), None);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The Linux directory is named after the executable, not the string "Nexus" — so the
+    /// candidate has to be built from the running binary's own name.
+    #[test]
+    fn the_linux_resource_dir_follows_the_executable_name() {
+        let cands = bundled_candidates("Nexus", "rigctld");
+        assert!(cands
+            .iter()
+            .any(|c| c == "../lib/Nexus/resources/hamlib/rigctld"));
+        let renamed = bundled_candidates("Tempo", "rigctld");
+        assert!(renamed
+            .iter()
+            .any(|c| c == "../lib/Tempo/resources/hamlib/rigctld"));
+        assert!(
+            !renamed.iter().any(|c| c.contains("/Nexus/")),
+            "the product name was hard-coded"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3467,5 +4140,41 @@ mod rts_declaration_tests {
             !rts_is_deliberate(None, false, "COM3"),
             "an operator who ticks nothing must get exactly the behaviour they have today"
         );
+    }
+
+    /// A daemon states which radio it serves in its own launch arguments — the model AND the
+    /// device. Real `ps` output from the station this was written on (2026-08-17).
+    const PS: &str = "\
+  501 /Users/x/.local/bin/rigctld -m 1 -T 127.0.0.1 -t 4534
+  502 rigctld -vvv -m 1049 -r /dev/cu.usbserial-01AF7FED0 -s 38400 -T 127.0.0.1 -t 4533
+  503 rigctld -vvv -m 1051 -r /dev/cu.usbserial-01A98F800 -s 38400 -T 127.0.0.1 -t 45340
+  504 /Applications/Nexus.app/Contents/MacOS/Nexus";
+    #[test]
+    fn a_daemons_arguments_say_which_radio_it_is_driving() {
+        let ft710 = parse_ps_for_port(PS, 4533).expect("the daemon on 4533");
+        assert_eq!(ft710.model, Some(1049));
+        assert_eq!(
+            ft710.device.as_deref(),
+            Some("/dev/cu.usbserial-01AF7FED0"),
+            "the DEVICE is what separates two identical rigs"
+        );
+
+        // The stray that caused this: a dummy, launched with no -r at all.
+        let stray = parse_ps_for_port(PS, 4534).expect("the daemon on 4534");
+        assert_eq!(stray.model, Some(1));
+        assert_eq!(stray.device, None);
+        assert_eq!(stray.describe(), "Hamlib model 1");
+
+        // `-t 4534` must not match `-t 45340` — a substring match would have called the FTX-1's
+        // daemon the stray's and refused a perfectly good rig.
+        assert_eq!(
+            parse_ps_for_port(PS, 45340).and_then(|d| d.model),
+            Some(1051)
+        );
+
+        // A port nothing serves is "cannot tell", NOT "foreign".
+        assert!(parse_ps_for_port(PS, 4599).is_none());
+        // And a process list with no rigctld in it at all is the same answer.
+        assert!(parse_ps_for_port("  1 /sbin/launchd\n  2 /usr/bin/ssh-agent", 4533).is_none());
     }
 }

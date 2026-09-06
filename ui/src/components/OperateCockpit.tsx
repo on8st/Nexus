@@ -11,18 +11,22 @@
 // binding below, which is a keyboard handler with no string of its own.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { t } from '../i18n'
+import { engagedInQso } from '../alerts'
 import type {
   AppSnapshot,
   BandChannel,
   ModeRequest,
+  LoggedQso,
   NeedAlert,
   NeedTag,
+  QrzLookup,
   Settings,
   SourceKind,
   Tier,
 } from '../types'
 import { isRxOnly, isBeacon } from '../types'
 import type { NeedBandScopes } from '../features/needs'
+import { bandKey, callHistory, entitySlots, isNewEntity, modeKey } from '../features/callHistory'
 import { bandLabelForMhz } from '../band'
 import {
   clampOffsetHz,
@@ -32,11 +36,14 @@ import {
   stdMessageList,
   toggleIgnored,
 } from '../txMessages'
-import { atuTune, openPanelWindow, getSettings, notifyErase, setSettings, setMsk144Period } from '../api'
+import { atuTune, openPanelWindow, getSettings, notifyErase, setSettings, setMsk144Period, type FdRulesetDto } from '../api'
+import { FdAdvisories } from './FdAdvisories'
 import { pointRotatorAtCall, redecode, startCq, startQsoRecording, stopQsoRecording } from '../api'
 import { setDecodeDepth } from '../api'
 import { setSkipTx1 as setSkipTx1Cmd } from '../api'
+import { getLog, qrzLookup, resolveEntity } from '../api'
 import { pushToast } from '../toast'
+import { SplitControl } from './SplitControl'
 import { RotorStrip } from './RotorStrip'
 import { FastGraph } from './FastGraph'
 import { Waterfall } from './Waterfall'
@@ -49,6 +56,7 @@ import { OperateQsoStrip } from './OperateQsoStrip'
 import { TxMeters, TX_METERS_WHEN } from './TxMeters'
 import { SpotDialog } from './SpotDialog'
 import { OperateRoster } from './OperateRoster'
+import { RecallPanel } from './RecallPanel'
 import { TxPanel } from './TxPanel'
 import { CockpitHeader } from './CockpitHeader'
 import { PanelsMenu } from './PanelsMenu'
@@ -62,11 +70,19 @@ interface Props {
   /** Configured companion UDP listen address (Settings) — shown instead of a
    * hardcoded :2237 so a moved WSJT-X port reads truthfully. */
   companionAddr?: string
+  /** Field Day master switch + the active event's ruleset facts — the warn-only
+   * banned-mode chip in the header (a passive status div, outside every
+   * ⊞-removable pane; nothing is ever removed or disabled by rule). */
+  fdActive?: boolean
+  fdRuleset?: FdRulesetDto | null
   snap: AppSnapshot
   theme: string
   /** Active mode/tier (authoritative from the snapshot's link). */
   tier: Tier
   onTierChange: (t: Tier) => void
+  /** Open the Logbook filtered to a callsign (#192) — handed to the recall card in the side
+   *  rail, whose previous-contact rows become clickable when it is present. Omitted ⇒ inert. */
+  onOpenLogbook?: (call: string) => void
   /** Switch the RX signal source (native engine vs WSJT-X companion over UDP). */
   onSourceChange: (k: SourceKind) => void
   /** Click-to-tune on the waterfall: left=TX, right=RX, both buttons=TX+RX. */
@@ -200,8 +216,6 @@ const MODES: { tier: Tier; label: string; slot: string; title: string }[] = [
 const HOUND_LABEL = 'Hound'
 const HOUND_BADGE = 'HOUND'
 
-/** The rig's own SPLIT annunciator — the word on every radio's front panel. */
-const SPLIT_BADGE = 'SPLIT ▲'
 
 /** The two RX signal sources, named exactly as the BACKEND names them: `radio.sourceLabel`
  *  is interpolated into the group tooltip beside these buttons, so a translated button would
@@ -297,6 +311,7 @@ export function OperateCockpit({
   theme,
   tier,
   onTierChange,
+  onOpenLogbook,
   bandPlan,
   onSetFrequency,
   onSourceChange,
@@ -332,6 +347,8 @@ export function OperateCockpit({
   panels,
   active = true,
   companionAddr,
+  fdActive = false,
+  fdRuleset = null,
   onOpenSettings,
   wheelSensitivity,
 }: Props) {
@@ -597,8 +614,18 @@ export function OperateCockpit({
     setDxGrid('')
     tx5Edited.current = false
     setTx5('')
-    tx6Edited.current = false
-    setTx6('')
+    // ⚠️ TX6 IS DELIBERATELY NOT CLEARED. It is the CQ message, and it has nothing to do with
+    // the DX call this clears — the stock option is "Clear DX call and grid after logging",
+    // and that is exactly what it promises. Wiping Tx6 here reset the operator's DIRECTED CQ
+    // after every single contact: type "CQ DX KR4FQG EM64", work one station, and the next CQ
+    // went out bare (reported 2026-08-23: "it will work for one call, then revert back to just
+    // CQ unless I go back to Classic and change it again").
+    //
+    // WSJT-X keeps the two apart for the same reason: editing Tx6 sets `m_CQtype`
+    // (`mainwindow.cpp on_tx6_editingFinished`), a member the DX-clear never touches, so a
+    // directed CQ persists across contacts until the operator edits it back. `cqDirFromText`
+    // re-reads this field on every Tx6 fire, so keeping the text IS keeping the direction —
+    // and clearing it back to a plain CQ stays one edit away.
     setLocalNext(null)
   }, [])
 
@@ -768,6 +795,46 @@ export function OperateCockpit({
     onSetFrequency(mhz, bandLabelForMhz(mhz), snap.radio.sideband || 'USB')
   }
 
+  // THE CALLSIGN CARD (#168), rendered into the SIDE RAIL of whichever layout is up — one
+  // node, two placements, so the two layouts cannot drift into showing different cards.
+  //
+  // WHY THE RAIL AND NOT A SHELL-LEVEL BLOCK. This cockpit's four-child shell is header /
+  // waterfall / QSO strip / `.cockpit-lower`, and the card belongs to none of them: a fifth
+  // shell child would sit above `.cockpit-lower`, which is `flex: 1; min-height: 0` and would
+  // simply give up the card's height — the pre-overhaul crush, reintroduced. `.cockpit-side`
+  // is the one container here that is already an interposed scroller (`overflow-y: auto`,
+  // styles.css), which is the same structural reason the CW and Phone log panes can host the
+  // full card: it scrolls INSIDE the rail instead of squeezing the cockpit. It also lands
+  // where the click did in Classic — the Stations roster is directly beneath it.
+  //
+  // It costs the rail NOTHING until a call is selected: unselected there is no element at
+  // all, so the idle layout is unchanged. Selected, it takes rail height from the roster
+  // (which keeps its `flex: 1.8` share of what is left) and the rail scrolls if the pair no
+  // longer fits. Two known limits, stated rather than papered over: with the whole side rail
+  // ⊞-hidden the card goes with it, and in Roster layout the rail is opposite the roster the
+  // click happened in.
+  // WHICH station the card is about, and the order is the whole of it: an explicit
+  // click WINS over the sequencer. `selectedCall` is the operator saying "show me this
+  // one"; `snap.qso.dxcall` is the station the sequencer is actually working, and it
+  // fills in when they have not clicked — which is most of an FT8 session, because
+  // double-clicking a decode starts a QSO without ever selecting a peer. Reading only
+  // the click left the card blank through every contact the operator ran; reading only
+  // the QSO would yank it away from a station they had deliberately opened mid-run.
+  // Same field the roster highlights as `workingCall`, so the two can never disagree
+  // about who is being worked.
+  const recallCall = selectedCall || snap.qso?.dxcall || null
+  // The decode panes' hide-filter exemption: the station the sequencer is actively working,
+  // and nobody after Done — the same "engaged" line the alerts draw.
+  const partnerCall = engagedInQso({
+    state: snap.fieldDay?.state ?? snap.qso?.state ?? null,
+    dxcall: snap.qso?.dxcall ?? null,
+  })
+    ? (snap.qso?.dxcall ?? null)
+    : null
+  const recallCard = recallCall ? (
+    <OperateRecall snap={snap} call={recallCall} mode={tier} onOpenLog={onOpenLogbook} />
+  ) : null
+
   return (
     <main className="layout single operate-cockpit">
       <CockpitHeader
@@ -899,6 +966,12 @@ export function OperateCockpit({
           </select>
         </div>
 
+        {/* Warn-only Field Day banned-mode chip (e.g. FT8 at WFD — this cockpit is
+            where a banned mode would actually be keyed). A PASSIVE status div in
+            the header, outside every ⊞-removable pane: it is a status line, not a
+            control, so it carries no panel-vocabulary id and no stop-line role. */}
+        <FdAdvisories fdActive={fdActive} ruleset={fdRuleset} activeMode={tier} />
+
         <div className="cockpit-meta">
           <div
             className="cockpit-source"
@@ -980,15 +1053,18 @@ export function OperateCockpit({
           >
             {recording ? '■' : '●'}
           </button>
-          {snap.radio.splitTxMhz != null && (
-            <span
-              className="cockpit-cat ok"
-              title={t('operate.header.split.title', {
-                freq: snap.radio.splitTxMhz.toFixed(4),
-              })}
-            >
-              {SPLIT_BADGE}
-            </span>
+          {/* ⭐ A REAL SPLIT CONTROL. This was an annunciator only — it told you split was on
+              and gave you no way to set it. Operate is the FT8 cockpit, so it is where a
+              DXpedition pile-up is actually worked, and "UP 5" is the ordinary case: the spot
+              parser already reads the offset out of the comment and commands it, but an
+              operator who tuned to the DX by hand had no control at all. NOT a stop control —
+              see SplitControl's header. */}
+          {snap.radio.catOk === true && (
+            <SplitControl
+              snap={snap}
+              onSnap={onSnap}
+              onError={(m) => pushToast(m, 'error')}
+            />
           )}
           <div className="cockpit-layout-toggle" role="group" aria-label={t('operate.header.layout.aria')}>
             <button
@@ -1010,6 +1086,14 @@ export function OperateCockpit({
               {t('operate.header.layout.roster.label')}
             </button>
           </div>
+          <button
+            type="button"
+            className="cockpit-map-btn"
+            onClick={() => void openPanelWindow('operatemap')}
+            title={t('operate.header.map.title')}
+          >
+            {t('operate.header.map.label')}
+          </button>
           {/* No MemoryStrip here, deliberately (operator ruling, 2026-08-16). Memories are
               repeaters, nets and calling frequencies — Phone/CW things. In this header a
               favorite chip was worse than clutter: one click retuned the rig off the FT8
@@ -1210,6 +1294,7 @@ export function OperateCockpit({
               )}
               {sideShown && (
                 <aside className="cockpit-side">
+                  {recallCard}
                   {shown('bandActivity') && (
                     <div className="cockpit-decodes-side panel" ref={decodesSideRef} style={shareStyle('bandActivity')}>
                       {/* The FULL decode window (filters + sort), not the compact
@@ -1228,6 +1313,7 @@ export function OperateCockpit({
                         needScopes={needScopes}
                         myGrid={snap.mygrid}
                         {...decodeClickProps}
+                    partnerCall={partnerCall}
                         onErase={() => notifyErase(0)}
                         title={t('operate.decodes.title')}
                       />
@@ -1257,6 +1343,7 @@ export function OperateCockpit({
                         needScopes={needScopes}
                         myGrid={snap.mygrid}
                         {...decodeClickProps}
+                    partnerCall={partnerCall}
                         onErase={() => notifyErase(1)}
                         lockedFilter="rx"
                         // This pane is situational awareness, not a chase list: a station
@@ -1298,6 +1385,7 @@ export function OperateCockpit({
                     needScopes={needScopes}
                     myGrid={snap.mygrid}
                     {...decodeClickProps}
+                    partnerCall={partnerCall}
                     onErase={() => notifyErase(0)}
                   />
                 </div>
@@ -1322,6 +1410,7 @@ export function OperateCockpit({
                         needScopes={needScopes}
                         myGrid={snap.mygrid}
                         {...decodeClickProps}
+                    partnerCall={partnerCall}
                         onErase={() => notifyErase(1)}
                         lockedFilter="rx"
                         // This pane is situational awareness, not a chase list: a station
@@ -1377,6 +1466,7 @@ export function OperateCockpit({
               )}
               {sideShown && (
                 <aside className="cockpit-side" ref={classicSideRef}>
+                  {recallCard}
                   {shown('stations') && <div className="cockpit-roster panel">{roster}</div>}
                 </aside>
               )}
@@ -1392,6 +1482,146 @@ export function OperateCockpit({
         defaultComment={String(snap.link.tier).toUpperCase()}
       />
     </main>
+  )
+}
+
+/**
+ * THE CALLSIGN CARD FOR THE FT COCKPIT (#168 — "the details card is missing here").
+ *
+ * The card is `RecallPanel`, the same one the CW and Phone log strips have shown since
+ * 2026-07-31, and none of what it shows is new: the prior-contact list, the confirmed
+ * count, the DXCC/band/mode slot flags, the distance/bearing line and the private note all
+ * already worked. What was missing was a PATH to it from this cockpit. `RecallPanel` had
+ * exactly one caller — LogEntry — and Operate hosts no LogEntry, so clicking a roster row
+ * here only ever armed the Spot button.
+ *
+ * This is therefore the assembly LogEntry does inline, with the log FORM left out: read the
+ * logbook, resolve the award entity, ask the callbook, hand the result over. Three
+ * deliberate differences from LogEntry, each because this cockpit is not a log strip:
+ *
+ *   · THE LOGBOOK IS RE-READ ON EVERY SELECTION. LogEntry reads once per mount and again
+ *     after it logs, which is complete for a strip that is the only thing writing. Operate
+ *     logs in the BACKGROUND — the sequencer files a contact the moment the exchange
+ *     completes, with no click — so a once-per-mount read would show a stale "previous
+ *     contacts" list for the rest of the session, and would tell an operator they had never
+ *     worked a station they worked ten minutes ago. A roster click is an operator action,
+ *     not a poll.
+ *   · THE DECODED GRID SEEDS THE CARD. The station is on screen because we decoded it, and
+ *     an FT8 frame carries a square. Using it when the callbook has none is what puts a
+ *     distance and a bearing on the card for an operator with no QRZ subscription at all —
+ *     the callbook's own square still wins when there is one, being the finer of the two.
+ *   · THE LOOKUP IS SILENT AND DEBOUNCED. No credentials, no subscription, a call the
+ *     callbook does not know: all of those are ordinary here, and none may put a toast on
+ *     screen for a roster click. The card degrades to identity + history + badges, exactly
+ *     as the CW cockpit's does today.
+ */
+function OperateRecall({
+  snap,
+  call,
+  mode,
+  onOpenLog,
+}: {
+  snap: AppSnapshot
+  call: string
+  mode: string
+  onOpenLog?: (call: string) => void
+}) {
+  const cu = call.trim().toUpperCase()
+  const [log, setLog] = useState<LoggedQso[]>([])
+  const [book, setBook] = useState<QrzLookup | null>(null)
+  const [entity, setEntity] = useState<string | null>(null)
+
+  useEffect(() => {
+    let stale = false
+    void getLog()
+      .then((l) => {
+        if (!stale) setLog(l)
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [cu])
+
+  // The award identity comes from cty.dat via the CALL — never the callbook's country
+  // string, which spells entities differently enough ("Germany" vs "Fed. Rep. of Germany")
+  // that NEW ONE fired forever on every contact with one. LogEntry's ruling, same reason.
+  useEffect(() => {
+    let stale = false
+    void resolveEntity(cu)
+      .then((e) => {
+        if (!stale) setEntity(e)
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [cu])
+
+  useEffect(() => {
+    setBook(null)
+    if (cu.length < 3) return
+    let stale = false
+    // Debounced: arrowing down the roster walks through calls, and each one must not spend
+    // a callbook request on a station the operator did not stop at.
+    const id = setTimeout(() => {
+      void qrzLookup(cu)
+        .then((r) => {
+          if (!stale) setBook(r)
+        })
+        .catch(() => {})
+    }, 400)
+    return () => {
+      stale = true
+      clearTimeout(id)
+    }
+  }, [cu])
+
+  const station = snap.stations.find((s) => s.call.trim().toUpperCase() === cu) ?? null
+  const hist = useMemo(
+    () => callHistory(log, cu, snap.radio.band, mode, snap.b4MatchMode ?? false),
+    [log, cu, snap.radio.band, mode, snap.b4MatchMode],
+  )
+  // The roster's country is cty.dat-resolved from the call, like `resolveEntity` — so it is
+  // the right thing to stand in with while that request is in flight, and the badges do not
+  // flicker through "new one" on the way to the truth.
+  const entityForBadge = entity ?? station?.country ?? book?.country ?? null
+  const newEntity = useMemo(() => isNewEntity(log, entityForBadge), [log, entityForBadge])
+  const slots = useMemo(() => entitySlots(log, entityForBadge), [log, entityForBadge])
+  const liveBand = bandKey({ band: snap.radio.band, freqMhz: snap.radio.dialMhz })
+  const newBandSlot =
+    slots.workedEver &&
+    !slots.bandUnknown &&
+    liveBand !== null &&
+    !slots.bandsWorked.includes(liveBand)
+  const newModeSlot =
+    slots.workedEver && !newBandSlot && !slots.modesWorked.includes(modeKey(mode))
+
+  return (
+    <RecallPanel
+      call={cu}
+      band={snap.radio.band}
+      // The operator's QRZ nickname over their full name, for the same reason the log strip
+      // prefers it: it is what they answer to on the air.
+      name={book?.nickname || book?.name}
+      qth={book?.qth}
+      grid={book?.grid || station?.grid}
+      lat={book?.lat ?? null}
+      lon={book?.lon ?? null}
+      country={book?.country}
+      image={book?.image}
+      myGrid={snap.mygrid}
+      hist={hist}
+      newEntity={newEntity}
+      newBandSlot={newBandSlot}
+      newModeSlot={newModeSlot}
+      // No Lookup button in this cockpit — the card must not tell the operator to press one.
+      hasLookup={false}
+      // The rail is SHARED with the Stations roster; unbounded this card took it down to
+      // ~2 rows at 1024x768 and off-screen at 175 % zoom. See `.cockpit-recall`.
+      bounded
+      onOpenLog={onOpenLog}
+    />
   )
 }
 

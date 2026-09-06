@@ -187,6 +187,39 @@ pub fn reply_ok(reply: &str) -> bool {
     reply.lines().any(|l| l.trim() == "RPRT 0")
 }
 
+/// The Hamlib result code a rigctld reply carries (`RPRT -5` → `Some(-5)`), if any.
+pub fn rprt_code(reply: &str) -> Option<i32> {
+    reply
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("RPRT ")?.trim().parse::<i32>().ok())
+}
+
+/// Is this Hamlib code a LINK fault — the rig did not answer — rather than a refusal?
+///
+/// ⚠️ THIS DISTINCTION IS LOAD-BEARING (the overnight-radio review, 2026-09-02). Every
+/// non-`RPRT 0` reply used to become `ErrorKind::Other`, which the radio loop reads as "the
+/// rig refused it": a radio that was merely SWITCHED OFF answered `RPRT -5` (Hamlib's
+/// ETIMEOUT), was reported as "does not cover that frequency", and had its band given up
+/// on — a give-up that no recovery cleared. Hamlib's own codes, from `rig.h`:
+/// -5 ETIMEOUT, -6 EIO, -13 BUSERROR, -14 BUSBUSY are the link not answering;
+/// -1 EINVAL, -9 ERJCTED, -15 EARG, -17 EDOM (and the rest) are the rig, or Hamlib, saying no.
+pub fn rprt_is_link_fault(code: i32) -> bool {
+    matches!(code, -5 | -6 | -13 | -14)
+}
+
+/// Turn a non-OK rigctld reply into the error the radio loop can act on: a link fault is
+/// `TimedOut` (so the loop's "no reply from the rig" wording and its circuit breaker apply);
+/// anything else stays `Other` — a genuine refusal.
+fn rprt_error(what: &str, reply: &str) -> std::io::Error {
+    match rprt_code(reply) {
+        Some(code) if rprt_is_link_fault(code) => std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("rigctld {what}: the rig did not answer (Hamlib RPRT {code})"),
+        ),
+        _ => std::io::Error::other(format!("rigctld {what} error: {reply:?}")),
+    }
+}
+
 /// Parse the RECEIVE frequency ranges (Hz, inclusive) out of a rigctld `\dump_state` reply.
 ///
 /// The format is Hamlib's own machine-readable capability dump — the one its NETRIGCTL backend
@@ -313,6 +346,24 @@ pub struct Rig {
     /// uses a much shorter per-command deadline — a stalled serial read then can't hold the radio
     /// loop (and the fast dial poll) for 2.5 s. Default false (serial / local).
     slow_transport: bool,
+}
+
+/// Does this read error mean "nothing was read, try again" rather than "the stream is broken"?
+///
+/// `WouldBlock`/`TimedOut` are the per-read window expiring. **`Interrupted` is EINTR**: the
+/// syscall was cut short by a signal before it waited at all, which says nothing whatever about
+/// the peer. Treating it as a hard error surfaced as a spurious CAT failure — and it is not
+/// theoretical, it took CI's own `slow_fragmented_reply_still_reads_whole_line` down on a loaded
+/// runner (2026-08-21), which is the same thing that would happen to an operator whose machine
+/// is busy mid-QSO. `std::io::Read::read` does not retry EINTR for you; `read_exact` does, which
+/// is why this only bites the hand-rolled loops.
+fn read_should_retry(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 impl Rig {
@@ -477,11 +528,7 @@ impl Rig {
                         return Ok(String::from_utf8_lossy(&out).to_string());
                     }
                 }
-                Err(ref e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {} // per-read timeout tick — keep waiting to the deadline
+                Err(ref e) if read_should_retry(e.kind()) => {} // nothing read — wait out the deadline
                 Err(e) => return Err(e), // hard error — caller drops the stream
             }
             if std::time::Instant::now() >= deadline {
@@ -527,6 +574,11 @@ impl Rig {
             match stream.read(&mut buf) {
                 Ok(0) => break, // peer closed — parse what we have
                 Ok(n) => out.extend_from_slice(&buf[..n]),
+                // A per-read window that expired with nothing in it means the peer has gone
+                // quiet, so the reply is complete. EINTR is NOT that: the syscall was cut
+                // short by a signal without waiting, so breaking here would truncate a reply
+                // that is still arriving. Retry it instead; the deadline below still bounds us.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(ref e)
                     if matches!(
                         e.kind(),
@@ -673,9 +725,7 @@ impl Rig {
         if reply_ok(&reply) || reply.is_empty() {
             Ok(())
         } else {
-            Err(std::io::Error::other(format!(
-                "rigctld freq error: {reply:?}"
-            )))
+            Err(rprt_error("freq", &reply))
         }
     }
 
@@ -698,6 +748,22 @@ impl Rig {
         parse_dump_state_rx_ranges(&reply)
     }
 
+    /// Ask the rig ONCE whether its split can be read without disturbing it.
+    ///
+    /// Uses `\dump_caps` — the PROSE capability dump, which is the only one carrying the split
+    /// flags (`\dump_state`, the machine-readable one, does not). Verified against Hamlib
+    /// 4.7.1 `tests/rigctl_parse.c`, where `dump_caps` is a real protocol command
+    /// (`{ '1', "dump_caps", … }`).
+    ///
+    /// Cache the answer per connection: it is a long reply and it cannot change while the rig
+    /// is the same rig. `None` = we could not ask, which the caller must treat as
+    /// [`SplitDetect::Absent`] — silence is not permission.
+    pub fn read_split_capability(&mut self) -> Option<crate::baud_ladder::SplitDetect> {
+        self.control.as_ref()?;
+        let reply = self.command_multiline("\\dump_caps\n").ok()?;
+        Some(crate::baud_ladder::parse_caps(&reply).split_detect)
+    }
+
     /// Set the operating mode (e.g. "USB") + passband. A BLANK mode is a no-op —
     /// the caller is choosing to OBEY the radio's current mode (max compatibility),
     /// so Nexus sends no `M` command. Also a no-op unless a CAT control channel is
@@ -715,9 +781,7 @@ impl Rig {
         if reply_ok(&reply) || reply.is_empty() {
             Ok(())
         } else {
-            Err(std::io::Error::other(format!(
-                "rigctld mode error: {reply:?}"
-            )))
+            Err(rprt_error("mode", &reply))
         }
     }
 
@@ -799,8 +863,18 @@ impl Rig {
     /// CAT-only; `None` on VOX/serial or no finite numeric reply (e.g. the rig ignores the
     /// read while receiving). Used for SWR/ALC/RFPOWER_METER/COMP_METER.
     pub fn read_meter_f32(&mut self, name: &str) -> Option<f32> {
+        self.read_meter_f32_within(name, None)
+    }
+
+    /// [`read_meter_f32`] with a caller-chosen deadline (ms). The tune-time meter poll uses a
+    /// short one: a read that outlasts the tune carrier's audio lead would gap the carrier, so
+    /// it is abandoned (the stream drops and reconnects on the next command) rather than
+    /// waited for. `None` = the transport's normal deadline.
+    pub fn read_meter_f32_within(&mut self, name: &str, deadline_ms: Option<u64>) -> Option<f32> {
         self.control.as_ref()?;
-        let reply = self.command(&format!("l {name}\n")).ok()?;
+        let reply = self
+            .command_with_deadline(&format!("l {name}\n"), deadline_ms)
+            .ok()?;
         reply
             .lines()
             .find_map(|l| l.trim().parse::<f32>().ok())
@@ -852,11 +926,15 @@ impl Rig {
             .lines()
             .find_map(|l| l.trim().parse::<u64>().ok())
             .filter(|hz| *hz > 0)
-            .ok_or_else(|| {
-                std::io::Error::other(format!(
+            .ok_or_else(|| match rprt_code(&reply) {
+                Some(code) if rprt_is_link_fault(code) => std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the rig did not answer the frequency read (Hamlib RPRT {code})"),
+                ),
+                _ => std::io::Error::other(format!(
                     "rig did not return a frequency (reply {reply:?}) — check the serial port, \
                      baud rate, and that CAT/CI-V is enabled on the rig"
-                ))
+                )),
             })
     }
 
@@ -989,6 +1067,15 @@ impl Rig {
     pub fn set_rx_level(&mut self, name: &str, frac: f32) -> std::io::Result<()> {
         self.cat(&level_line(name, &format!("{:.3}", frac.clamp(0.0, 1.0))))
     }
+    /// Set the MANUAL-NOTCH FREQUENCY in Hz (Hamlib `NOTCHF`). Not a 0.0–1.0 level: this one
+    /// is an absolute frequency in the audio passband, which is why it does not go through
+    /// [`Rig::set_rx_level`] — that clamps to a fraction and would command a notch at 1 Hz.
+    pub fn set_notch_freq_hz(&mut self, hz: f32) -> std::io::Result<()> {
+        self.cat(&level_line(
+            "NOTCHF",
+            &format!("{}", hz.max(0.0).round() as i32),
+        ))
+    }
     /// Set the AGC time constant by Hamlib enum int (FAST=2, MEDIUM=5, SLOW=3, OFF=0).
     pub fn set_agc(&mut self, hamlib_val: u8) -> std::io::Result<()> {
         self.cat(&level_line("AGC", &hamlib_val.to_string()))
@@ -1011,6 +1098,16 @@ impl Rig {
     /// manufacturer (the WinKeyer path has a reliable Clear-Buffer abort instead).
     pub fn stop_morse(&mut self) -> std::io::Result<()> {
         self.cat("\\stop_morse\n")
+    }
+    /// Play the rig's voice memory `ch` — Hamlib's `\send_voice_mem`, the exact spelling
+    /// its own NET client uses (on a Yaesu it becomes `PB0<ch>;`). ⚠️ The RIG transmits the
+    /// message itself; this only relays the ask.
+    pub fn send_voice_mem(&mut self, ch: u32) -> std::io::Result<()> {
+        self.cat(&format!("\\send_voice_mem {ch}\n"))
+    }
+    /// Abort a voice-memory playback in progress.
+    pub fn stop_voice_mem(&mut self) -> std::io::Result<()> {
+        self.cat("\\stop_voice_mem\n")
     }
 
     /// Send a rigctld command, succeeding on `RPRT 0` (or an empty reply); no-op when
@@ -1068,6 +1165,34 @@ impl Drop for Rig {
 
 #[cfg(test)]
 mod tests {
+    /// A powered-off rig answers `RPRT -5`; the radio loop must see a LINK fault, not a
+    /// refusal — that misread is what latched the band give-up on a radio that was only off.
+    #[test]
+    fn a_hamlib_timeout_is_a_link_fault_and_a_refusal_stays_a_refusal() {
+        assert_eq!(super::rprt_code("RPRT -5\n"), Some(-5));
+        assert_eq!(super::rprt_code("14074000\n"), None);
+        assert_eq!(super::rprt_code("garbage\nRPRT -1\n"), Some(-1));
+        for code in [-5, -6, -13, -14] {
+            assert!(super::rprt_is_link_fault(code), "RPRT {code} is the link");
+        }
+        for code in [-1, -9, -15, -17, -4] {
+            assert!(!super::rprt_is_link_fault(code), "RPRT {code} is a refusal");
+        }
+        assert_eq!(
+            super::rprt_error("freq", "RPRT -5\n").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            super::rprt_error("freq", "RPRT -1\n").kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            super::rprt_error("freq", "nonsense\n").kind(),
+            std::io::ErrorKind::Other,
+            "an unparseable reply is still a refusal-class error, never a silent success"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1293,6 +1418,39 @@ mod tests {
             } else {
                 "RPRT 0\n".to_string()
             }
+        }
+    }
+
+    /// EINTR IS NOT "THE PEER WENT QUIET". A signal can cut a blocking read short before it
+    /// has waited at all, and both reply loops used to treat that as a hard error: the
+    /// single-line one returned it (and the caller dropped the stream), the multi-line one
+    /// would have ended the reply early. On a busy machine that is a CAT failure with no cause
+    /// an operator could ever find. CI hit exactly this on 2026-08-21.
+    ///
+    /// Both directions, because a classifier proven one way is half a test: the transient kinds
+    /// must retry, and the genuinely broken ones must NOT — retrying a reset connection forever
+    /// is the opposite failure and it hangs the radio loop instead of erroring.
+    #[test]
+    fn eintr_is_retried_but_a_broken_stream_is_not() {
+        use std::io::ErrorKind::*;
+        for k in [WouldBlock, TimedOut, Interrupted] {
+            assert!(
+                read_should_retry(k),
+                "{k:?} means nothing was read — retry it"
+            );
+        }
+        for k in [
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+            UnexpectedEof,
+            NotConnected,
+            PermissionDenied,
+        ] {
+            assert!(
+                !read_should_retry(k),
+                "{k:?} is a broken stream — must NOT retry"
+            );
         }
     }
 

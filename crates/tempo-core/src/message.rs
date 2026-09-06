@@ -139,6 +139,21 @@ fn is_cq_dir(s: &str) -> bool {
 /// every portable station down i3=4, which carries neither a grid nor a report.
 /// Its jobs are receive-side (recognising a call token while parsing) and hash-table
 /// seeding — never choosing what we transmit.
+/// A callsign the 77-bit protocol cannot put in its standard 28-bit field, so it travels
+/// hashed in an i3=4 message: compound calls (`EA1/PE5X`, `KD9TAW/QRP`) AND non-conforming
+/// shapes (`II7MGBR`, `EN3SUKR`, `YW18FIFA` — special-event calls whose suffix is longer than
+/// the standard three letters).
+///
+/// Deliberately built from the two predicates that already exist rather than a new pattern:
+/// it must LOOK like a callsign ([`is_callsign`], which also rejects a bracketed hash token
+/// like `<...>` and anything punctuated) and must NOT be a standard one ([`is_std_call`]).
+/// Nonstandard is not a shape of its own — it is the complement of the standard field, which
+/// is precisely how the protocol defines it.
+pub fn is_nonstandard_call(call: &str) -> bool {
+    let c = call.trim();
+    is_callsign(c) && !is_std_call(c)
+}
+
 pub fn is_compound(call: &str) -> bool {
     let c = call.trim().trim_start_matches('<').trim_end_matches('>');
     c.contains('/') && c.split('/').any(is_callsign)
@@ -326,6 +341,35 @@ pub fn unhash_call(s: &str) -> &str {
     }
 }
 
+/// Resolve an i3=4 hashed token to the plain call it stands for — but ONLY when the plain form
+/// can legally go back on the air.
+///
+/// `<W9XYZ>` → `W9XYZ`. TWO cases keep their brackets, and both matter:
+///
+/// **A COMPOUND call stays hashed.** `<KH8/W1AW>` must NOT become `KH8/W1AW`: the brackets are
+/// there precisely because a compound call does not fit an ordinary 77-bit frame, so unwrapping
+/// it would build a message the protocol cannot carry. This is the rule issue #84 recorded when
+/// it stripped brackets at the LOG boundary and deliberately not in the sequencer, for exactly
+/// this reason. The sequencer's job is to say the call the way the wire requires; the log's job
+/// is to record who it was, and those are different answers to the same token.
+///
+/// **An UNRESOLVED hash stays as it is.** `<...>` is what a decoder prints before it has heard
+/// the full call; stripping it hands the rest of the app the literal `...` as though it were a
+/// callsign.
+///
+/// What is left is the case this exists for: a station whose call fits a standard message
+/// perfectly well, sending it hashed to save bits because it is answering several callers at
+/// once. There the brackets are pure encoding and must never survive into what we transmit —
+/// see [`Msg::unhashed`].
+pub fn resolve_hashed(s: &str) -> &str {
+    let inner = unhash_call(s);
+    if !std::ptr::eq(inner, s) && is_callsign(inner) && !is_compound(inner) {
+        inner
+    } else {
+        s
+    }
+}
+
 /// The inner text of an i3=4 hashed token (`<W9XYZ>` → `W9XYZ`, `<...>` → `...`).
 fn hashed_inner(s: &str) -> &str {
     s.trim_start_matches('<').trim_end_matches('>')
@@ -364,6 +408,68 @@ pub fn looks_like_call(s: &str) -> bool {
 }
 
 impl Msg {
+    /// The same message with any i3=4 HASHED callsign resolved to the plain call it stands for.
+    ///
+    /// Applied once, where decodes are parsed, so no downstream arm has to remember. Every reply
+    /// in the sequencer is built as `to: de.clone()` from the message it answers, so a hashed
+    /// sender used to be copied straight back out and TRANSMITTED in brackets — a station
+    /// answering several callers at once sends its call hashed to save bits, and we echoed the
+    /// encoding onto the air (field report 2026-08-23: `<RI1FJL> KD9TAW EN52`, twice).
+    ///
+    /// Matching never needed this — `base_call` already ignores brackets — so this changes what
+    /// we SAY, not who we recognise. An unresolved `<...>` is deliberately left alone
+    /// ([`resolve_hashed`]).
+    #[must_use]
+    pub fn unhashed(self) -> Msg {
+        fn r(s: &str) -> String {
+            resolve_hashed(s).to_string()
+        }
+        match self {
+            Msg::Grid { to, de, grid } => Msg::Grid {
+                to: r(&to),
+                de: r(&de),
+                grid,
+            },
+            Msg::Report { to, de, snr } => Msg::Report {
+                to: r(&to),
+                de: r(&de),
+                snr,
+            },
+            Msg::RReport { to, de, snr } => Msg::RReport {
+                to: r(&to),
+                de: r(&de),
+                snr,
+            },
+            Msg::Rr73 { to, de } => Msg::Rr73 {
+                to: r(&to),
+                de: r(&de),
+            },
+            Msg::Rrr { to, de } => Msg::Rrr {
+                to: r(&to),
+                de: r(&de),
+            },
+            Msg::Bye73 { to, de } => Msg::Bye73 {
+                to: r(&to),
+                de: r(&de),
+            },
+            Msg::FieldDay {
+                to,
+                de,
+                roger,
+                class,
+                section,
+            } => Msg::FieldDay {
+                to: r(&to),
+                de: r(&de),
+                roger,
+                class,
+                section,
+            },
+            // Cq carries no `to`, and Other is raw text shown verbatim — both unchanged.
+            other => other,
+        }
+    }
+
     /// Render to the on-air text form.
     pub fn to_text(&self) -> String {
         match self {
@@ -438,10 +544,29 @@ impl Msg {
                 dir: t[1].to_string(),
             };
         }
-        // i3=4 compound CQ: "CQ <compound-call>" with NO grid (a compound call can't
-        // carry one). Only a real COMPOUND call qualifies — "CQ W1AW" (a grid-less plain
-        // call) stays free text, and "CQ <...>" is invalid (the modem rejects it).
-        if t.len() == 2 && t[0] == "CQ" && is_compound(t[1]) {
+        // i3=4 NONSTANDARD CQ: "CQ <call>" with NO grid, because the i3=4 message cannot
+        // carry one. Two shapes reach it, and only one of them used to be accepted here.
+        //
+        // ⚠️ COMPOUND IS NOT THE WHOLE OF NONSTANDARD, and that gap is the bug (operator
+        // report 2026-08-21, v1.7.5, with screenshots): `CQ II7MGBR` and `CQ EN3SUKR` got no
+        // CQ chip and could not be double-clicked to work them, while `CQ IU7VOL JN81` right
+        // above them worked fine. Neither special-event call contains a `/`, so `is_compound`
+        // said no and the message fell to free text — invisible to the sequencer, which is
+        // why double-click did nothing. The roster's Work button still started a QSO, because
+        // that path never asked whether it was a CQ, and the split between the two is exactly
+        // what the report describes.
+        //
+        // `is_std_call`'s own doc already names this class: "every non-conforming shape
+        // (`YW18FIFA`) is nonstandard and must be HASHED". II7MGBR is YW18FIFA — a four-letter
+        // suffix where the standard field allows three. So the test is the protocol's own:
+        // it LOOKS like a callsign and is NOT a standard one, therefore it can only have
+        // arrived as i3=4, therefore a bare "CQ" in front of it is a CQ.
+        //
+        // The guard rails the old comment named are kept by construction rather than by
+        // narrowness: "CQ W1AW" stays free text because W1AW IS standard (a standard call
+        // would have carried its grid), and "CQ <...>" is still rejected because a bracketed
+        // or punctuated token is not a callsign to `is_callsign`.
+        if t.len() == 2 && t[0] == "CQ" && is_nonstandard_call(t[1]) {
             return Msg::Cq {
                 de: t[1].to_string(),
                 grid: String::new(),
@@ -631,6 +756,70 @@ pub fn is_callsign(s: &str) -> bool {
 #[cfg(test)]
 mod fidelity_tests {
     use super::*;
+
+    /// OPERATOR REPORT 2026-08-21 (v1.7.5, screenshots): "with special calls it doesn't
+    /// recognize them as CQ calls. Hence the double click does not work." `CQ II7MGBR` and
+    /// `CQ EN3SUKR` printed with no CQ chip and could not be double-clicked to work them,
+    /// while `CQ IU7VOL JN81` on the line above behaved normally. The roster's Work button
+    /// still started a QSO — that path never asks whether it is a CQ — and the difference
+    /// between the two is the whole report.
+    #[test]
+    fn a_gridless_cq_from_a_special_event_call_is_a_cq() {
+        // THE REPORT. Neither has a slash, so the old `is_compound` test said no.
+        for msg in ["CQ II7MGBR", "CQ EN3SUKR"] {
+            match Msg::parse(msg) {
+                Msg::Cq { de, grid, dir } => {
+                    assert_eq!(grid, "", "i3=4 carries no grid");
+                    assert_eq!(dir, "");
+                    assert!(!de.is_empty(), "{msg} must name its sender");
+                }
+                other => panic!("{msg} must parse as a CQ, got {other:?}"),
+            }
+        }
+        // The compound form that already worked must keep working.
+        assert!(matches!(Msg::parse("CQ EA1/PE5X"), Msg::Cq { .. }));
+    }
+
+    /// The guard rails the narrow rule used to provide by being narrow. They are now held by
+    /// construction — a standard call is excluded because it IS standard — so they are worth
+    /// asserting directly rather than trusting the shape of the predicate.
+    #[test]
+    fn a_gridless_cq_still_refuses_what_it_always_refused() {
+        // A STANDARD call with no grid is free text: a standard sender would have carried one.
+        assert!(
+            !matches!(Msg::parse("CQ W1AW"), Msg::Cq { .. }),
+            "a grid-less STANDARD call stays free text"
+        );
+        assert!(!matches!(Msg::parse("CQ KD9TAW"), Msg::Cq { .. }));
+        // A hashed placeholder is not a callsign and never names a station.
+        assert!(!matches!(Msg::parse("CQ <...>"), Msg::Cq { .. }));
+        // Not a callsign at all.
+        assert!(!matches!(Msg::parse("CQ ..."), Msg::Cq { .. }));
+        assert!(!matches!(Msg::parse("CQ ?"), Msg::Cq { .. }));
+    }
+
+    /// The predicate on its own, because it is the thing that decides and it is easier to see
+    /// wrong here than through a parse.
+    #[test]
+    fn nonstandard_is_the_complement_of_the_standard_field() {
+        // Non-conforming shapes — a suffix longer than the standard three letters.
+        assert!(is_nonstandard_call("II7MGBR"));
+        assert!(is_nonstandard_call("EN3SUKR"));
+        assert!(is_nonstandard_call("YW18FIFA")); // the example is_std_call's own doc names
+                                                  // Compound, which was already handled and must not regress.
+        assert!(is_nonstandard_call("EA1/PE5X"));
+        assert!(is_nonstandard_call("KD9TAW/QRP"));
+        // Standard calls are NOT nonstandard — including the two suffixes that ride their own
+        // bit and are therefore standard by protocol, not by shape.
+        assert!(!is_nonstandard_call("W1AW"));
+        assert!(!is_nonstandard_call("KD9TAW"));
+        assert!(!is_nonstandard_call("F4CYH/P"));
+        assert!(!is_nonstandard_call("F4CYH/R"));
+        // Not callsigns at all.
+        assert!(!is_nonstandard_call("<...>"));
+        assert!(!is_nonstandard_call("599"));
+        assert!(!is_nonstandard_call(""));
+    }
 
     #[test]
     fn valid_grid_accepts_4_and_6_char_rejects_blank_and_malformed() {

@@ -32,6 +32,8 @@ import {
   setRfPower,
   setMicGain,
   setNrLevel,
+  setCompLevel,
+  setNotchFreq,
   setAgc,
   setScopeSpan,
   setScopeRef,
@@ -48,13 +50,15 @@ import { pushToast } from '../toast'
 import { RotorStrip } from './RotorStrip'
 import { MemoryStrip } from './MemoryStrip'
 import type { Memory } from '../features/memories'
-import { setFrequency, setSplit, setRigFunc, setSidebandOverride, setFilterWidth, openPanelWindow } from '../api'
+import { setFrequency, setRigFunc, setSidebandOverride, setFilterWidth, openPanelWindow } from '../api'
 import { bandLabelForMhz, sidebandForQsy } from '../band'
 import { isRfScopeSource, NO_NATIVE_SCOPE_REASON } from '../waterfall'
 import { useWheelTune } from '../useWheelTune'
 import { useScopeTune } from '../useScopeTune'
 import { useRegionCols } from '../useRegionCols'
 import { t } from '../i18n'
+import { SplitControl } from './SplitControl'
+import type { MessageKey } from '../i18n'
 
 /** This cockpit's INVARIANT vocabulary — the words that are technical tokens rather than
  *  prose, gathered here so the i18n guard reads them as the deliberate constants they are:
@@ -62,19 +66,33 @@ import { t } from '../i18n'
 const DSP = 'DSP'
 const NR = 'NR'
 const AGC = 'AGC'
+// The rig's own names for the two controls #95 completed. COMP is the speech processor
+// (PROC on a Yaesu front panel); NOTCH is the MANUAL notch, not the automatic one.
+const COMP = 'COMP'
+const NOTCH = 'NOTCH'
+const HZ = 'Hz'
 const BW = 'BW'
 const DB = 'dB'
 const DBM = 'dBm'
 const REC = 'REC'
-const SPLIT_PLATE = 'SPLIT'
 /** The mode picker's AUTO face — the word and the sideband it resolved to, both tokens. */
 const autoPlate = (sideband: string) => `AUTO·${sideband}`
 /** The nudges the two steppers take, as their tooltips print them — figures, so they are
  *  supplied to the message rather than written in it. */
 const FILTER_STEP_HZ = 100
-const SPLIT_STEP_KHZ = 1
 
-
+/** The AGC chips, in the order `Engine::AGC_SPEEDS` lists them: AUTO left of the three time
+ *  constants, OFF right of them — most-automatic through to no AGC at all. The `id` is the
+ *  token that goes on the wire and the label is a KEY, not a word: `t()` runs when the row
+ *  RENDERS, so a locale switch relabels the chips and the chip is still compared on its id
+ *  (the same split RF_SPANS makes, and for the same reason). */
+const AGC_CHIPS = [
+  { id: 'auto', labelKey: 'phone.rxDsp.agc.auto' },
+  { id: 'fast', labelKey: 'phone.rxDsp.agc.fast' },
+  { id: 'mid', labelKey: 'phone.rxDsp.agc.mid' },
+  { id: 'slow', labelKey: 'phone.rxDsp.agc.slow' },
+  { id: 'off', labelKey: 'phone.rxDsp.agc.off' },
+] as const satisfies readonly { id: string; labelKey: MessageKey }[]
 
 interface Props {
   /** Which panels this cockpit shows or hides (⊞ Panels). Owned by the HOST (App), never
@@ -114,6 +132,9 @@ interface Props {
   /** Open Settings at a section id (see settings/registry.ts). Absent ⇒ the surfaces that
    * point at Settings stay plain text. */
   onOpenSettings?: (target: string) => void
+  /** Open the Logbook filtered to a callsign (#192) — handed to the log strip's recall card,
+   *  whose previous-contact rows become clickable when it is present. Omitted ⇒ inert rows. */
+  onOpenLogbook?: (call: string) => void
 }
 
 /**
@@ -200,10 +221,15 @@ const DSP_FUNCS = [
   { key: 'notch', label: 'Notch', titleKey: 'phone.dsp.notch.title' },
   { key: 'comp', label: 'COMP', titleKey: 'phone.dsp.comp.title' },
   { key: 'vox', label: 'VOX', titleKey: 'phone.dsp.vox.title' },
+  // #95. TWO notches, and they are different controls: `notch` above is the AUTOMATIC
+  // notch (Hamlib ANF), which hunts a carrier on its own; this is the MANUAL one you
+  // park on a heterodyne, and it is what most operators mean by "notch". Each renders
+  // only when the rig reports it, so a radio with one shows one button.
+  { key: 'manualNotch', label: 'MN', titleKey: 'phone.dsp.manualNotch.title' },
 ] as const
 
 /** Bandscope span presets — the width of OCCUPIED SIDEBAND to show, because the scope's axis
- *  is the rig's: RF offset from the dial, dial at the 1/4 mark and the sideband filling the
+ *  is the rig's: RF offset from the dial, dial at the 1/9 mark and the sideband filling the
  *  rest (PhoneScope's `carrierCentered`). The engine is asked for exactly 0..width — receiver
  *  audio is one-sided — so the preset is both what is captured and 3/4 of what is shown; the
  *  remaining quarter is scopeView's guard band, which has no data by construction.
@@ -319,7 +345,7 @@ const FLEX_SPANS = [
   { label: '2M', hz: 2_000_000 },
 ] as const
 
-export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, fieldDay, phoneMode, wheelSensitivity, spots, needByCall, typeByCall, onWorkSpot, onRecallMemory, onOpenMemories, onOpenSettings, panels }: Props) {
+export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, fieldDay, phoneMode, wheelSensitivity, spots, needByCall, typeByCall, onWorkSpot, onRecallMemory, onOpenMemories, onOpenSettings, onOpenLogbook, panels }: Props) {
   // Live S-meter (shared 100 ms poll, lock-free backend) — used to arrive via the 300 ms
   // snapshot on top of the backend's own sampling, which read as a laggy needle. smeterDb-only
   // subscription: the cockpit re-renders when the S-meter changes, never on RX-level churn.
@@ -357,6 +383,37 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
       setNr((n) => (Math.abs(n - pct) >= 2 ? pct : n))
     }
   }, [snap.radio.nrLevel])
+  // #95's two additions, both the same shape as NR above: mirror the rig's own value so the
+  // slider shows where the knob really is, and never fight an in-flight drag.
+  const [comp, setComp] = useState(50)
+  const compDragging = useRef(false)
+  useEffect(() => {
+    const rb = snap.radio.compLevel
+    if (rb != null && !compDragging.current) {
+      const pct = Math.round(rb * 100)
+      setComp((c) => (Math.abs(c - pct) >= 2 ? pct : c))
+    }
+  }, [snap.radio.compLevel])
+  const changeComp = (pct: number) => {
+    setComp(pct)
+    void setCompLevel(pct / 100)
+  }
+  // HZ, not a percentage — the notch sits at an audio frequency and the operator is placing it
+  // on a heterodyne by ear. A 10 Hz step is fine enough to null a tone and coarse enough to
+  // sweep the passband without a hundred CAT writes.
+  const [notchHz, setNotchHz] = useState(1000)
+  const notchDragging = useRef(false)
+  useEffect(() => {
+    const rb = snap.radio.notchFreqHz
+    if (rb != null && !notchDragging.current) {
+      const hz = Math.round(rb)
+      setNotchHz((n) => (Math.abs(n - hz) >= 10 ? hz : n))
+    }
+  }, [snap.radio.notchFreqHz])
+  const changeNotch = (hz: number) => {
+    setNotchHz(hz)
+    void setNotchFreq(hz)
+  }
   const changeNr = (pct: number) => {
     setNr(pct)
     void setNrLevel(pct / 100)
@@ -383,6 +440,13 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     void setScopeRef(tenths)
   }
   const [keyed, setKeyed] = useState(false)
+  /** Mirrors `keyed` for the window key handlers, which capture their closure once per
+   *  effect run — the release must act on what is TRUE when it fires, not on what was true
+   *  when it was bound. See the space-release comment below. */
+  const keyedRef = useRef(false)
+  useEffect(() => {
+    keyedRef.current = keyed
+  }, [keyed])
   // Bandscope span (audio-window zoom within the captured passband — this is
   // soundcard audio, not RF IQ, so "span" means which slice of the passband
   // fills the scope).
@@ -456,8 +520,11 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
   // Transient operator override ("USB"/"LSB"/"FM") or null = AUTO. The COMMANDED mode (canonical
   // for TX/logging + what the rig is set to) is the override when set, else the band-auto sideband.
   const modeOverride = snap.radio.sidebandOverride ?? null
+  // Bands where AM is worked: the HF windows below 10 MHz, and 10 m / 6 m and up. Mirrors the
+  // comment on the picker's filter below.
+  const amBandOk = snap.radio.dialMhz > 0 && (snap.radio.dialMhz < 10 || snap.radio.dialMhz >= 28)
   const commandedMode = modeOverride ?? sidebandAuto
-  const pickMode = (m: 'USB' | 'LSB' | 'FM' | null) =>
+  const pickMode = (m: 'USB' | 'LSB' | 'FM' | 'AM' | null) =>
     void setSidebandOverride(m)
       .then((s) => onSnap?.(s))
       .catch(() => pushToast(t('phone.mode.failed'), 'error'))
@@ -507,39 +574,6 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
   // is said. Same chip vocabulary as the mode-mismatch pill beside it — no new pane, no
   // structural size of its own (cockpit-panes.css owns those).
   const micOffForDax = snap.radio.flexDaxTx === true
-
-  // Manual split (casual DX "work up N"): the desired TX dial lives in the snapshot; a plain
-  // retune clears it (backend). Offset is kHz off the RX dial; default +5, the common pileup.
-  const [splitOffsetKhz, setSplitOffsetKhz] = useState(5)
-  const splitTxMhz = snap.radio.splitTxMhz ?? null
-  const splitOn = splitTxMhz != null
-  // When split turns on externally (e.g. a pile-up spot programs it), sync the local offset
-  // to the rig so the display + bumping start from the real value, not a stale default.
-  const wasSplitOn = useRef(false)
-  useEffect(() => {
-    if (splitOn && !wasSplitOn.current && splitTxMhz != null) {
-      setSplitOffsetKhz(Math.round((splitTxMhz - snap.radio.dialMhz) * 1000))
-    }
-    wasSplitOn.current = splitOn
-  }, [splitOn, splitTxMhz, snap.radio.dialMhz])
-  const applySplitTx = (offsetKhz: number) =>
-    setSplit(snap.radio.dialMhz + offsetKhz / 1000)
-      .then((s) => onSnap?.(s))
-      .catch(() => pushToast(t('phone.split.setFailed'), 'error'))
-  const toggleSplit = () =>
-    splitOn
-      ? setSplit(null)
-          .then((s) => onSnap?.(s))
-          .catch(() => pushToast(t('phone.split.clearFailed'), 'error'))
-      : applySplitTx(splitOffsetKhz)
-  // Accumulate on local state (functional updater) so rapid bumps that fire before the
-  // IPC/onSnap round-trip don't all read the same stale value and collapse into one step.
-  const bumpSplit = (delta: number) =>
-    setSplitOffsetKhz((prev) => {
-      const next = Math.max(-90, Math.min(90, prev + delta))
-      if (splitOn) void applySplitTx(next)
-      return next
-    })
 
   // Live snapshot ref so the spacebar PTT handler (bound on `lock` changes, not every render)
   // reads the CURRENT TX-allowed privilege state through key() — not whatever existed when bound.
@@ -636,8 +670,16 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
         key(true)
       }
     }
+    // ⚠️ THE RELEASE ASKS ONLY WHETHER WE ARE KEYED. It used to carry the same
+    // `!isField` guard as the press, on the reasoning that nothing here moves focus by
+    // itself — but the OPERATOR does: hold the space bar to talk, click into the log strip
+    // while still holding, release, and the keyup now targets an INPUT. The old guard
+    // returned, `key(false)` never fired, and the rig stayed keyed with the button still
+    // reading "release to stop", which is exactly what had just been done. An unkey a guard
+    // can swallow is a stuck transmitter. The PRESS keeps its guard — a space typed into a
+    // field must never start a transmission — and the asymmetry is the whole point.
     const up = (e: KeyboardEvent) => {
-      if (e.code === 'Space' && !isField(e.target) && !lock) {
+      if (e.code === 'Space' && keyedRef.current && !lock) {
         e.preventDefault()
         key(false)
       }
@@ -687,7 +729,16 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
   // before the rig first reported stuck with a dead entry once it does.
   const canDsp = liveDspFuncs.length > 0 || seenDspFuncs.current.length > 0
   const canDspLevels =
-    seenDspLevels.current || snap.radio.nrLevel != null || snap.radio.agc != null
+    seenDspLevels.current ||
+    snap.radio.nrLevel != null ||
+    snap.radio.agc != null ||
+    // #95's two, and leaving them out is not a detail: this boolean decides whether the pane
+    // EXISTS. A rig reporting a speech-processor depth or a notch frequency but no NR and no
+    // AGC would have had both new controls built and then never rendered — the dead-entry
+    // failure this whole block is written against, arriving from the other side. Caught by
+    // PhoneCockpit.notch.test.tsx before it shipped.
+    snap.radio.compLevel != null ||
+    snap.radio.notchFreqHz != null
   // ⊞ Panels. `main`/`side` are unused here (Phone has no two-column pane grid), so the
   // host is only supplying `shown` + the menu items.
   //
@@ -956,28 +1007,64 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
                 <span className="ph-power-val">{nr}%</span>
               </label>
             )}
+            {/* #95: the speech processor's DEPTH. The toggle switched PROC on and there was
+                no way to say how hard it worked, which is the half that matters. */}
+            {snap.radio.compLevel != null && (
+              <label className="ph-dsplev" title={t('phone.rxDsp.comp.title')}>
+                <span>{COMP}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={comp}
+                  onChange={(e) => changeComp(Number(e.target.value))}
+                  onPointerDown={() => {
+                    compDragging.current = true
+                  }}
+                  onPointerUp={() => {
+                    compDragging.current = false
+                  }}
+                  aria-label={t('phone.rxDsp.comp.aria')}
+                />
+                <span className="ph-power-val">{comp}%</span>
+              </label>
+            )}
+            {/* #95: WHERE the manual notch sits. Shown only when the rig reports NOTCHF, so a
+                radio with an auto-notch and nothing else never grows a slider that does
+                nothing. Hz, not a percentage — you are placing it on a tone you can hear. */}
+            {snap.radio.notchFreqHz != null && (
+              <label className="ph-dsplev" title={t('phone.rxDsp.notchFreq.title')}>
+                <span>{NOTCH}</span>
+                <input
+                  type="range"
+                  min={300}
+                  max={3400}
+                  step={10}
+                  value={notchHz}
+                  onChange={(e) => changeNotch(Number(e.target.value))}
+                  onPointerDown={() => {
+                    notchDragging.current = true
+                  }}
+                  onPointerUp={() => {
+                    notchDragging.current = false
+                  }}
+                  aria-label={t('phone.rxDsp.notchFreq.aria')}
+                />
+                <span className="ph-power-val">{notchHz} {HZ}</span>
+              </label>
+            )}
             {snap.radio.agc != null && (
               <div className="ph-agc" role="group" aria-label={t('phone.rxDsp.agc.aria')} title={t('phone.rxDsp.agc.title')}>
                 <span className="ph-dsplev-lbl">{AGC}</span>
-                {(['auto', 'fast', 'mid', 'slow', 'off'] as const).map((sp) => (
-
+                {AGC_CHIPS.map(({ id, labelKey }) => (
                   <button
-                    key={sp}
+                    key={id}
                     type="button"
-                    className={`theme-chip${agc === sp ? ' active' : ''}`}
-                    aria-pressed={agc === sp}
-                    onClick={() => changeAgc(sp)}
+                    className={`theme-chip${agc === id ? ' active' : ''}`}
+                    aria-pressed={agc === id}
+                    onClick={() => changeAgc(id)}
                   >
-                        {sp === 'auto'
-                          ? t('phone.rxDsp.agc.auto')
-                          : sp === 'fast'
-                            ? t('phone.rxDsp.agc.fast')
-                            : sp === 'mid'
-                              ? t('phone.rxDsp.agc.mid')
-                              : sp === 'slow'
-                                ? t('phone.rxDsp.agc.slow')
-                                : t('phone.rxDsp.agc.off')}
-
+                    {t(labelKey)}
                   </button>
                 ))}
               </div>
@@ -996,6 +1083,7 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
           card scrolls inside the log column and can never squeeze the cockpit — the operator
           gets the QRZ photo / bearing / history back while operating. */}
       <LogEntry
+        onOpenLogbook={onOpenLogbook}
         snap={snap}
         mode={commandedMode === 'FM' ? 'FM' : 'SSB'}
         defaultRst="59"
@@ -1021,7 +1109,21 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
         onSnap={onSnap}
         modeIndicator={
           <div className="ph-mode-pick" role="group" aria-label={t('phone.mode.aria')}>
-            {(['AUTO', 'USB', 'LSB', 'FM'] as const).map((m) => {
+            {(['AUTO', 'USB', 'LSB', 'FM', 'AM'] as const)
+              // AM IS OFFERED ONLY WHERE AM IS ACTUALLY WORKED — below 10 MHz (the 1.885,
+              // 3.870-3.890 and 7.290 windows) and at 28 MHz and up (29.0-29.2, 50.4 and above).
+              // 20/17/15/12 m are not AM territory, and a 6 kHz emission there has no room in the
+              // band plan.
+              //
+              // NOT OFFERING it rather than refusing it, deliberately. The cockpit pick is the
+              // operator's own CURRENT action and this app honours those — `sideband_override` is
+              // already cleared by a band change, a cross-band knob QSY, working a spot and an
+              // SSTV tune, so unlike the station-wide `phone_mode` it cannot follow anybody onto a
+              // band they did not choose it for. There is no stale state to protect against here;
+              // the only thing worth doing is not putting a button in front of somebody on a band
+              // where it makes no sense.
+              .filter((m) => m !== 'AM' || amBandOk)
+              .map((m) => {
               const active = m === 'AUTO' ? modeOverride === null : modeOverride === m
               return (
                 <button
@@ -1115,36 +1217,11 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
           </span>
         )}
         {catOk && (
-          <div className={`ph-split ${splitOn ? 'on' : ''}`}>
-            <button
-              className="ph-split-toggle"
-              onClick={toggleSplit}
-              title={
-                splitOn
-                  ? t('phone.split.on.title', { freq: splitTxMhz?.toFixed(3) ?? '' })
-                  : t('phone.split.off.title')
-              }
-            >
-              {SPLIT_PLATE}
-            </button>
-            <button
-              className="ph-split-step"
-              onClick={() => bumpSplit(-SPLIT_STEP_KHZ)}
-              title={t('phone.split.lower.title', { step: SPLIT_STEP_KHZ })}
-            >
-              −
-            </button>
-            <span className="ph-split-amt mono" title={t('phone.split.offset.title')}>
-              {splitOffsetKhz >= 0 ? `+${splitOffsetKhz}` : `${splitOffsetKhz}`}
-            </span>
-            <button
-              className="ph-split-step"
-              onClick={() => bumpSplit(SPLIT_STEP_KHZ)}
-              title={t('phone.split.higher.title', { step: SPLIT_STEP_KHZ })}
-            >
-              +
-            </button>
-          </div>
+          <SplitControl
+            snap={snap}
+            onSnap={onSnap}
+            onError={(m) => pushToast(m, 'error')}
+          />
         )}
         {!catOk && (
           <span

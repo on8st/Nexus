@@ -9,7 +9,7 @@
 [package]
 publish = false
 name = "tempo"
-version = "1.7.5"
+version = "1.10.3"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["KD9TAW <kd9taw@protonmail.com>"]
@@ -88,6 +88,7 @@ keyring = { version = "3.6", features = [
 # tempo-core for the pure LoTW URL/validate/high-water helpers used by the
 # download command (the reconcile path is reached via tempo-app).
 tempo-core = { path = "../crates/tempo-core" }
+
 # SSTV encoder for the transmit command: the webview sends raw RGB, the command
 # resolves the mode + validates dims via `for_mode` and encodes via `encode_image`
 # (off the engine lock). Already in the lockfile transitively via tempo-audio; a
@@ -95,6 +96,27 @@ tempo-core = { path = "../crates/tempo-core" }
 tempo-sstv = { path = "../crates/tempo-sstv" }
 # Real sound-card + rig transport (optional; enabled by the `radio` feature).
 tempo-audio = { path = "../crates/tempo-audio", optional = true }
+
+# Reading the display's EDID physical size, which is the only way to learn a Linux panel's
+# true DPI: X11 reports scale factor 1 whatever the hardware is, so the UI scale had no
+# signal to work from (see `display_metrics`). LINUX ONLY and NOT A NEW PACKAGE — gdk 0.18.2
+# is already in this tree, pulled in by tao via tauri itself, and this pins the same version:
+# the Cargo.lock diff for adding it is one line, the crate's name against `tempo`. Nothing new
+# is fetched, built or linked.
+#
+# Licence: MIT (gtk-rs/gtk3-rs, verified against the crate's own LICENSE text, not just its
+# metadata) — compatible with our GPL-3.0-only.
+#
+# ⚠️ It is also UNMAINTAINED, and knowingly so: gtk3-rs is archived and RUSTSEC-2024-0412 is
+# already in deny.toml's ignore list with the reason ("every tauri v2 app carries these ten;
+# the fix is upstream tauri moving to gtk4"). Depending on it directly adds no exposure we do
+# not already have and stops mattering at the same moment the transitive one does — on a tauri
+# major. If that migration ever lands, this is one of the call sites to move.
+#
+# ⚠️ NOTICE ENTRY IS OUTSTANDING — it belongs in the "Rust crate dependencies" list and adding
+# it is approval-gated. Do not ship a release from this without it.
+[target.'cfg(target_os = "linux")'.dependencies]
+gdk = "0.18"
 
 [features]
 # This feature is used by the desktop binary. It allows configuring whether the
@@ -113,3 +135,16 @@ radio = ["dep:tempo-audio", "tempo-audio/device", "tempo-audio/serial", "tempo-a
 # functions. Dev builds keep full debug info.
 [profile.release]
 strip = "debuginfo"
+# ⭐ MEASURED, NOT ASSUMED: 87.3 MB -> 55.2 MB on the windows-gnu build, same commit, profile the
+# only difference. That is 32 MB off what an operator installs, and most of what the cpal 0.18
+# upgrade cost — that upgrade swapped `windows-sys` for the full `windows` crate family to reach
+# six sample formats Nexus had been refusing outright, and put 44 MB into the binary doing it.
+#
+# ⚠️ `panic = "abort"` is NOT here and must not be added to save more. There are 16 catch_unwind
+# sites in this codebase; abort turns every one of them into a hard crash. It belongs to crash
+# BEHAVIOUR, not to file size, and it was in the first draft of this change until it was caught.
+#
+# The cost is build time: fat LTO with one codegen unit is slow, and it is paid on release
+# builds only.
+lto = true
+codegen-units = 1

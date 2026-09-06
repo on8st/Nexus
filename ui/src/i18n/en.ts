@@ -97,10 +97,6 @@ export const EN = {
   "settings.radio.check.secondInterface": "{{port}} is port {{n}} of this device. CAT is normally on port 1 — the other one answers nothing.",
   "settings.radio.check.audioNotOnRig.input": "Input device “{{chosen}}” is not inside the radio on {{port}} — “{{paired}}” is. Device names can swap when a rig moves USB port.",
   "settings.radio.check.audioNotOnRig.output": "Output device “{{chosen}}” is not inside the radio on {{port}} — “{{paired}}” is. Device names can swap when a rig moves USB port.",
-  "cw.rxDsp.agc.auto": "Auto",
-  "cw.rxDsp.agc.off": "Off",
-  "phone.rxDsp.agc.auto": "Auto",
-  "phone.rxDsp.agc.off": "Off",
   "topbar.version.builtFrom": "v{{version}} — built from {{build}}",
   // ── Settings ▸ Station ──────────────────────────────────────────────────────────────
   // The pilot surface. Placeholders that are technical tokens (`KD9TAW`, `EN52xa`, `WI`) are
@@ -435,7 +431,9 @@ export const EN = {
   'update.notNow.title': 'Not now — the update stays downloaded',
   'update.available': "Nexus {{latest}} is available — you're on {{current}}",
   'update.download': 'Download',
-  'update.downloadFailed': 'Could not open the download page',
+  'update.downloadFailed':
+    "Couldn't open your browser — download Nexus yourself from {{url}}",
+  'update.copyLink': 'Copy link',
   'update.checkFailed': 'Could not reach the update server to check for updates',
   'update.upToDate': "You're on the latest Nexus ({{current}})",
   'update.unreadable': "Couldn't read the latest release info",
@@ -674,6 +672,10 @@ export const EN = {
   'logbook.field.qth.label': 'QTH',
   // Also prose — QTH is free text, so the example is a place a reader recognises.
   'logbook.field.qth.placeholder': 'Dayton, OH',
+  'logbook.column.notes': 'Notes',
+  'logbook.row.notes.title': 'Comment (shared on the QSL)',
+  'logbook.row.notes.private': 'Private note',
+  'logbook.row.notes.aria': 'has a private note',
   'logbook.field.comment.label': 'Comment',
   'logbook.field.comment.placeholder': 'Shared on the QSL',
   'logbook.field.notes.label': 'Notes',
@@ -726,6 +728,14 @@ export const EN = {
   'logbook.row.pushClublog.title':
     'Push {{call}} to ClubLog (re-push is safe — duplicates are detected)',
   'logbook.row.pushClublog.aria': 'Push {{call}} to ClubLog',
+  // World Radio League per-row push (the manual verification / bounce-recovery path).
+  'logbook.row.pushWrl.title': 'Send this QSO with {{call}} to World Radio League',
+  'logbook.row.pushWrl.aria': 'Push the QSO with {{call}} to World Radio League',
+  'logbook.push.wrl.ok': '{{call}} sent to World Radio League',
+  'logbook.push.wrl.duplicate': 'World Radio League already has {{call}}',
+  'logbook.push.wrl.unavailable': 'World Radio League is busy — {{call}} will go on the next try',
+  'logbook.push.wrl.rejected': 'World Radio League refused {{call}}: {{reason}}',
+  'logbook.push.wrl.failed': 'World Radio League push failed: {{detail}}',
   'logbook.row.pushHrdlog.title':
     'Push {{call}} to HRDLog.net (live-logging/awards site — not an ARRL confirmation source; re-push is safe)',
   'logbook.row.pushHrdlog.aria': 'Push {{call}} to HRDLog.net',
@@ -735,6 +745,11 @@ export const EN = {
   'logbook.row.qslSent.title':
     "Mark a QSL request sent to {{call}} (bureau/direct/electronic). A request is not a confirmation — the row stays here until it's confirmed.",
   'logbook.row.qslSent.aria': 'Mark QSL sent to {{call}}',
+  'logbook.qsl.cardMarked': 'QSL card recorded for {{call}}',
+  'logbook.qsl.cardCleared': 'QSL card cleared for {{call}}',
+  'logbook.row.qslRcvd.card': 'Card received',
+  'logbook.row.qslRcvd.clear': 'Card NOT received',
+  'logbook.row.qslSent.clear': 'QSL NOT sent',
   'logbook.row.qslSent.bureau': 'Bureau',
   'logbook.row.qslSent.direct': 'Direct',
   'logbook.row.qslSent.electronic': 'Electronic',
@@ -752,6 +767,7 @@ export const EN = {
   'logbook.qsl.sentVia': 'QSL sent via {{via}}',
   'logbook.qsl.sentOnVia': 'QSL sent {{date}} via {{via}}',
   'logbook.qsl.marked': 'Marked QSL sent to {{call}} ({{via}})',
+  'logbook.qsl.sentCleared': 'QSL sent mark cleared for {{call}}',
   'logbook.qsl.markFailed': 'Could not mark QSL sent',
 
   // Manual per-QSO pushes. `{{reason}}` and `{{detail}}` are the service's own words.
@@ -869,6 +885,8 @@ export const EN = {
     'Section "{{section}}" isn\'t a known ARRL/RAC section — required to log.',
   'logEntry.fd.logged': 'FD: logged {{call}} {{class}}/{{section}} ({{mode}})',
   'logEntry.fd.failed': 'FD log failed',
+  'logEntry.fd.dupe.own': 'Dupe: {{call}} is already in this position\'s log on {{band}} {{mode}}',
+  'logEntry.fd.dupe.club': 'Club dupe: another position already worked {{call}} on {{band}} {{mode}} — logging is allowed but adds no points',
 
   // ── Confirm-before-log prompt (WSJT-X's "Prompt me to log QSO") ─────────────────────
   // Its own area, not `logEntry.*`: this is the popup that reviews a contact the sequencer
@@ -989,6 +1007,14 @@ export const EN = {
   // The breakdown panels. Every band and mode name under these headings is data.
   'awards.bands.head': 'DXCC by band',
   'awards.grids.head': 'Grids by band (VUCC)',
+  // Band names and frequencies are invariant tokens — never translate '6 m' or '50 MHz'.
+  'awards.grids.filter.vucc.label': 'VUCC bands',
+  'awards.grids.filter.vucc.title': 'Show only the bands ARRL awards grids on — 50 MHz and up',
+  'awards.grids.filter.all.label': 'All bands',
+  'awards.grids.filter.all.title':
+    'Show every band you have worked a grid on, HF included — a tracker count, not award progress',
+  'awards.grids.noVucc':
+    'No grids on 6 m or up yet — VUCC starts at 50 MHz. Switch to All bands for the full tracker count.',
   'awards.modes.head': 'DXCC by mode',
   'awards.bar.title': '{{confirmed}} confirmed / {{worked}} worked',
   'awards.bar.titleGrids': '{{confirmed}} confirmed / {{worked}} worked grids',
@@ -1168,6 +1194,9 @@ export const EN = {
   'needed.column.call': 'Call',
   'needed.column.entity': 'Entity',
   'needed.column.band': 'Band',
+  'needed.column.freq': 'Freq',
+  'needed.row.freq.title': 'Spotted on {{freq}} MHz',
+  'needed.row.freq.none': 'No exact frequency — this need is band-level only',
   'needed.column.mode': 'Mode',
   'needed.column.zone': 'Zone',
   'needed.column.why': 'Why',
@@ -1212,7 +1241,7 @@ export const EN = {
     'New US state on this band (5BWAS) — a hint from the grid; confirm from the log',
   'need.badge.dxped.label': 'DXPED',
   'need.badge.dxped.title': 'Active DXpedition — limited-time window',
-  'need.badge.confirm.label': 'NEEDS QSL',
+  'need.badge.confirm.label': 'LoTW',
   'need.badge.confirm.title':
     'This entity/zone/grid is worked on this band but not yet confirmed — a LoTW match or a paper card would close it (eQSL and QRZ do not count toward awards, so they do not clear this). Not a claim about this callsign: B4 is the worked-this-call chip.',
   'need.badge.pota.title': 'Live POTA activator',
@@ -1240,8 +1269,8 @@ export const EN = {
   'need.chip.newState.label': 'STATE',
   'need.chip.newState.short': 'ST',
   'need.chip.newState.title': 'New US state on this band — best-guess from the grid',
-  'need.chip.confirm.label': 'NEEDS QSL',
-  'need.chip.confirm.short': 'QSL',
+  'need.chip.confirm.label': 'LoTW',
+  'need.chip.confirm.short': 'LoTW',
   'need.chip.confirm.title':
     'Worked on this band but not yet confirmed — a LoTW match or a paper card closes it; eQSL and QRZ do not count toward awards',
   'need.chip.dxped.label': 'DXPED',
@@ -1504,6 +1533,7 @@ export const EN = {
   'map.layer.stations.label': 'My decodes',
   'map.layer.paths.label': 'Selected path',
   'map.layer.dxped.label': 'DXpeditions',
+  'map.layer.ota.label': 'Parks on the air',
 
   // The two legends, rendered by BOTH the 2-D map and the 3-D globe from one component —
   // the surfaces must explain their dots identically, so they share these keys. The band
@@ -1528,6 +1558,11 @@ export const EN = {
   'map.hover.workHint': ' — double-click to work',
   'map.hover.liveConfirmed': ' · live-confirmed',
   'map.hover.dxped': '{{call}} · {{entity}}{{az}} · {{need}} on {{band}} · {{likelihood}}',
+  // Parks on the air. `{{badge}}` marks a park never logged; `{{approx}}` admits a
+  // grid-placed marker is a ~4 km square rather than the park itself.
+  'map.hover.ota': '{{activator}} · {{reference}}{{name}} · {{freq}} MHz {{mode}}{{badge}}{{approx}}',
+  'map.hover.ota.new': ' · NEW PARK',
+  'map.hover.ota.approx': ' · approx',
   'map.hover.muf':
     'Ionosonde · measured MUF {{muf}} MHz here (KC2G) — a data point, not a station',
   // `{{what}}` (the symbol's own label), `{{moving}}` (speed/course) and `{{note}}` (the
@@ -1807,6 +1842,11 @@ export const EN = {
   'prop.openingAlert.tropo':
     '📡 {{band}} tropo opening — DX to ~{{km}} km, point {{octant}} · {{stations}} stns',
   'prop.openingAlert.generic': '⚡ {{band}} open — point {{octant}} · {{stations}} stns',
+  // Geomagnetic storm heads-up (stormAlert.ts). A storm is hours-to-days of degraded
+  // HF, unlike a flare's minutes — the copy says what it means for operating, and the
+  // forecast line is explicitly a forecast.
+  'prop.stormAlert.now': '🧲 Geomagnetic storm G{{g}} (Kp {{kp}}) — HF degraded, worst on polar paths; aurora possible on VHF',
+  'prop.stormAlert.forecast': '🧲 NOAA expects G{{g}} (Kp {{kp}}) from {{when}} — HF likely degraded then',
   'prop.openingAlert.thin':
     '📻 {{band}} possible {{mode}} — thin evidence: {{stations}} stns to ~{{km}} km {{octant}}; may not be audible by ear',
 
@@ -1984,8 +2024,8 @@ export const EN = {
   'spots.filter.mode.hide.title': 'Hide {{mode}} spots',
   'spots.filter.state.title':
     "Show only {{state}} spots (state resolved from stations you've heard before)",
-  'spots.filter.local.label': 'Heard near me',
-  'spots.filter.local.hidden': 'Heard near me · {{count}} hidden',
+  'spots.filter.local.label': 'Heard on my continent',
+  'spots.filter.local.hidden': 'Heard on my continent · {{count}} hidden',
   'spots.filter.local.title':
     'Show only spots someone on your continent actually heard. A station reported solely from another continent says nothing about a path from your station — the same test the Needed board uses. Turn it off for the worldwide cluster feed.',
   'spots.filter.privileges.label': 'My privileges',
@@ -2268,8 +2308,14 @@ export const EN = {
   'settings.alerts.legend': 'Alerts',
   'settings.alerts.myCall.label': 'My call',
   'settings.alerts.myCall.hint': 'Beep + flash when someone directs a call at you.',
+  'settings.alerts.confirmTier.label': 'Confirmation opportunities',
+  'settings.alerts.confirmTier.hint':
+    'Show worked-but-unconfirmed award slots — LoTW confirmation chances — on the Needed board and as chips on decodes. Turn off to chase only new contacts.',
   'settings.alerts.cq.label': 'CQ calls',
   'settings.alerts.cq.hint': 'Alert on any decoded CQ. Off by default — CQs are constant.',
+  'settings.alerts.potaNewActivation.label': 'New POTA activation',
+  'settings.alerts.potaNewActivation.hint':
+    "Beep when a park is freshly spotted on the air (the map's Parks on the air layer). Off by default.",
   // One band-scope vocabulary, read by all three selects — the same four choices mean the
   // same thing on each, and a translator writes them once.
   'settings.alerts.scope.off': 'Off',
@@ -2299,6 +2345,8 @@ export const EN = {
   // frequency, band and mode — is data and never passes through here either. Where a
   // programme name appears INSIDE a sentence below, a translator leaves it exactly as it is.
   'ota.subtitle': 'Hunt activators on the air now',
+  'ota.popOut.title': 'Open the POTA/SOTA board in its own window (a POTA board beside a SOTA board)',
+  'ota.popOut.label': '⧉ Pop out',
   // The programme picker. POTA and SOTA are names the operator reads on the programmes' own
   // sites; "Both" is an English word and this is the only part of that row a translator sees.
   'ota.program.aria': 'Program',
@@ -2463,6 +2511,23 @@ export const EN = {
   'fieldDay.bonus.aria': '{{label}} — {{points}} pts',
   'fieldDay.bonus.pts': '{{points}} pts',
 
+  // Three states per bonus: not planned / planned / earned. Only EARNED scores — a plan is
+  // a plan, not points — so these words carry that distinction and must keep carrying it in
+  // every language. `{{points}}` is a score, `{{count}}` a number of bonuses, `{{mult}}` the
+  // power multiplier and `{{label}}` a bonus name from FD_BONUSES (never translated).
+  'fieldDay.scoring.power.chip': '\u00d7{{mult}} power',
+  'fieldDay.bonuses.planned.count': '{{count}} planned \u00b7 +{{points}} pts',
+  'fieldDay.bonuses.chase.aria': 'Bonus points earned and planned',
+  'fieldDay.bonuses.chase.earned': 'Earned {{points}} pts',
+  'fieldDay.bonuses.chase.earned.note': 'counted in your score',
+  'fieldDay.bonuses.chase.planned': 'Planned +{{points}} pts',
+  'fieldDay.bonuses.chase.planned.note': 'not scored until you tick it',
+  'fieldDay.bonuses.chase.potential': 'If all land {{points}} pts',
+  'fieldDay.bonus.plan.off': 'Plan',
+  'fieldDay.bonus.plan.on': 'Planned',
+  'fieldDay.bonus.plan.aria': 'Plan {{label}} \u2014 planned bonuses do not score',
+  'fieldDay.bonus.plan.title': 'Planned = you mean to earn it. It scores only once you tick the box.',
+
   // The log. Column headings name a CONCEPT; every value under them is a token. ARRL calls
   // the exchange field Class and WFD calls it Category — two words for two events, not one
   // word with a variant.
@@ -2489,6 +2554,50 @@ export const EN = {
   'fieldDay.countdown.tomorrow': 'starts tomorrow',
   'fieldDay.countdown.hours': 'starts in {{count}}h',
   'fieldDay.countdown.soon': 'starting soon',
+  // Which rules data is scoring — the banner's identity line. {{year}} is the ruleset's
+  // rules_year, {{date}} the rules file's `generated` stamp shown as YYYY-MM-DD.
+  'fieldDay.rules.line': 'Rules {{year}} · data {{date}}',
+  // The warn-only rule advisories (FdAdvisories.tsx — warn, NEVER remove or disable;
+  // operator ruling). {{event}} is the event's own untranslated name, {{mode}} an on-air
+  // mode token, {{sources}} the live assistance-source labels — all invariant slots.
+  'fieldDay.advisory.banned':
+    '{{mode}} is not permitted at {{event}} ({{year}} rules) — you can still log it, but it will not count',
+  'fieldDay.advisory.cluster':
+    'DX cluster assistance is not permitted at {{event}} ({{year}} rules) — live now: {{sources}}',
+  'fieldDay.advisory.spotting':
+    'Spotting assistance is not permitted at {{event}} ({{year}} rules) — live now: {{sources}}',
+  'fieldDay.club.aria': 'Club sync',
+  'fieldDay.club.head': 'Club',
+  'fieldDay.club.state.synced': 'Synced',
+  'fieldDay.club.state.behind': 'Behind — {{queued}} to send',
+  'fieldDay.club.state.offline': 'Offline — {{queued}} queued here',
+  'fieldDay.club.state.title': 'Live sync state, derived from the send queue — never a guess. Contacts logged while offline are journaled and re-sent automatically.',
+  'fieldDay.club.hostLine': '{{event}} · host {{call}}',
+  'fieldDay.club.counters': 'Club: {{score}} pts · {{qsos}} QSOs · {{sections}} sections',
+  'fieldDay.club.export.cabrillo.label': 'Club Cabrillo',
+  'fieldDay.club.export.cabrillo.title': 'Export the merged club log as Cabrillo (deduped — the earliest contact wins)',
+  'fieldDay.club.export.adif.label': 'Club ADIF',
+  'fieldDay.club.export.adif.title': 'Export the merged club log as ADIF (deduped — the earliest contact wins)',
+  'fieldDay.club.popOut.label': '⧉ Pop out board',
+  'fieldDay.club.popOut.title': 'Pop the club band board out to its own window (second monitor) — who is on what band, across every position',
+  'fieldDay.club.skew': 'This PC\'s clock differs from the host\'s by {{secs}} s — check this PC\'s clock',
+  'fieldDay.club.error': 'Host: {{msg}}',
+  'fieldDay.club.board.empty': 'No positions heard yet — every other Nexus position on this network appears here as it logs.',
+  'fieldDay.club.board.column.position': 'Position',
+  'fieldDay.club.bands.column.band': 'Band',
+  'fieldDay.club.bands.column.who': 'Who is there',
+  'fieldDay.club.bands.free': 'free',
+  'fieldDay.club.bands.clash.mark': 'CLASH',
+  'fieldDay.club.bands.clash.why':
+    '{{band}} conflict: two positions are running {{mode}} at once. They will work each other\u2019s callers and split the run.',
+  'fieldDay.club.board.column.band': 'Band',
+  'fieldDay.club.board.column.mode': 'Mode',
+  'fieldDay.club.board.column.operator': 'Operator',
+  'fieldDay.club.board.column.qsos': 'QSOs',
+  'fieldDay.club.board.column.rate': 'Rate',
+  'fieldDay.club.board.stale': 'Last heard {{secs}} s ago',
+  'fieldDay.club.board.unnamed': 'Unnamed position',
+  'fieldDay.club.board.rate': '{{rate}}/hr',
 
   // ── The contest calendar (upcoming contests, from the WA7BNM calendar) ──────────────
   // ⚠️ Contest NAMES arrive from the feed and are never translated; the date + UTC time
@@ -2568,6 +2677,102 @@ export const EN = {
   'settings.fieldDay.power.high.hint': 'Over 100W — commercial/generator power',
   'settings.fieldDay.power.hint':
     'Multiplies your QSO points. QRP/battery = ×5 (ARRL bonus for going off-grid). Choose before the event.',
+
+  // Rules-data currency (fd-rules.json — the scoring parameters, event windows, bonus menu
+  // and section list behind both events). {{date}} is the rules file's `generated` stamp
+  // shown as YYYY-MM-DD; every "applies at next launch" is literal (the table is set once
+  // at launch), like the country file's. No cron: this pre-event button is the refresh path.
+  'settings.fdRules.update.action': 'Check for rules updates',
+  'settings.fdRules.update.busy': 'Checking…',
+  'settings.fdRules.update.done':
+    'Rules data downloaded — applies at next launch (data {{date}}).',
+  'settings.fdRules.update.current': 'Rules data is already current (data {{date}}).',
+  'settings.fdRules.update.failed': 'Rules update failed: {{detail}}',
+  'settings.fdRules.status': '{{year}} rules · data {{date}}',
+  'settings.fdRules.pending': 'Update downloaded (data {{date}}) — applies at next launch.',
+  'settings.fdRules.stale': 'Rules data is from {{year}} — check for updates before the event.',
+  'settings.fdRules.empty': 'Built-in rules data active.',
+  'settings.fdRules.hint':
+    'Scoring parameters, event windows, bonuses and sections for both Field Day events. Checked on demand; a downloaded update applies at the next launch.',
+  // ── Settings ▸ Contesting ▸ Who's who at this event ─────────────────────────────────
+  // Three names, three different jobs, and until now nothing said so: the club call lived on
+  // Station, the position name under a networking heading on Contesting, the operator on
+  // Station and on the Field Day dashboard. The club report behind this section is an operator
+  // asking what the position name was even for. Each hint therefore names its own job in terms
+  // that separate it from the other two — what goes on the air, where you are sitting, who is
+  // sitting there — and every one of these rows edits the SAME setting as its other home.
+  'settings.fdWho.legend': "Who's who at this event",
+  'settings.fdWho.note':
+    'Three names, three different jobs — the club call goes on the air, the position is which tent you are sitting in, and the operator is whoever is at the key right now. Changing one of them here changes it everywhere in Nexus: the callsign and the operator are the same two boxes the Station tab holds.',
+
+  'settings.fdWho.call.label': 'Callsign on the air',
+  'settings.fdWho.call.hint':
+    'The call that goes on the air and onto every contact you log — at a club event that is the club\'s call, the same one at every position on site.',
+
+  'settings.fdWho.position.label': 'Position name',
+  'settings.fdWho.position.placeholder': 'CW tent',
+  'settings.fdWho.position.hint':
+    'Which tent, trailer or table this station is — it names you on the club band board so everyone can see which position is on which band, and it never goes on the air.',
+
+  // ⚠️ `OPERATOR` is the ADIF field name — a wire identifier. Keep it verbatim.
+  'settings.fdWho.operator.label': 'Operator at the key',
+  'settings.fdWho.operator.placeholder': 'blank = the callsign above',
+  'settings.fdWho.operator.hint':
+    'Whoever is running this position right now — change it every time someone takes the seat, and their contacts are stamped with it (ADIF OPERATOR) so the club can split the log by operator afterwards.',
+
+  'settings.fdClub.legend': 'Field Day Club Sync',
+  'settings.fdClub.host.label': 'Host a club event',
+  'settings.fdClub.host.hint': 'Merges every position\'s contacts into one club log on this PC — and opens a port on your local network (the only time Nexus listens beyond this computer).',
+  'settings.fdClub.host.note': 'Positions on this network can now find and join this event. There is no join password — a club site LAN is trusted, and anyone on it could add rows to the club log, which you will see. If this PC dies, enable hosting on any other position: everyone re-joins and nothing is lost.',
+  'settings.fdClub.host.aria.enable': 'Enable club event hosting',
+  'settings.fdClub.host.aria.disable': 'Disable club event hosting',
+  'settings.fdClub.eventName.label': 'Event name',
+  'settings.fdClub.eventName.placeholder': 'W9ABC Field Day',
+  'settings.fdClub.eventName.hint': 'Shown to joining positions and in discovery.',
+  'settings.fdClub.hostPort.label': 'Host port',
+  'settings.fdClub.hostPort.hint': 'TCP port for the club sync (default 42073).',
+  'settings.fdClub.join.label': 'Join event at',
+  'settings.fdClub.join.hint': 'host:port of the club host — use Find club events, or type it from the host\'s screen.',
+  'settings.fdClub.join.hostingHint': 'Hosting — this position joins its own event automatically.',
+  'settings.fdClub.discover.action': 'Find club events',
+  'settings.fdClub.discover.busy': 'Listening…',
+  'settings.fdClub.discover.empty': 'Nothing heard in 2 s — same network? Some Wi-Fi blocks discovery; type the host address instead.',
+  'settings.fdClub.discover.pick.label': '{{event}} — {{host}}',
+  'settings.fdClub.discover.pick.title': 'Use {{host}} as the join address',
+  // ---- Connect on the TV (the read-only LAN page). The toggle IS the LAN opt-in,
+  // so the copy has to name what it exposes and to whom — its threat model is not the
+  // Field Day scoreboard's, which is defensible partly because a contest log is
+  // already broadcast in clear on the air.
+  // ---- App updates: the beta (pre-release) channel opt-in ----
+  'settings.betaUpdates.legend': 'App updates',
+  'settings.betaUpdates.label': 'Receive beta (pre-release) updates',
+  'settings.betaUpdates.hint':
+    'When on, the updater offers pre-release builds — newer features, but less tested. Off keeps you on stable releases only.',
+  'settings.betaUpdates.aria.enable': 'Turn on beta updates',
+  'settings.betaUpdates.aria.disable': 'Turn off beta updates',
+  'settings.connectWeb.legend': 'Connect on a TV',
+  'settings.connectWeb.label': 'Serve Connect on this network',
+  'settings.connectWeb.hint':
+    'Serves the full Connect view — the map with every layer, the panes, live openings — read-only, to any browser on your network: a shack TV, a tablet, a phone. Nothing can be changed from it.',
+  'settings.connectWeb.exposes':
+    'While this is on, anyone on your network can see your callsign, grid square and the propagation picture — including the callsigns of stations heard and spotted. Your log, your needs board and the frequency you are on are never sent.',
+  'settings.connectWeb.aria.enable': 'Serve Connect on the local network',
+  'settings.connectWeb.aria.disable': 'Stop serving Connect on the local network',
+  'settings.connectWeb.port.label': 'Port',
+  'settings.connectWeb.port.hint': 'Separate from the Field Day scoreboard, so both can run at once.',
+  'settings.connectWeb.url.label': 'Open this on the TV',
+  'settings.connectWeb.url.copy': 'Copy',
+  'settings.connectWeb.url.pending': 'Starting…',
+  'settings.fdBoard.label': 'Spectator scoreboard',
+  'settings.fdBoard.hint': 'Serves a read-only scoreboard page for a TV or projector on this network — nothing to install on the TV, and viewers can only look. The first enable may pop a Windows Firewall prompt; allow it or viewers see nothing.',
+  'settings.fdBoard.aria.enable': 'Enable the spectator scoreboard',
+  'settings.fdBoard.aria.disable': 'Disable the spectator scoreboard',
+  'settings.fdBoard.port.label': 'Board port',
+  'settings.fdBoard.port.hint': 'TCP port the scoreboard page is served on (default 7373).',
+  'settings.fdBoard.url.label': 'On the TV, open',
+  'settings.fdBoard.url.copy': 'Copy',
+  'settings.fdBoard.url.pending': 'Starting up — save settings, then this row shows the address.',
+  'settings.fdBoard.hostOnly': 'Live data appears when this position hosts the club event; otherwise the page points viewers to the host.',
 
   // ── Satellites ──────────────────────────────────────────────────────────────────────
   // The Satellites section, the Connect Passes pane, and the nine composers behind them.
@@ -3287,6 +3492,54 @@ export const EN = {
   'memories.editor.groups.aria': 'Group membership',
   'memories.editor.done': 'Done',
 
+  // The mode and CTCSS pickers. Every choice is always offered (a datalist filtered them by
+  // what was already in the field, which left one mode reachable), and "Other…" is the escape
+  // that lets a mode or tone we do not list — a CHIRP import carries them — still be typed in.
+  'memories.picker.other': 'Other…',
+
+  // The pinned add panel ＋ New opens. The channel exists from the moment it is pressed, so
+  // backing out keeps it and Discard is what throws it away.
+  'memories.add.title': 'New memory',
+  'memories.add.hint': 'Enter saves · Esc closes — the channel is kept either way',
+  'memories.add.discard': 'Discard',
+  'memories.add.discard.title': 'Delete this new memory and close the panel',
+
+  // Selecting rows and deleting them together. Every count here is the SELECTED ROWS ON
+  // SCREEN — a bulk delete never touches a row the operator has narrowed away.
+  'memories.select.row.aria': 'Select {{name}}',
+  'memories.select.all.aria': 'Select all shown',
+  'memories.select.all.label': 'All shown',
+  'memories.select.count': {
+    one: '{{count}} selected',
+    other: '{{count}} selected',
+  },
+  // Shown INSTEAD of the plain count when part of the selection has been narrowed out of
+  // view: the numbers on this bar are the visible selection, so without this the count
+  // silently disagrees with how many rows are actually ticked.
+  'memories.select.countHidden': '{{count}} selected · {{hidden}} not in view',
+  'memories.select.clear': 'Clear',
+  'memories.select.delete.label': 'Delete {{count}}',
+  'memories.select.delete.title': 'Delete the selected memories in this view',
+  'memories.select.confirm.title': {
+    one: 'Delete {{count}} memory?',
+    other: 'Delete {{count}} memories?',
+  },
+  'memories.select.confirm.body':
+    'They leave every group and the cockpit strips too. The toast that follows can undo it.',
+  'memories.select.confirm.ok': {
+    one: 'Delete {{count}} memory',
+    other: 'Delete {{count}} memories',
+  },
+  'memories.select.deleted': {
+    one: 'Deleted {{count}} memory',
+    other: 'Deleted {{count}} memories',
+  },
+  'memories.select.undo': 'Undo',
+  'memories.select.restored': {
+    one: 'Restored {{count}} memory',
+    other: 'Restored {{count}} memories',
+  },
+
   // Starter packs. The pack's name, description and region are the pack's own data.
   'memories.packs.title': 'Starter packs',
   'memories.packs.close.aria': 'Close',
@@ -3549,6 +3802,7 @@ export const EN = {
   'recall.note.title': 'Your most recent note on this station',
   'recall.log.head': 'Previous contacts',
   'recall.log.aria': 'Previous contacts with {{call}}',
+  'recall.log.row.title': 'Show {{call}} in the Logbook',
 
   // ── The band controls (the licensed-band picker, the frequency control) ─────────────
   // ⚠️ Band names are both the LABEL and the VALUE of the pickers' options — `pickBand` sends
@@ -3559,6 +3813,8 @@ export const EN = {
   'bandPicker.select.title':
     'Band — your last frequency on this band in this mode this session, else the start of your licensed segment',
   'bandPicker.txLock.label': '🔒 TX locked',
+  'bandPicker.txLock.splitTitle':
+    'TX locked — your split transmit frequency, {{tx}} MHz, is outside your license privileges. Receiving on {{rx}} MHz is fine.',
   'bandPicker.txLock.title':
     'This frequency/mode is outside your license privileges — transmit is blocked. Pick a band above, or change your license class in Settings.',
 
@@ -3567,6 +3823,16 @@ export const EN = {
   'freq.channel.aria': 'Band channel preset',
   'freq.channel.title': 'Pick a band-plan channel',
   'freq.channel.presets': '— Presets —',
+  // A band this licence class cannot transmit on is still LISTED and still tunable — no
+  // licence restricts receiving. The suffix says what you will and will not be able to do.
+  // ---- The TV page's chrome (src/tv/ConnectTv.tsx — the LAN-served full Connect view).
+  'tv.readonly': 'read-only',
+  'tv.noLink': 'no link to Nexus',
+  'tv.stale': 'data {{min}} min old',
+  'tv.waiting': 'Waiting for the first propagation picture from Nexus…',
+  'freq.channel.rxOnly': 'receive only',
+  'freq.channel.rxOnly.title':
+    'Your licence class has no transmit privileges on this band. You can tune here and listen; transmitting will be refused.',
   'freq.channel.custom': '{{band}} (custom)',
   'freq.dial.label': 'Dial (MHz)',
   'freq.band.title': 'Current band',
@@ -3701,6 +3967,7 @@ export const EN = {
   // What Save says when the form is refused. The rig checks' own wording lives above, in
   // `settings.radio.check.*` — this is only the panel's fallback when one carries no message.
   'settings.save.callsignFirst': 'Enter your callsign on the Station tab before saving.',
+  'settings.save.fdPositionName': 'Name this position on the Contesting tab before hosting or joining a club event — the club band board shows this name.',
   'settings.save.checkRadio': 'Check the radio settings.',
   'settings.save.failed': 'Could not save settings.',
 
@@ -3767,8 +4034,9 @@ export const EN = {
   'settings.radios.makeActive.confirm.action': 'Discard and switch',
   'settings.routing.rules.failed': 'Could not save the routing rules',
 
-  // Radio detection.
-  // called by in the three "Applied …" reports — it fills `{{device}}`, never a fragment.
+  // Radio detection. This fork's Auto-detect PROPOSES rather than applying (see
+  // `SettingsPanel.catproposal.test.tsx`), so upstream's three "Applied …" reports and the
+  // `settings.detect.unknownRadio` word they filled have no call site here and are not carried.
   'settings.detect.usb.failed': 'USB radio detection failed',
   'settings.detect.flex.scanFailed': 'Flex LAN scan: {{error}}',
   'settings.detect.none':
@@ -4119,6 +4387,23 @@ export const EN = {
 
   // ── Settings ▸ Radio ▸ Rig & CAT ▸ Advanced ─────────────────────────────────────────
   'settings.rigControl.advanced.title': 'Advanced',
+  'settings.rigControl.serialHandshake.label': 'Serial handshake',
+  'settings.rigControl.serialHandshake.auto': 'Auto (recommended)',
+  'settings.rigControl.serialHandshake.none': 'None — no flow control',
+  'settings.rigControl.serialHandshake.hardware': 'Hardware (RTS/CTS)',
+  'settings.rigControl.serialHandshake.xonxoff': 'XON/XOFF (software)',
+  'settings.rigControl.serialHandshake.hint':
+    "Tells Nexus what your cable actually does, instead of letting it guess. Leave it on Auto unless you have a rig that keys at launch — Auto changes nothing about how your station works today. If you change it and CAT stops working, put it back on Auto: on some rigs Hamlib quietly refuses the setting and then answers without ever having opened the radio, so you get a CAT light and a rig that ignores you.",
+  'settings.rigControl.pttLineState.label': 'Keying line at startup',
+  'settings.rigControl.pttLineState.auto': 'Auto (recommended)',
+  'settings.rigControl.pttLineState.untouched': 'Never touch it',
+  'settings.rigControl.pttLineState.low': 'Hold it low',
+  'settings.rigControl.pttLineState.high': 'Hold it high',
+  'settings.rigControl.pttLineState.hint':
+    "For the one fault this exists to fix: a rig that keys at launch, before you have touched anything. Leave it on Auto unless that is happening to you — Auto changes nothing about how your station works today. If you change it and CAT stops working, put it back on Auto. Only you can see whether the rig unkeys; nobody can test this from our end, so treat it as something to try on a rig you are watching.",
+  'settings.digital.tunePower.label': 'Tune power (%)',
+  'settings.digital.tunePower.hint':
+    "The power a tune-up keys at — leave it empty and Nexus never touches your power, which is what it does today. It can only turn the rig DOWN, never up: it keys at whichever is lower, this or the power you are already running, so 50 % here while you run 25 % still tunes at 25 %. On a 100 W rig, 10 % is about 10 W — enough for an antenna tuner, kind to a loop.",
   'settings.rigControl.rigctldPort.label': 'rigctld TCP Port',
   'settings.rigControl.rigctldPort.hint': 'Port Nexus launches rigctld on.',
   'settings.rigControl.plainSsb.label': 'Data modes use plain SSB',
@@ -4199,16 +4484,25 @@ export const EN = {
   // ── Settings ▸ Radio ▸ Headphone monitor ────────────────────────────────────────────
   // "System default" inside these sentences names the picker entry above, so it reads the
   // same word the operator just chose — translate them together.
-  'settings.headphoneMonitor.legend': 'Headphone monitor',
-  'settings.headphoneMonitor.enable.label': 'Enable monitor',
-  'settings.headphoneMonitor.enable.aria': 'Enable headphone monitor',
+  // ⚠️ THE WORD "MONITOR" IS NOT USED HERE, deliberately, though the settings behind it are still
+  // named `monitor_*`. In amateur practice MONITOR means listening to your own TRANSMITTED audio —
+  // it is what MONI on the rig does. This plays the RECEIVED audio out of a computer device. An
+  // experienced operator read the old label and asked whether it would put his own voice back in
+  // his ears (2026-08-22); it would not, which is precisely the problem with the old wording.
+  'settings.headphoneMonitor.legend': 'Receive audio on this computer',
+  'settings.headphoneMonitor.enable.label': 'Play receive audio here',
+  'settings.headphoneMonitor.enable.aria': 'Play receive audio on this computer',
   'settings.headphoneMonitor.enable.hint':
-    "Plays the exact audio the decoder hears — for level / RFI diagnosis and listening to the band. Off by default; UNVERIFIED on-air until the attended session. Guards against the rig's TX device by name (System default is resolved to its real device first) — if your devices go by multiple names, pick your headphones explicitly rather than System default.",
-  'settings.headphoneMonitor.device.label': 'Monitor Output Device',
+    "Plays the RECEIVED audio — exactly what the decoder hears — out of a device on this computer, for level and RFI diagnosis or simply to listen to the band. This is not a transmit monitor: it never plays your own voice back. Off by default; UNVERIFIED on-air until the attended session.",
+  // NAMES THE DESTINATION, not the direction — "Output device" collided with
+  // `settings.audio.output.label` ("Output Device (TX)") on the same tab, so the Radio page
+  // showed two pickers differing by a parenthetical and a capital letter. Under the section
+  // heading it read clearly; scanning the tab it did not (kd9taw, #157).
+  'settings.headphoneMonitor.device.label': 'Headphones or speakers',
   'settings.headphoneMonitor.device.hint':
     "Your headphones or speakers — must NOT be the rig's TX output device.",
-  'settings.headphoneMonitor.level.label': 'Monitor Level',
-  'settings.headphoneMonitor.level.aria': 'Headphone monitor level',
+  'settings.headphoneMonitor.level.label': 'Listening level',
+  'settings.headphoneMonitor.level.aria': 'Receive listening level',
   'settings.headphoneMonitor.level.hint':
     'Headphone listening volume (does not affect TX).',
 
@@ -4276,6 +4570,30 @@ export const EN = {
   // `{{detail}}` is `tleRefreshMessage`'s operator-voiced sentence — already a catalog string
   // (batch 7), composed there and interpolated whole here.
   'settings.orbitalElements.lastRefresh': 'Last refresh: {{detail}}',
+
+  // ── Settings ▸ Radio ▸ Amplifier ────────────────────────────────────────────────────
+  // ⚠️ NOT HERE, and none of it may move: the AMPLIFIER FAMILY NAMES ("SPE Expert 1.3K-FA /
+  // 2K-FA", "Elecraft KPA500 / KPA1500") and the serial device examples. Those are
+  // manufacturers' product names and OS device paths — a translated one names no amplifier
+  // anyone owns and no port any machine has. `SWR` and `ATU` are the vocabulary of the thing
+  // being configured and stay verbatim inside these sentences.
+  //
+  // NO PLURAL ENTRIES IN THIS BLOCK. es.ts and fr.ts carry English's plural entries flattened
+  // into single concatenated strings, so a `{one, other}` key added here would ship rendering
+  // both forms at once in two languages, and no guard sees it.
+  'settings.amplifier.legend': 'Amplifier',
+  'settings.amplifier.note':
+    'Read-only status from a linear on its own serial port — power out, SWR, temperature and any alarm. Nexus never commands the amplifier: it only reads it.',
+  'settings.amplifier.model.label': 'Amplifier',
+  'settings.amplifier.model.none': 'None',
+  'settings.amplifier.model.hint':
+    'Place the Amplifier pane in Connect to see the readings. Nothing here changes how the radio transmits.',
+  'settings.amplifier.follow.label': 'Follow the radio\u2019s band',
+  'settings.amplifier.follow.hint':
+    'Step the amplifier to the band you are on, without being asked. Off by default \u2014 this is the one amplifier control that acts on its own. It never moves the amplifier while you are transmitting, and it steps one band at a time, checking where the amplifier actually is after each one rather than assuming it got there. \u26a0\ufe0f If your amplifier already follows the radio through its own band-data cable, as most SPE installations do, leave this off: the hardware is doing the same job, and two things steering one band is worse than either alone.',
+  'settings.amplifier.port.label': 'Amplifier port',
+  'settings.amplifier.port.hint':
+    'Its own port, not the one CAT uses — a serial port can only be open once, so sharing it stops the radio connecting. The speed is worked out for you.',
 
   // ── Settings ▸ Radio ▸ Rotator ──────────────────────────────────────────────────────
   // ⚠️ NOT HERE, and none of it may move: the ROTATOR MODEL NAMES and their Hamlib model
@@ -4622,6 +4940,11 @@ export const EN = {
   'settings.digital.promptToLog.label': 'Prompt before logging',
   'settings.digital.promptToLog.hint':
     'Show a confirm-and-edit popup when a QSO completes instead of logging silently (WSJT-X “Prompt me to log QSO”). No effect unless Auto-log is on.',
+  // WSJT-X's "dB reports to comments" (Settings ▸ Reporting there), quoted so an operator
+  // migrating recognises it; the format is WSJT-X's own, byte for byte.
+  'settings.digital.reportsToComments.label': 'dB reports to comments',
+  'settings.digital.reportsToComments.hint':
+    'Write the exchanged reports into the logged QSO\u2019s comment, e.g. \u201cFT8  Sent: -07  Rcvd: -12\u201d — the same format WSJT-X uses.',
   'settings.digital.preferRrr.label': 'Roger with RRR (not RR73)',
   'settings.digital.preferRrr.hint':
     'Acknowledge the final report with a bare RRR (partner still owes a 73) instead of the combined RR73. Off = RR73 (modern FT8 practice).',
@@ -4865,9 +5188,11 @@ export const EN = {
   'settings.cw.keyer.cat': 'CAT — the rig keys CW (Hamlib send_morse; newer rigs only)',
   'settings.cw.keyer.serial': "Serial keyline (DTR/RTS) — key the rig's KEY jack",
   'settings.cw.keyer.winkeyer': 'WinKeyer — K1EL hardware keyer',
-  'settings.cw.keyer.soundcard': 'Soundcard — audio tone through SSB (workaround)',
+  'settings.cw.keyer.soundcard': 'Soundcard — audio tone through a data mode (workaround)',
   'settings.cw.keyer.hint':
-    "How Nexus sends CW. <b>CAT</b> uses the rig's internal keyer, but older rigs (e.g. IC-756PRO III) don't support it. <b>Serial keyline</b> toggles DTR/RTS into the rig's KEY jack (rig in CW, rig shapes the signal — the clean N1MM/fldigi method, needs only a keying cable). <b>WinKeyer</b> drives a K1EL.<b>Soundcard</b> keys an audio tone through SSB — a workaround; set drive so ALC reads zero. Also switchable live from the CW cockpit.",
+    "How Nexus sends CW. <b>CAT</b> uses the rig's internal keyer, but older rigs (e.g. IC-756PRO III) don't support it. <b>Serial keyline</b> toggles DTR/RTS into the rig's KEY jack (rig in CW, rig shapes the signal — the clean N1MM/fldigi method, needs only a keying cable). <b>WinKeyer</b> drives a K1EL.<b>Soundcard</b> keys an audio tone — a workaround; set drive so ALC reads zero. <b>It takes your radio out of CW</b> into a data mode (DATA-U/DATA-L, so the tone reaches the transmitter instead of the mic jack); pick any other keyer and CW mode comes straight back. Also switchable live from the CW cockpit.",
+  'settings.cw.keyer.unproven':
+    "CAT CW keying is <b>unproven on this radio</b>. Its Hamlib backend sends a different keying command from the one other radios use, and it reports success either way — so if nothing is transmitted, Nexus cannot tell you. If CW doesn't go out, use the Serial keyline, WinKeyer, or Soundcard keyer.",
   'settings.cw.pitch.label': 'Sidetone pitch (Hz)',
   'settings.cw.pitch.hint':
     'CW tone pitch (300–1200 Hz) — the soundcard keyer tone and the CW scope zero-beat marker.',
@@ -4920,6 +5245,9 @@ export const EN = {
   // The 425 and 850 Hz shifts are rows with nothing in them but a number, so they stay in
   // the panel; only the 170 Hz row and the two baud rows carry prose beside the figure.
   'settings.rtty.legend': 'RTTY',
+  'settings.rtty.rxAutoArm.label': 'Start receiving when RTTY opens',
+  'settings.rtty.rxAutoArm.hint':
+    'The RTTY screen starts the decoder as soon as you open it — tune a signal and the text prints, no setup. Turn this off to arm the receiver by hand (the Arm RX button in the decoded-text pane). This arms the RECEIVER only — transmitting is never armed for you.',
   'settings.rtty.keying.title': 'Keying',
   'settings.rtty.backend.label': 'Keying backend',
   'settings.rtty.backend.afsk': 'AFSK — soundcard tones through the rig in LSB (default)',
@@ -4951,7 +5279,7 @@ export const EN = {
   'settings.psk.legend': 'PSK',
   'settings.psk.rxAutoArm.label': 'Start receiving when PSK opens',
   'settings.psk.rxAutoArm.hint':
-    'The PSK screen starts the decoder as soon as you open it — click a trace on the waterfall and the text prints, no setup. Turn this off to arm the receiver by hand (the Arm RX button in the decoded-text pane). Stopping the receiver yourself is already remembered for the rest of the session. PSK31 is receive-only for now; transmit is on the keyboard-modes roadmap.',
+    'The PSK screen starts the decoder as soon as you open it — click a trace on the waterfall and the text prints, no setup. Turn this off to arm the receiver by hand (the Arm RX button in the decoded-text pane). Stopping the receiver yourself is already remembered for the rest of the session. This arms the RECEIVER only — transmitting is never armed for you.',
 
   // ── Settings ▸ SSTV ─────────────────────────────────────────────────────────────────
   // The transmit-mode picker's own rows are built from `SSTV_TX_MODES` — a mode name, its
@@ -5129,7 +5457,8 @@ export const EN = {
   // real nodes.
   'settings.integrations.legend': 'Integrations & Feeds',
   'settings.integrations.local.title': 'Local APIs & Loggers',
-  'settings.integrations.wsjtxUdp.hint': 'for JTAlert / GridTracker / loggers',
+  'settings.integrations.wsjtxUdp.hint':
+    'for JTAlert / GridTracker / loggers — and FT8 contest scorers. Several at once: separate addresses with a comma.',
   'settings.integrations.udpAddr.label': 'UDP Address',
   'settings.integrations.udpAddr.hint': 'host:port for the UDP feed',
   'settings.integrations.hrdLogging.label': 'Ham Radio Deluxe logging',
@@ -5309,6 +5638,25 @@ export const EN = {
   'settings.callsignState.hint':
     'A callsign→state index (from the FCC license file) so a New State lights up on cluster / CW / SSB spots that carry no grid. Refreshed weekly from hamradiotools.io; a live decode grid refines it for rovers.',
 
+  // ── Settings ▸ Logging & Connectors ▸ Country file (DXCC) ─────────────────────────
+  // ⚠️ `AD1C` (the file's maintainer), `cty.dat` and `DXCC` are invariant tokens in every
+  // catalog. `{{ver}}` is an AD1C release date the panel formats as YYYY-MM-DD; the resolver
+  // is set once at launch, so every "applies at next launch" is literal, not caution.
+  'settings.countryFile.legend': 'Country file (DXCC)',
+  'settings.countryFile.update.action': 'Update country file',
+  'settings.countryFile.update.busy': 'Updating…',
+  'settings.countryFile.update.done':
+    'Country file downloaded — AD1C {{ver}} applies at next launch.',
+  'settings.countryFile.update.current': 'Country file is already current — AD1C {{ver}}.',
+  'settings.countryFile.update.failed': 'Country file update failed: {{detail}}',
+  'settings.countryFile.status': '{{count}} entities · AD1C {{ver}} · fetched {{date}}',
+  'settings.countryFile.statusBuiltIn': '{{count}} entities · AD1C {{ver}} (built-in)',
+  'settings.countryFile.empty': 'Built-in country file active.',
+  'settings.countryFile.pending':
+    'Update downloaded (AD1C {{ver}}) — applies at next launch.',
+  'settings.countryFile.hint':
+    'The AD1C cty.dat country file maps callsigns to DXCC entities — the country on decode rows, the Needed board and the log. Checked weekly; a downloaded update applies at the next launch.',
+
   // ── Settings ▸ Logging & Connectors ▸ Confirmations ────────────────────────────────
   // The QSL services, one featgroup each. Everything below is a LABEL or a HINT: no key,
   // password, token or upload code is read, written or interpolated by any entry here, and the
@@ -5375,10 +5723,20 @@ export const EN = {
     'Unavailable while “Sign from ADIF location” is on: an unattended batch would sign older contacts with wherever you are NOW.',
   'settings.confirmations.lotw.autoUpload.lastRun': 'Last run: {{when}}.',
 
+  'settings.confirmations.wrl.export.label': 'Already have a log?',
+  'settings.confirmations.wrl.export.action': 'Export ADIF for WRL',
+  'settings.confirmations.wrl.export.hint':
+    'Auto-upload sends contacts as you log them. For your existing history, export it here and use the ADIF import on worldradioleague.com — their API caps uploads at 5,000 a day, so the file is the fast path for a big log.',
+  'settings.confirmations.wrl.export.done': 'Log exported to {{path}} — import that file on worldradioleague.com.',
+  'settings.confirmations.wrl.export.failed': 'Couldn\u2019t export the log',
   'settings.confirmations.eqsl.username.label': 'eQSL username',
   'settings.confirmations.eqsl.username.placeholder': 'your eQSL.cc account login',
   'settings.confirmations.eqsl.username.hint':
     'Your eQSL.cc login (often your callsign). Save settings to apply.',
+  'settings.confirmations.eqsl.qthNickname.label': 'QTH Nickname',
+  'settings.confirmations.eqsl.qthNickname.placeholder': 'e.g. Home',
+  'settings.confirmations.eqsl.qthNickname.hint':
+    'Only needed when your callsign has more than one QTH profile at eQSL — those accounts can\u2019t sign in without it. Leave empty otherwise.',
   'settings.confirmations.eqsl.password.label': 'eQSL password',
   'settings.confirmations.eqsl.password.placeholder': 'eQSL.cc account password',
   'settings.confirmations.eqsl.password.hint':
@@ -5453,6 +5811,21 @@ export const EN = {
   'settings.confirmations.clublog.upload.hint':
     'Push each logged QSO to ClubLog in real time (needs the email + app-password above; official builds bundle the API key).',
 
+  // World Radio League — a live logging service; the key comes from their
+  // Integrations ▸ Developer API page and is validated at save (GET /v1/me), so a
+  // typo fails HERE with a plain message, not on the first QSO.
+  'settings.confirmations.wrl.key.label': 'API key',
+  'settings.confirmations.wrl.key.placeholder': 'wrl_live_…',
+  'settings.confirmations.wrl.key.hint':
+    'From worldradioleague.com ▸ Integrations ▸ Developer API. Checked against the service when you save; stored write-only in the OS keychain.',
+  'settings.confirmations.wrl.key.saved': 'World Radio League key verified and saved — auto-upload is on.',
+  'settings.confirmations.wrl.key.saveFailed': 'Couldn\u2019t save the World Radio League key',
+  'settings.confirmations.wrl.key.cleared': 'World Radio League key cleared — auto-upload is off.',
+  'settings.confirmations.wrl.key.clearFailed': 'Couldn\u2019t clear the World Radio League key',
+  'settings.confirmations.wrl.key.forget.title': 'Remove the stored key from the OS keychain',
+  'settings.confirmations.wrl.upload.label': 'Auto-upload each QSO',
+  'settings.confirmations.wrl.upload.hint':
+    'Push every logged contact to your World Radio League logbook as it lands. A live-logging service — not an ARRL confirmation source.',
   'settings.confirmations.hrdlog.code.label': 'HRDLog.net upload code',
   'settings.confirmations.hrdlog.code.placeholder': 'your hrdlog.net upload code',
   'settings.confirmations.hrdlog.code.forget.title':
@@ -5613,6 +5986,22 @@ export const EN = {
   'connect.pane.outlook.title': 'Band Outlook',
   'connect.pane.openings.title': 'Openings',
   'connect.pane.openingsLog.title': 'Openings Log',
+  // ---- The three-day planetary-K outlook (Connect pane + the map's storm cue).
+  // `kind` is SWPC's own word for how a sample was arrived at; only "observed" is a
+  // measurement, so the wording must never turn a forecast into a reading.
+  'connect.pane.kpOutlook.title': 'Kp outlook',
+  'connect.pane.kpOutlook.basic': 'Three-day planetary-K forecast from NOAA — when the bands settle down.',
+  'connect.kp.unavailable': 'No Kp outlook yet — NOAA has not answered.',
+  'connect.kp.noForward': 'NOAA has published no forecast beyond now.',
+  'connect.kp.now': 'Now Kp {{kp}} ({{when}}, measured)',
+  'connect.kp.peak': 'Worst ahead: Kp {{kp}} at {{when}}',
+  'connect.kp.onset': 'Storm level (Kp {{kp}}) expected from {{when}}',
+  'connect.kp.relief': 'Settling below storm level around {{when}}',
+  'connect.kp.chart.aria': 'Planetary K index, measured hours then forecast',
+  'connect.kp.bar.title': '{{when}} · Kp {{kp}} · {{kind}}{{scale}}',
+  'connect.kp.kind.observed': 'measured',
+  'connect.kp.kind.estimated': 'estimated by NOAA',
+  'connect.kp.kind.predicted': 'forecast',
   'connect.pane.spacewx.title': 'Space Wx',
   'connect.pane.getout.title': 'Getting Out',
   'connect.pane.bestband.title': 'Best Band → Region',
@@ -5627,6 +6016,7 @@ export const EN = {
   'connect.pane.chaseFeed.title': 'Chase Feed',
   'connect.pane.satPasses.title': 'Satellite Passes',
   'connect.pane.rotor.title': 'Rotor',
+  'connect.pane.amp.title': 'Amplifier',
   'connect.pane.scope.title': 'Band Scope',
   'connect.pane.contests.title': 'Contests',
 
@@ -5638,6 +6028,8 @@ export const EN = {
     'Upcoming amateur-satellite passes over your QTH appear here once orbital elements load.',
   'connect.pane.rotor.basic':
     'Rotator control appears here once you pick a rotator model and port in Settings ▸ Radio ▸ Rotator.',
+  'connect.pane.amp.basic':
+    'Amplifier readings appear here once you pick an amplifier and its port in Settings ▸ Radio ▸ Amplifier.',
   'connect.pane.scope.basic':
     "A live spectrum of the active radio's passband — band noise and signals at a glance.",
   'connect.pane.scope.idle': "Flat — the radio's audio isn't reaching Nexus right now.",
@@ -6108,7 +6500,7 @@ export const EN = {
   'operate.dxped.off.label': 'Off',
   'operate.dxped.off.title': 'No DXpedition special mode',
   'operate.dxped.hound.title':
-    "DXpedition hound: calls go out above 1000 Hz; your R+report auto-moves to the Fox's frequency",
+    "DXpedition hound: calls go out above 1000 Hz, your R+report auto-moves to the Fox's frequency, and the QSO ends on the Fox's RR73 with NO parting 73 — a 73 there is QRM in the Fox's own segment. Off again at every launch: turn it on for the DXpedition, not for the day.",
 
   // The signal source. `{{active}}` is the backend's own `sourceLabel` and `{{addr}}` the
   // configured companion UDP address — both data. Two whole sentences, because the
@@ -6144,9 +6536,6 @@ export const EN = {
   'operate.header.record.startFailed': 'Could not start recording',
   'operate.header.record.stopFailed': 'Could not stop recording',
 
-  // `{{freq}}` is the split TX frequency, already formatted invariantly by the cockpit.
-  'operate.header.split.title':
-    'Rig split active — TX {{freq}} MHz (pile-up). Any QSY returns to simplex.',
 
   'operate.header.layout.aria': 'Operate layout',
   'operate.header.layout.classic.label': 'Classic',
@@ -6154,6 +6543,9 @@ export const EN = {
     'Classic — WSJT-X layout (Band Activity + Rx Frequency pair, roster aside)',
   'operate.header.layout.roster.label': 'Roster',
   'operate.header.layout.roster.title': 'Roster — GridTracker layout (Call Roster dominant)',
+
+  'operate.header.map.label': 'Map',
+  'operate.header.map.title': 'Open the POTA activity map in its own window',
 
   'operate.header.spot.aria': 'Spot a callsign to the DX cluster',
   'operate.header.spot.title':
@@ -6341,6 +6733,8 @@ export const EN = {
   'operate.roster.title': 'Call Roster',
   'operate.roster.filter.neededOnly': 'Needed only',
   'operate.roster.filter.hideWorked': 'Hide worked',
+  'operate.roster.filter.hideWorked.title':
+    'Hide stations you have already worked — EXCEPT the ones that still fill a need, which stay on the list. That is why a B4 chip can survive this filter: you worked that call on another band or mode, and it is still a new slot here. Turn on Needed only to see just those.',
   'operate.roster.filter.hideBlocked': 'Hide blocked',
   'operate.roster.filter.hideBlocked.title':
     'Drop blocked callsigns from the roster entirely (unchecked: they render dimmed). Alt-double-click a row to block or unblock; the auto-responder never answers blocked calls either way.',
@@ -6379,6 +6773,8 @@ export const EN = {
   'operate.roster.lotw.title': 'Uploads to LoTW — this contact should confirm',
   'operate.roster.calling.title': 'Working {{call}}',
   'operate.roster.calling.cq.title': 'Calling CQ — not in a QSO',
+  'operate.roster.calling.cqDir.title':
+    'Calling CQ {{dir}} — a DIRECTED call. He is asking for {{dir}} only, so answering from anywhere else will usually be ignored.',
   'operate.roster.state.title': '{{call}} is in {{state}}',
   // The Age column. The unit letter rides inside the message with its number, so a
   // translation can never separate the two (the Now-Bar's rule, batch 15).
@@ -6461,6 +6857,7 @@ export const EN = {
   // The pane's own name is lower-case where the frame prints it and title-case in the ⊞
   // menu, because that is what each surface shipped; two keys rather than one re-cased.
   'rtty.pane.stream.title': 'Decoded text',
+  'rtty.pane.log.title': 'Log',
   'rtty.stream.title':
     "Decoded RTTY text — faint characters are low-confidence copy (the demodulator's soft metric)",
   'rtty.arm.on.label': 'RX armed',
@@ -6546,6 +6943,7 @@ export const EN = {
   'psk.waterfall.hint': 'click nets the decoder',
 
   // ── PSK ▸ the decoded-text pane ─────────────────────────────────────────────────────
+  'psk.pane.log.title': 'Log',
   'psk.pane.stream.title': 'Decoded text',
   'psk.stream.title':
     "Decoded PSK31 text — faint characters are low-confidence copy (the demodulator's phase-margin metric)",
@@ -6847,7 +7245,7 @@ export const EN = {
   'cw.keyer.winkeyer.title':
     'K1EL WinKeyer — hardware keyer over serial (rig in CW). Set its port in Settings ▸ CW.',
   'cw.keyer.soundcard.title':
-    "Soundcard keyer — a keyed audio tone through SSB (rig in USB). A workaround: works ONLY if Nexus's audio output is routed to the rig (like FT8) AND PTT works, and you must keep drive below ALC. WinKeyer or the serial keyline are the clean options.",
+    "Soundcard keyer — a keyed audio tone (this TAKES THE RADIO OUT OF CW, into a data mode like FT8 uses; CW mode returns when you pick another keyer). A workaround: works ONLY if Nexus's audio output is routed to the rig (like FT8) AND PTT works, and you must keep drive below ALC. WinKeyer or the serial keyline are the clean options.",
   'cw.pitch.label': 'Pitch',
   'cw.pitch.aria': 'CW pitch (Hz)',
   'cw.pitch.title': "Sidetone / zero-beat pitch (Hz) — the scope's dashed marker",
@@ -6867,8 +7265,6 @@ export const EN = {
   // own words — all three arrive invariant.
   'cw.rotator.pointed': 'Rotator → {{call}}: {{bearing}}°',
   'cw.rotator.failed': 'Rotator: {{error}}',
-  // `{{freq}}` is the split TX frequency, already formatted invariantly.
-  'cw.split.title': 'Split — TX {{freq}} MHz',
   'cw.record.start.aria': 'Record QSO audio',
   'cw.record.stop.aria': 'Stop recording this QSO',
   'cw.record.off.title': 'Record the received audio to a WAV in the recordings folder',
@@ -6884,6 +7280,11 @@ export const EN = {
   'cw.scope.nativeRf.label': 'RF Panadapter',
   'cw.scope.nativeRf.title': 'Native RF panadapter — the real RF spectrum around your dial.',
   'cw.scope.audio.label': 'CW audio',
+  'cw.zeroBeat.label': 'Zero beat',
+  'cw.zeroBeat.aria': 'Zero-beat tuning indicator',
+  'cw.zeroBeat.none': 'no signal',
+  'cw.zeroBeat.locked': 'ON PITCH',
+  'cw.zeroBeat.title': 'Where the received tone sits against your CW pitch. The light comes on within {{tol}} Hz. Tune until the needle centres — it runs the same way as the scope below it. Display only: it never moves your radio.',
   'cw.scope.audio.title':
     'Receiver AUDIO centered on your CW pitch ({{lo}}–{{hi}} Hz) — tune a signal onto the dashed hairline, mid-screen, to zero-beat it.',
   'cw.scope.audio.sub': 'zero-beat',
@@ -6928,10 +7329,13 @@ export const EN = {
   'cw.rxDsp.nr.aria': 'Noise-reduction level',
   'cw.rxDsp.agc.aria': 'AGC speed',
   'cw.rxDsp.agc.title': 'AGC time constant — Fast for CW/pileups, Slow for steady copy',
-  // The three chips are words over stored tokens ('fast' / 'mid' / 'slow').
+  // The five chips are words over stored tokens ('auto' / 'fast' / 'mid' / 'slow' /
+  // 'off' — `Engine::AGC_SPEEDS`, and the order they render in).
+  'cw.rxDsp.agc.auto': 'Auto',
   'cw.rxDsp.agc.fast': 'Fast',
   'cw.rxDsp.agc.mid': 'Mid',
   'cw.rxDsp.agc.slow': 'Slow',
+  'cw.rxDsp.agc.off': 'Off',
 
   // ── CW ▸ the decode pane and the sent echo ──────────────────────────────────────────
   // `{{window}}` is the AI decoder's audio window in Hz, supplied by the call site.
@@ -7115,18 +7519,29 @@ export const EN = {
   'phone.dsp.nr.title': 'Noise Reduction — pulls voice out of broadband hiss (RX, DSP)',
   'phone.dsp.notch.title': 'Auto-Notch (ANF) — nulls carriers/heterodynes (RX, DSP)',
   'phone.dsp.comp.title': 'Speech Compressor — more average talk power (TX)',
+  'phone.dsp.manualNotch.title':
+    'Manual notch — the one you place yourself on a whistle, using the notch frequency slider. Distinct from Notch, which hunts a carrier automatically.',
   'phone.dsp.vox.title': 'Voice-Operated Transmit — hands-free keying (TX)',
   'phone.dsp.toggleFailed': 'Could not toggle {{func}}',
   'phone.rxDsp.aria': 'RX DSP levels',
   'phone.rxDsp.nr.title':
     'Noise-reduction depth — raise until the noise floor drops, back off if audio gets watery',
   'phone.rxDsp.nr.aria': 'Noise-reduction level',
+  'phone.rxDsp.comp.title':
+    'Speech processor depth — how hard the compressor works. Raise it for punch on a weak path; too much sounds harsh and splatters.',
+  'phone.rxDsp.comp.aria': 'Speech processor depth',
+  'phone.rxDsp.notchFreq.title':
+    'Manual notch frequency — slide it onto the whistle you want gone. This is the notch you place yourself, not the automatic one.',
+  'phone.rxDsp.notchFreq.aria': 'Manual notch frequency in hertz',
   'phone.rxDsp.agc.aria': 'AGC speed',
   'phone.rxDsp.agc.title': 'AGC time constant',
-  // The three chips are words over stored tokens ('fast' / 'mid' / 'slow').
+  // The five chips are words over stored tokens ('auto' / 'fast' / 'mid' / 'slow' /
+  // 'off' — `Engine::AGC_SPEEDS`, and the order they render in).
+  'phone.rxDsp.agc.auto': 'Auto',
   'phone.rxDsp.agc.fast': 'Fast',
   'phone.rxDsp.agc.mid': 'Mid',
   'phone.rxDsp.agc.slow': 'Slow',
+  'phone.rxDsp.agc.off': 'Off',
 
   // ── Phone ▸ the voice keyer pane ─────────────────────────────────────────────────────
   // F1–F6 are key names and `{{slot}}` is the number one of them carries; `{{label}}` is the
@@ -7210,6 +7625,9 @@ export const EN = {
   // data, never translated.
   'shell.lane.audio.message': 'RADIO STOPPED',
   'shell.lane.radioConfig.message': 'RADIO CONFIG',
+  'shell.lane.txPowerZero.message': 'NO RF POWER',
+  'shell.lane.txPowerZero.detail':
+    'The radio reports 0% power and transmit is armed — it will key and put nothing on the air. Check the Pwr slider, and the rig\u2019s own power for THIS mode: Yaesu rigs keep a separate level for SSB, DATA, CW and AM.',
   'shell.lane.recording.message': 'RECORDING',
   'shell.lane.prop.offline.message': 'Prop: no live data',
   'shell.lane.prop.offline.detail':
@@ -7301,6 +7719,13 @@ export const EN = {
   // ── A torn-off panel window ─────────────────────────────────────────────────────────
   'detached.connecting': 'Connecting to the radio…',
   'detached.fieldDay.inactive': 'Field Day isn’t active.',
+  'detached.fdClub.away.head': 'Club board',
+  'detached.fdClub.away.body':
+    "The club board shows here while Field Day is the section you are working in. Step back into Field Day and it comes straight back — nothing has stopped, and the host is still collecting contacts.",
+  'detached.fdClub.off.head': 'Club sync is off',
+  'detached.fdClub.off.body': 'This station is not hosting a club event and has not joined one, so there are no other positions to show.',
+  'detached.fdClub.off.route': 'Turn it on in Settings ▸ Contesting ▸ Field Day Club Sync ▸ Host a club event — or paste the host station’s address into Join event at to join one someone else is running.',
+  'detached.fdClub.off.wait': 'Leave this window open. The board fills in by itself the moment sync starts.',
   'detached.unavailable': 'Panel “{{panel}}” isn’t available as a standalone window yet.',
 
   // ── The navigation rail ─────────────────────────────────────────────────────────────
@@ -7343,6 +7768,8 @@ export const EN = {
   'nav.stats.title':
     'Statistics — your logbook sliced: QSOs by band/mode/year/hour, top DXCC entities, states, confirmations',
   'nav.fieldDay.title': 'Field Day — contest rate workspace',
+  'nav.fdClub.label': 'Club Board',
+  'nav.fdClub.title': 'Club band board — who is on what band at every position on site, in its own window for a second monitor',
   'nav.pota.title': "POTA / SOTA — parks & summits: who's on now (hunt) + tag your activation",
   'nav.memories.label': 'Memories',
   'nav.memories.title':
@@ -7676,6 +8103,63 @@ export const EN = {
   'rotor.strip.lost.open.aria': '{{state}} — open the rotator settings',
   'rotor.strip.lost.open.title': '{{detail}}. Click to open it',
 
+  // ── The Amplifier pane (Connect) ────────────────────────────────────────────────────
+  // ⚠️ NOT HERE, and none of it may move: the unit symbols W, V, A, ° and the `:1` of an SWR
+  // ratio, the meter names SWR / ATU / Vdc, and the amplifier's own raw model id. Those are
+  // the instrument's vocabulary; a translated `SWR` names no meter on any amplifier's panel.
+  // NO PLURAL ENTRIES — see the Settings ▸ Amplifier block for why.
+  // The amplifier's cockpit strip. Same invariant-token rule as the pane above: W stays W.
+  'amp.strip.aria': 'Amplifier',
+  'amp.strip.toOperate.title': 'Put the amplifier into Operate.',
+  'amp.strip.toStandby.title': 'Put the amplifier into Standby. This does NOT stop a transmission — the exciter keeps keying and the drive passes straight through.',
+  'amp.strip.keyed.title': 'Not while you are transmitting. Changing band or mode on a keyed amplifier can damage it.',
+  'amp.strip.bandDown.aria': 'Amplifier band down',
+  'amp.strip.bandUp.aria': 'Amplifier band up',
+  'amp.strip.refused': 'Not sent',
+  'amp.link.up': 'Linked',
+  'amp.operate': 'Operate',
+  'amp.standby': 'Standby',
+  'amp.k.power': 'Power out',
+  'amp.k.temp': 'PA temp',
+  'amp.k.current': 'Current',
+  'amp.swr.title': 'Standing-wave ratio measured at the antenna.',
+  'amp.swrAtu.title': "Standing-wave ratio measured before the amplifier's tuner.",
+  // ⚠️ THE ONE PLACE THE MISSING UNIT IS EXPLAINED RATHER THAN GUESSED AT. The SPE protocol
+  // does not carry the scale, so no letter is printed and this says why.
+  'amp.temp.unknownScale':
+    "The SPE protocol does not say whether this is °C or °F — the amplifier reports whatever its own display is set to. Check the amplifier's front panel.",
+
+  // Why the link is down. Four states, and `wrongModel` is the one that earns its own sentence:
+  // a working link on a protocol Nexus does not speak must never read as "no amplifier".
+  'amp.reason.noAnswer': 'Not answering',
+  'amp.reason.portBusy': 'Port in use by something else',
+  'amp.reason.wrongModel': 'Answering, but in a protocol Nexus does not read yet',
+  'amp.reason.malformed': 'Answering with something Nexus cannot read',
+
+  // Alarms — the amplifier's own, rendered as faults. `unknown` is a fault too: a code a later
+  // firmware ships must reach the operator, not go quiet in front of a kilowatt.
+  'amp.alarm.swrExceedingLimits': 'Alarm: SWR beyond limits',
+  'amp.alarm.amplifierProtection': 'Alarm: amplifier protection tripped',
+  'amp.alarm.inputOverdriving': 'Alarm: input overdriven',
+  'amp.alarm.excessOverheating': 'Alarm: overheating',
+  'amp.alarm.combinerFault': 'Alarm: combiner fault',
+  'amp.alarm.fault': 'Fault',
+  'amp.alarm.unknown': 'Alarm the amplifier did not name',
+
+  'amp.warning.alarmAmplifier': 'Warning: amplifier alarm',
+  'amp.warning.noSelectedAntenna': 'Warning: no antenna selected',
+  'amp.warning.swrAntenna': 'Warning: antenna SWR',
+  'amp.warning.noValidBand': 'Warning: no valid band',
+  'amp.warning.powerLimitExceeded': 'Warning: power limit exceeded',
+  'amp.warning.overheating': 'Warning: overheating',
+  'amp.warning.atuNotAvailable': 'Warning: tuner not available',
+  'amp.warning.tuningWithNoPower': 'Warning: tuning with no drive',
+  'amp.warning.atuBypassed': 'Warning: tuner bypassed',
+  'amp.warning.powerSwitchHeldByRemote': 'Warning: power switch held by remote',
+  'amp.warning.combinerOverheating': 'Warning: combiner overheating',
+  'amp.warning.combinerFault': 'Warning: combiner fault',
+  'amp.warning.unknown': 'Warning the amplifier did not name',
+
   'rotor.pane.rose.aria': 'Rotator at {{deg}} degrees — click to slew',
   'rotor.pane.rose.aria.unknown': 'Rotator — position not reported; click to slew',
   'rotor.pane.az.title': 'True bearing',
@@ -7773,6 +8257,12 @@ export const EN = {
   'topbar.operator.title': 'Operating as {{call}} — click to change who is at the key',
   'topbar.operator.switch': 'Switch to {{call}}',
   'topbar.operator.single': 'Single operator (clear)',
+  // The chip before anyone has been set — Field Day only. It has to read as an invitation
+  // rather than as a callsign, because at that moment it is the only thing on screen that
+  // says an operator can be named at all.
+  'topbar.operator.set': 'Set operator',
+  'topbar.operator.set.title': 'Nobody is set as the operator — click to say who is at the key',
+  'topbar.operator.firstSet': 'No operators logged yet — set the first one on the Field Day dashboard',
   // `{{rig}}` and `{{believed}}` are mode names, straight through.
   'topbar.rigMode.chip': 'rig: {{mode}}',
   'topbar.rigMode.title':

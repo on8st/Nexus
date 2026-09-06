@@ -33,17 +33,18 @@
 /// chain registry. Inert at runtime — see the module docs.
 mod chains;
 mod pouncer;
-mod window_state;
 /// Pins `assetProtocol.scope` to where SSTV images are actually written — they are one fact in
 /// two files, and when they drifted every gallery preview silently went blank.
 #[cfg(test)]
 mod sstv_scope_test;
+mod window_state;
 
 use chains::{panel_key, panel_label, Instance};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Manager;
 use tauri::State;
+use tauri_plugin_updater::UpdaterExt;
 use tempo_app::dto::{
     AppSnapshot, DiagnosticsReportDto, ImportStats, LoggedQso, LotwSyncResult, MeterReadout,
     SourceKind, Spectrum, Tier, UploadReportDto,
@@ -53,6 +54,27 @@ use tempo_app::settings::{Settings, VoiceMessage};
 
 /// The engine, shared between UI commands and the radio loop.
 type SharedEngine = Arc<Mutex<Engine>>;
+
+/// The spectator scoreboard's bound state — written by its manager thread,
+/// read by `fd_scoreboard_status` for the Settings row. Distinct payload
+/// type → distinct TypeId for `.manage()`.
+#[derive(Default)]
+struct FdBoardState {
+    running: bool,
+    port: u16,
+    error: Option<String>,
+}
+type SharedFdBoardState = Arc<Mutex<FdBoardState>>;
+
+/// The Connect web page's bound state — same shape and same job as
+/// [`FdBoardState`], read by `connect_web_status` for its Settings row.
+#[derive(Default)]
+struct ConnectWebState {
+    running: bool,
+    port: u16,
+    error: Option<String>,
+}
+type SharedConnectWebState = Arc<Mutex<ConnectWebState>>;
 
 /// Cached propagation nowcast: `(fetched_at, snapshot)`. Caching enforces PSK
 /// Reporter's ≥5-minute-per-dataset query limit across UI polls.
@@ -71,6 +93,8 @@ type AuroraCache = Arc<
 /// TypeId for `.manage()`.
 type Kc2gCache = Arc<Mutex<Option<(std::time::Instant, Vec<propagation::MufStation>)>>>;
 type ProtonCache = Arc<Mutex<Option<(std::time::Instant, propagation::live::protons::ProtonFlux)>>>;
+/// TTL cache for the NOAA planetary-K outlook (the three-day forecast).
+type KpForecastCache = Arc<Mutex<Option<(std::time::Instant, propagation::KpForecast)>>>;
 /// TTL cache for the NOAA R/S/G scales + recent SWPC alerts (one fetch pair).
 /// Distinct payload type → distinct TypeId for `.manage()`.
 type ScalesCache = Arc<
@@ -218,7 +242,11 @@ fn pounce_offer(sp: &tempo_net::cluster::ClusterSpot) {
         // therefore take the same arm in both, so where a click lands is unchanged.
         mode: propagation::digital_hole_mode(freq_mhz)
             .map(str::to_string)
-            .unwrap_or_else(|| propagation::classify_spot_mode(freq_mhz).label().to_string()),
+            .unwrap_or_else(|| {
+                propagation::classify_spot_mode(freq_mhz)
+                    .label()
+                    .to_string()
+            }),
         spotted_unix: sp.received_unix as i64,
     });
 }
@@ -1413,7 +1441,10 @@ fn radio_launch_info(state: State<'_, SharedEngine>) -> Result<RadioLaunchInfo, 
             in_use: profile_in_use(&radio_profile_key(r.id)),
         })
         .collect();
-    Ok(RadioLaunchInfo { show_picker, radios })
+    Ok(RadioLaunchInfo {
+        show_picker,
+        radios,
+    })
 }
 
 /// The operator picked a radio in the launch picker: relaunch this same binary bound to that
@@ -1602,6 +1633,82 @@ fn save_bandmap_window(slug: &str, inst: Instance, g: &BandmapWindow) {
     }
 }
 
+/// How physically large a CSS pixel is on this operator's display — the one input the UI
+/// scale has never had on Linux.
+///
+/// Windows and macOS answer this themselves: the OS picks a scale factor, the webview reports
+/// it as `devicePixelRatio`, and a CSS pixel lands near the 96-dpi reference on purpose. X11
+/// does not, and X11 is what Nexus runs on — `scripts/build-linux.sh` documents that the
+/// AppImage's AppRun forces `GDK_BACKEND=x11`, so even a Wayland session is an XWayland
+/// client. There the scale factor is 1 whatever the panel is. Measured against webkit2gtk-4.1
+/// 2.52.3 with this app's own stylesheet: `GDK_SCALE=2` and `GDK_DPI_SCALE=1.5` both reach the
+/// page as `devicePixelRatio`, but `gtk-xft-dpi=144` — what GNOME's text-scaling-factor and
+/// "Large Text" actually set, and the setting an operator on a small high-resolution laptop
+/// reaches for first — moves nothing in web content. Not one pixel: same devicePixelRatio,
+/// same viewport, same rendered rect for every element.
+///
+/// So on Linux we ask the display for its EDID physical size and let the UI do the
+/// arithmetic. `physical_dpi: None` means "nothing here needs correcting", which is the right
+/// answer on every platform where the OS is already doing this job.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayMetrics {
+    /// True pixel density of the display the app opened on, from its reported physical size.
+    /// `None` off Linux, and on Linux whenever the panel reports no size (many virtual
+    /// displays, some KVMs and projectors report 0 mm) — never a guess.
+    physical_dpi: Option<f64>,
+    /// The scale factor the OS applies, which the webview already reflects as
+    /// `devicePixelRatio`. The UI divides by it to get the density of a CSS pixel.
+    scale_factor: f64,
+}
+
+/// Probed once, on the main thread, during `setup()` — GDK is not safe to call from a command
+/// worker, and the answer cannot change without the app being restarted onto another monitor.
+static DISPLAY_DPI: OnceLock<Option<f64>> = OnceLock::new();
+
+/// Read the primary monitor's physical size and turn it into a true DPI.
+///
+/// `Monitor::geometry()` is in GDK's LOGICAL pixels, so it is multiplied back up by GDK's own
+/// integer scale before dividing by the physical width — otherwise a display already running
+/// at `GDK_SCALE=2` would report half its real density and we would "correct" a screen that
+/// needs no correcting.
+#[cfg(target_os = "linux")]
+fn probe_physical_dpi() -> Option<f64> {
+    // `Display::default` / `primary_monitor` / `monitor` are inherent in gdk 0.18; only the
+    // Monitor accessors come from a trait.
+    use gdk::prelude::MonitorExt;
+    let display = gdk::Display::default()?;
+    // Primary is the right monitor to ask: the main window opens there. A multi-head setup
+    // with mismatched densities is not solvable from one number, and guessing the wrong head
+    // is worse than the current behaviour — hence no per-window monitor walk.
+    let monitor = display.primary_monitor().or_else(|| display.monitor(0))?;
+    let width_mm = monitor.width_mm();
+    let width_px = monitor.geometry().width() * monitor.scale_factor().max(1);
+    if width_mm <= 0 || width_px <= 0 {
+        return None;
+    }
+    let dpi = width_px as f64 / (width_mm as f64 / 25.4);
+    // A sane-range gate rather than trust: EDID is operator-visible hardware data and some
+    // panels lie outright (a 0-mm or 1-mm width would divide into thousands). Outside this
+    // band we would rather change nothing than resize someone's app on bad data.
+    (40.0..=800.0).contains(&dpi).then_some(dpi)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_physical_dpi() -> Option<f64> {
+    None
+}
+
+/// The display metrics for the window asking. Pure read of the cached probe plus this
+/// window's own scale factor, so it is cheap enough for the frontend to call at launch.
+#[tauri::command]
+fn display_metrics(window: tauri::WebviewWindow) -> DisplayMetrics {
+    DisplayMetrics {
+        physical_dpi: *DISPLAY_DPI.get_or_init(probe_physical_dpi),
+        scale_factor: window.scale_factor().unwrap_or(1.0),
+    }
+}
+
 /// Snapshot a band-map window's current size+position to its own per-surface file (logical px),
 /// preserving its dock choice. Called on close so the next open restores it. No-op otherwise.
 fn capture_bandmap_window(window: &tauri::WebviewWindow) {
@@ -1682,7 +1789,9 @@ fn sanitize_free_bandmap_rect(app: &tauri::AppHandle, g: &BandmapWindow) -> (f64
     // Cap w/h (logical) at the landing monitor's work area — or the primary's, where a
     // dropped-position window opens. If no monitor resolves at all (headless/API error),
     // leave w/h as saved; `min_inner_size` still floors them at build.
-    let cap = hit.cloned().or_else(|| app.primary_monitor().ok().flatten());
+    let cap = hit
+        .cloned()
+        .or_else(|| app.primary_monitor().ok().flatten());
     let (mut w, mut h) = (g.w, g.h);
     if let Some(m) = &cap {
         let sf = m.scale_factor();
@@ -1746,15 +1855,49 @@ fn logbook_path() -> PathBuf {
     shared_data_dir().join("log.adi")
 }
 
-/// Where the Field Day contest log's durable ADIF journal lives (beside
-/// settings.json). The engine rewrites it on every FD contact and restores it
-/// when Field Day mode starts; the exit flush writes the SAME file.
+/// The LEGACY (pre-club-sync) Field Day journal location — kept only so the
+/// one-time rename in `run()` can find an existing file and carry it into the
+/// per-position name below. Never written to anymore.
 fn fd_backup_path() -> PathBuf {
     settings_path()
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
         .join("fieldday_backup.adi")
+}
+
+/// Where the Field Day contest log's durable ADIF journal lives (beside
+/// settings.json): `fieldday_backup_<posid8>.adi`. The engine rewrites it on
+/// every FD contact and restores it when Field Day mode starts. Suffixed by
+/// the club-sync position id so two instances sharing a settings dir stop
+/// clobbering (and cross-importing) each other's contest logs — the old
+/// shared name did both.
+fn fd_backup_path_for(posid: &str) -> PathBuf {
+    settings_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("fieldday_backup_{posid}.adi"))
+}
+
+/// The club host's append-only event journal (one merged row per NDJSON
+/// line), beside settings.json, named by the sanitized event name so a new
+/// event gets a fresh file while a host restart mid-event replays the old.
+fn fd_event_journal_path(event_name: &str) -> PathBuf {
+    let mut slug: String = event_name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    slug.truncate(40);
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "event" } else { slug };
+    settings_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("fd_event_{slug}.jsonl"))
 }
 
 /// Durable journal for the ONE QSO held by the prompt-to-log popup (beside settings.json).
@@ -1863,9 +2006,7 @@ fn journal_assistance(settings: &tempo_app::settings::Settings, note: &str, forc
             active: *active,
         })
         .collect();
-    let mut log = ASSISTANCE_JOURNAL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut log = ASSISTANCE_JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !force && !assistance_posture_changed(&log, settings.unassisted_mode, &sources) {
         return;
     }
@@ -2094,14 +2235,17 @@ fn legacy_sstv_gallery_dir() -> PathBuf {
 fn sstv_delete_image(state: State<'_, SharedEngine>, path: String) -> Result<(), String> {
     let dir = sstv_gallery_dir();
     let target = std::path::Path::new(&path);
-    let canon_dir = dir.canonicalize().map_err(|e| format!("no gallery folder: {e}"))?;
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("no gallery folder: {e}"))?;
     let canon = target
         .canonicalize()
         .map_err(|e| format!("Could not find {}: {e}", target.display()))?;
     if !canon.starts_with(&canon_dir) {
         return Err("That file is not in the SSTV gallery folder".into());
     }
-    std::fs::remove_file(&canon).map_err(|e| format!("Could not delete {}: {e}", canon.display()))?;
+    std::fs::remove_file(&canon)
+        .map_err(|e| format!("Could not delete {}: {e}", canon.display()))?;
     {
         let mut eng = engine_lock(&state);
         eng.remove_sstv_gallery(&path);
@@ -2135,11 +2279,14 @@ fn sstv_delete_image(state: State<'_, SharedEngine>, path: String) -> Result<(),
 /// at zero rather than invented.
 ///
 /// Order is oldest-first by stamp, matching what the decoder appends.
-fn reconcile_gallery(dir: &std::path::Path, entries: Vec<tempo_app::dto::SstvGalleryEntry>)
-    -> Vec<tempo_app::dto::SstvGalleryEntry>
-{
-    let mut kept: Vec<tempo_app::dto::SstvGalleryEntry> =
-        entries.into_iter().filter(|e| std::path::Path::new(&e.path).is_file()).collect();
+fn reconcile_gallery(
+    dir: &std::path::Path,
+    entries: Vec<tempo_app::dto::SstvGalleryEntry>,
+) -> Vec<tempo_app::dto::SstvGalleryEntry> {
+    let mut kept: Vec<tempo_app::dto::SstvGalleryEntry> = entries
+        .into_iter()
+        .filter(|e| std::path::Path::new(&e.path).is_file())
+        .collect();
     let known: std::collections::HashSet<String> = kept.iter().map(|e| e.path.clone()).collect();
 
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -2163,7 +2310,10 @@ fn reconcile_gallery(dir: &std::path::Path, entries: Vec<tempo_app::dto::SstvGal
             if known.contains(&p) {
                 continue;
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
             let (stamp, mode) = stem.split_once('_').unwrap_or((stem, ""));
             kept.push(tempo_app::dto::SstvGalleryEntry {
                 path: p,
@@ -2186,12 +2336,21 @@ fn iso_from_stamp(stamp: &str) -> Option<String> {
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
         return None;
     }
-    if !stamp[..8].bytes().chain(stamp[9..15].bytes()).all(|c| c.is_ascii_digit()) {
+    if !stamp[..8]
+        .bytes()
+        .chain(stamp[9..15].bytes())
+        .all(|c| c.is_ascii_digit())
+    {
         return None;
     }
     Some(format!(
         "{}-{}-{}T{}:{}:{}Z",
-        &stamp[0..4], &stamp[4..6], &stamp[6..8], &stamp[9..11], &stamp[11..13], &stamp[13..15]
+        &stamp[0..4],
+        &stamp[4..6],
+        &stamp[6..8],
+        &stamp[9..11],
+        &stamp[11..13],
+        &stamp[13..15]
     ))
 }
 
@@ -2229,7 +2388,9 @@ fn migrate_sstv_gallery_between(from: &std::path::Path, to: &std::path::Path) {
     let mut moved = 0usize;
     for e in &mut entries {
         let src = PathBuf::from(&e.path);
-        let Some(name) = src.file_name() else { continue };
+        let Some(name) = src.file_name() else {
+            continue;
+        };
         // An entry whose file is already gone is left pointing where it always pointed. It renders
         // exactly as it did before — this is a move, not the gallery reconciliation that issue #23
         // is about, and quietly dropping someone's rows here would be answering that question by
@@ -2462,8 +2623,12 @@ fn write_qso_wav(call: &str, pcm: &[i16]) -> Result<PathBuf, String> {
 /// derived from the live profile's settings path, which a test cannot redirect, so the policy
 /// (create, name, write, and name the path in any error) lives here where it can be driven.
 fn write_qso_wav_in(dir: &std::path::Path, call: &str, pcm: &[i16]) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("Could not create the recordings folder {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "Could not create the recordings folder {}: {e}",
+            dir.display()
+        )
+    })?;
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -3678,6 +3843,27 @@ fn fcc_state_for_call(call: &str) -> Option<&'static str> {
     FCC_STATES.read().ok()?.as_ref()?.state_for_call(call)
 }
 
+/// The DX station's own Maidenhead grid off an RBN SKIMMER comment ("FT8 -15 dB DM03 CQ"),
+/// or `None`. Trusted ONLY on the machine-generated skimmer wire — the caller gates on
+/// `ClusterSpot::rbn`, the same doctrine that keeps human free-text mode tokens untrusted
+/// (`is_rbn_rtty`). The shape is strict RBN spelling: 4 or 6 chars, uppercase field pair
+/// A–R, digit pair, optional lowercase subsquare pair a–x — no case folding, because a
+/// human comment's stray word is far likelier to match a folded pattern than the skimmer
+/// is to change its spelling.
+///
+/// This exists for the Spots panel's heading column: without it every US station read as
+/// the bearing to cty.dat's Kansas reference point (`~309°` from Alabama, the 2026-09-01
+/// report) while the row's own comment was carrying the station's real square.
+fn rbn_comment_grid(comment: &str) -> Option<&str> {
+    comment.split_ascii_whitespace().find(|t| {
+        let b = t.as_bytes();
+        (b.len() == 4 || b.len() == 6)
+            && b[..2].iter().all(|c| (b'A'..=b'R').contains(c))
+            && b[2..4].iter().all(u8::is_ascii_digit)
+            && b[4..].iter().all(|c| (b'a'..=b'x').contains(c))
+    })
+}
+
 /// Best US-state hint for the WAS "New State" cue. The FCC callsign→state index is authoritative:
 /// it gives the licensed state precisely, needs no grid at all (so it covers the whole cluster /
 /// CW / SSB firehose), and carries no border ambiguity. A heard grid only FILLS IN when FCC has no
@@ -3692,6 +3878,32 @@ fn fcc_state_for_call(call: &str) -> Option<&'static str> {
 /// false New-State as often as a real one. Deferred until a 6-char grid→state resolver exists.
 /// Actual WAS credit still comes from the confirmed QSO's logged ADIF STATE; this only hints.)
 fn us_state_hint(call: &str, grid: Option<&str>) -> Option<String> {
+    // ⚠️ THE ENTITY OUTRANKS BOTH RESOLVERS BELOW, AND NEITHER OF THEM KNOWS THE COUNTRY (#171).
+    //
+    // The two answers were computed independently and never compared. Country comes from
+    // cty.dat prefix arithmetic — which is where the station IS. State comes from the FCC ULS
+    // index, which is the licensee's MAILING ADDRESS, or (failing that) from `state_for_grid`,
+    // whose table is US state polygons and which therefore answers with a US state for any grid
+    // cell that touches one. WL7E was reported as country "Alaska", state "CA": an Alaskan
+    // licensee with a California address, and nothing in the app was in a position to notice.
+    //
+    // NOT a display-only wrong. This hint feeds the WAS "New State" cue, so a mailing address
+    // credits a state that was never worked.
+    //
+    // Two rules, and the entity settles both. Alaska and Hawaii are single-state entities, so
+    // they name their own subdivision outright. Outside the United States/Alaska/Hawaii group
+    // there is no US state to report AT ALL, so the hint is dropped rather than guessed — the
+    // grouping is `propagation::dxcc::is_us_state_entity`, the same three names
+    // `tempo_core::diagnostics` groups a logged QSO by. An UNRESOLVABLE call falls through to
+    // the old behaviour: the entity has said nothing, so it overrules nothing.
+    if let Some(entity) = propagation::dxcc::resolve(call).map(|d| d.entity) {
+        if let Some(st) = propagation::dxcc::state_for_entity(entity) {
+            return Some(st.to_string());
+        }
+        if !propagation::dxcc::is_us_state_entity(entity) {
+            return None;
+        }
+    }
     if let Some(st) = fcc_state_for_call(call) {
         return Some(st.to_string());
     }
@@ -3815,6 +4027,414 @@ async fn fetch_fcc_states() -> Result<FccStatesStatus, String> {
         .await
         .map_err(|e| e.to_string())??;
     Ok(fcc_status())
+}
+
+// --- AD1C cty.dat country file (downloaded to the SHARED data dir; DXCC entity resolution
+// for decode rows, the Needed board and the log). Mirrors the FCC block above with ONE
+// deliberate delta: the "is newer" compare keys on the manifest's content-derived `ver` (the
+// AD1C `=VERyyyymmdd` marker), not `generated` — the weekly cron re-publishes unchanged
+// content with a fresh `generated`, and that must not force every install to re-download the
+// file for nothing.
+//
+// ⚠️ STARTUP-ONLY SWAP, unlike FCC's live RwLock: the DXCC resolver is a set-once OnceLock
+// serving `&'static` borrows, so a downloaded file activates at the NEXT launch —
+// `cty_load_from_disk` runs in `run()` right after Settings::load, BEFORE any thread that
+// could resolve a call, and `cty_download_if_newer` only stages bytes on disk (it never
+// touches the resolver). See propagation::dxcc::init_from for the seed-floor rule. ---
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct CtyMeta {
+    /// The manifest's `generated` ISO timestamp (kept for display; NOT the freshness key).
+    generated: String,
+    /// The installed file's `=VERyyyymmdd` date — the freshness key the download compares.
+    ver: String,
+    entities: usize,
+    fetched_at: i64,
+}
+
+fn cty_path() -> PathBuf {
+    shared_data_dir().join("cty.dat")
+}
+fn cty_meta_path() -> PathBuf {
+    shared_data_dir().join("cty.meta.json")
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CtyStatus {
+    /// Entity count of the ACTIVE file (the one resolving this session).
+    count: usize,
+    fetched_at: i64,
+    generated: String,
+    /// `=VER` date of the ACTIVE file.
+    active_ver: String,
+    /// `=VER` date of the INSTALLED (downloaded) file, `""` if none — when it is newer than
+    /// `active_ver`, the UI shows "applies at next launch".
+    installed_ver: String,
+}
+
+fn cty_meta() -> CtyMeta {
+    std::fs::read_to_string(cty_meta_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn cty_status() -> CtyStatus {
+    let m = cty_meta();
+    let active = propagation::dxcc::active_stats();
+    CtyStatus {
+        count: active.entities,
+        fetched_at: m.fetched_at,
+        generated: m.generated,
+        active_ver: active.ver.unwrap_or_default(),
+        installed_ver: m.ver,
+    }
+}
+
+/// Activate the downloaded cty.dat, if there is one and it beats the seed floor. MUST run
+/// before anything can resolve a callsign (see the `run()` call site). Milestone-logs which
+/// file won either way; an `AlreadyInitialized` is logged as an ERROR because it means a
+/// resolve beat us here — a code-ordering regression to fix, not a state to accept.
+fn cty_load_from_disk() {
+    let embedded = propagation::dxcc::embedded_ver().unwrap_or_default();
+    let text = match std::fs::read_to_string(cty_path()) {
+        Ok(t) => t,
+        Err(_) => {
+            // Nothing downloaded (or unreadable): the embedded seed activates lazily on
+            // first resolve, exactly as before the refresh pipeline existed.
+            tempo_core::applog::info(
+                "startup",
+                &format!("cty.dat: no downloaded file — embedded AD1C {embedded} active"),
+            );
+            return;
+        }
+    };
+    match propagation::dxcc::init_from(&text) {
+        Ok(stats) => tempo_core::applog::info(
+            "startup",
+            &format!(
+                "cty.dat: downloaded AD1C {} active ({} entities)",
+                stats.ver.unwrap_or_default(),
+                stats.entities
+            ),
+        ),
+        Err(propagation::dxcc::CtyInitError::AlreadyInitialized) => tempo_core::applog::error(
+            "startup",
+            "cty.dat: resolver was already initialized before the startup install — \
+             something resolved a callsign too early (code-ordering regression); the \
+             embedded file is locked in for this session",
+        ),
+        Err(e) => tempo_core::applog::info(
+            "startup",
+            &format!("cty.dat: downloaded file rejected ({e}) — embedded AD1C {embedded} active"),
+        ),
+    }
+}
+
+/// BLOCKING: download cty.dat if the hosted manifest's `ver` differs from what we hold (or we
+/// hold nothing), VALIDATE it with a scratch parse (never the global resolver — a corrupt
+/// download must never replace a good local copy, and the live resolver is set-once), persist
+/// it atomically to the shared data dir, and stamp the meta. NO resolver swap — the file
+/// activates at the next launch. Returns Ok(true) when it installed a new file. Shared by the
+/// Settings button + the startup auto-refresh.
+fn cty_download_if_newer() -> Result<bool, String> {
+    let local = cty_meta();
+    let have = cty_path().exists();
+    let c = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let manifest: serde_json::Value = c
+        .get(format!("{FCC_STATES_BASE}/cty.json"))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let ver = manifest
+        .get("ver")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let generated = manifest
+        .get("generated")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !ver.is_empty() && ver == local.ver && have {
+        // Same content (the weekly cron re-publishes with a fresh `generated`) — just
+        // refresh the fetched_at stamp so the 7-day staleness gate doesn't re-hit the
+        // manifest on every launch.
+        let _ = std::fs::write(
+            cty_meta_path(),
+            serde_json::to_string(&CtyMeta {
+                generated,
+                ver,
+                entities: local.entities,
+                fetched_at: now_unix(),
+            })
+            .unwrap_or_default(),
+        );
+        return Ok(false);
+    }
+    let text = c
+        .get(format!("{FCC_STATES_BASE}/cty.dat"))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .map_err(|e| e.to_string())?;
+    let stats = propagation::dxcc::validate(&text)
+        .map_err(|e| format!("downloaded cty.dat failed validation: {e}"))?;
+    if let Some(dir) = cty_path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Atomic install: per-process temp then rename, so two radio instances sharing this dir
+    // can never read a half-written file (same shape as the FCC index above).
+    let final_path = cty_path();
+    let tmp = final_path.with_extension(format!("dat.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(
+        cty_meta_path(),
+        serde_json::to_string(&CtyMeta {
+            generated,
+            // Stamp the VALIDATED file's own marker, not the manifest's claim.
+            ver: stats.ver.clone().unwrap_or(ver),
+            entities: stats.entities,
+            fetched_at: now_unix(),
+        })
+        .unwrap_or_default(),
+    );
+    Ok(true)
+}
+
+#[tauri::command]
+fn get_cty_status() -> CtyStatus {
+    cty_status()
+}
+
+/// The Settings "Update country file" button. The downloaded file applies at the NEXT
+/// launch; the returned status carries both vers so the UI can say so.
+#[tauri::command]
+async fn fetch_cty() -> Result<CtyStatus, String> {
+    tauri::async_runtime::spawn_blocking(cty_download_if_newer)
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(cty_status())
+}
+
+// --- Field Day rules data (downloaded to the SHARED data dir; the parameters behind FD
+// scoring, windows, bonuses, sections — tempo_core::fd_rules). The cty block's shape with
+// TWO deltas: the freshness key is the file's own `generated` ISO stamp (no separate
+// manifest — the rules file is small and self-describing), and there is NO weekly staleness
+// cron (rules change ~yearly; the pre-event Settings button is the refresh path).
+//
+// ⚠️ STARTUP-ONLY SWAP, exactly like cty: the rules table is a set-once OnceLock serving
+// `&'static` borrows, so a downloaded file activates at the NEXT launch —
+// `fd_rules_load_from_disk` runs in `run()` right after `cty_load_from_disk`, BEFORE the
+// engine builds (fd_score runs in its very first snapshot), and `fetch_fd_rules` only
+// stages bytes on disk. See tempo_core::fd_rules::install_from for the seed-floor rule. ---
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct FdRulesMeta {
+    /// The installed file's `generated` ISO stamp — the freshness key.
+    generated: String,
+    rules_year: u16,
+    fetched_at: i64,
+}
+
+fn fd_rules_path() -> PathBuf {
+    shared_data_dir().join("fd-rules.json")
+}
+fn fd_rules_meta_path() -> PathBuf {
+    shared_data_dir().join("fd-rules.meta.json")
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FdRulesStatus {
+    /// Newest rules year in the ACTIVE table (the one scoring this session).
+    rules_year: u16,
+    /// `generated` stamp of the ACTIVE rules data.
+    active_generated: String,
+    /// `generated` stamp of the INSTALLED (downloaded) file, `""` if none — when it is
+    /// newer than `active_generated`, the UI shows "applies at next launch".
+    installed_generated: String,
+    fetched_at: i64,
+}
+
+fn fd_rules_meta() -> FdRulesMeta {
+    std::fs::read_to_string(fd_rules_meta_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn fd_rules_status() -> FdRulesStatus {
+    let m = fd_rules_meta();
+    FdRulesStatus {
+        rules_year: tempo_core::fd_rules::active_rules_year(),
+        active_generated: tempo_core::fd_rules::active_generated().to_string(),
+        installed_generated: m.generated,
+        fetched_at: m.fetched_at,
+    }
+}
+
+/// Activate the downloaded fd-rules.json, if there is one and it beats the seed floor.
+/// MUST run before anything reads the ruleset (see the `run()` call site). Milestone-logs
+/// which data won either way; an `AlreadyInitialized` is logged as an ERROR because it
+/// means a read beat us here — a code-ordering regression to fix, not a state to accept.
+fn fd_rules_load_from_disk() {
+    let seed = tempo_core::fd_rules::seed_generated();
+    let text = match std::fs::read_to_string(fd_rules_path()) {
+        Ok(t) => t,
+        Err(_) => {
+            tempo_core::applog::info(
+                "startup",
+                &format!("fd-rules: no downloaded file — bundled seed ({seed}) active"),
+            );
+            return;
+        }
+    };
+    match tempo_core::fd_rules::install_from(&text) {
+        Ok(stats) => tempo_core::applog::info(
+            "startup",
+            &format!(
+                "fd-rules: downloaded data active (rules year {}, generated {})",
+                stats.rules_year, stats.generated
+            ),
+        ),
+        Err(tempo_core::fd_rules::RulesInitError::AlreadyInitialized) => {
+            tempo_core::applog::error(
+                "startup",
+                "fd-rules: table was already loaded before the startup install — \
+                 something read the ruleset too early (code-ordering regression); the \
+                 bundled seed is locked in for this session",
+            )
+        }
+        Err(e) => tempo_core::applog::info(
+            "startup",
+            &format!("fd-rules: downloaded file rejected ({e}) — bundled seed ({seed}) active"),
+        ),
+    }
+}
+
+/// BLOCKING: download fd-rules.json if the hosted file's `generated` differs from what we
+/// hold (or we hold nothing), VALIDATE it with the tempo-core loader's scratch parse (never
+/// the global table — a corrupt download must never replace a good local copy), persist it
+/// atomically to the shared data dir, and stamp the meta. NO table swap — the file
+/// activates at the next launch. Returns Ok(true) when it installed a new file.
+fn fd_rules_download_if_newer() -> Result<bool, String> {
+    let local = fd_rules_meta();
+    let have = fd_rules_path().exists();
+    let c = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = c
+        .get(format!("{FCC_STATES_BASE}/fd-rules.json"))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .map_err(|e| e.to_string())?;
+    let stats = tempo_core::fd_rules::validate(&text)
+        .map_err(|e| format!("downloaded fd-rules.json failed validation: {e}"))?;
+    if stats.generated == local.generated && have {
+        // Same content — just refresh the fetched_at stamp (the status line's
+        // "checked" date) without rewriting the file.
+        let _ = std::fs::write(
+            fd_rules_meta_path(),
+            serde_json::to_string(&FdRulesMeta {
+                fetched_at: now_unix(),
+                ..local
+            })
+            .unwrap_or_default(),
+        );
+        return Ok(false);
+    }
+    if let Some(dir) = fd_rules_path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Atomic install: per-process temp then rename, so two radio instances sharing this dir
+    // can never read a half-written file (same shape as the cty install above).
+    let final_path = fd_rules_path();
+    let tmp = final_path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(
+        fd_rules_meta_path(),
+        serde_json::to_string(&FdRulesMeta {
+            // Stamp the VALIDATED file's own values, not a manifest's claim.
+            generated: stats.generated.clone(),
+            rules_year: stats.rules_year,
+            fetched_at: now_unix(),
+        })
+        .unwrap_or_default(),
+    );
+    Ok(true)
+}
+
+#[tauri::command]
+fn get_fd_rules_status() -> FdRulesStatus {
+    fd_rules_status()
+}
+
+/// The Settings "Check for rules updates" button (Field Day Setup). The downloaded file
+/// applies at the NEXT launch; the returned status carries both stamps so the UI can say so.
+#[tauri::command]
+async fn fetch_fd_rules() -> Result<FdRulesStatus, String> {
+    tauri::async_runtime::spawn_blocking(fd_rules_download_if_newer)
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(fd_rules_status())
+}
+
+/// The ACTIVE event's ruleset FACTS for the warn-only advisories (banned-mode
+/// chip, assistance advisory). Facts only — the advisory TEXT is i18n catalog
+/// keys in the UI, never Rust prose. Enforcement ships "warn": nothing is ever
+/// removed or disabled by rule (operator ruling).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FdRulesetDto {
+    /// "arrlfd" | "wfd" — the snapshot's event convention.
+    event: String,
+    rules_year: u16,
+    /// On-air modes this event's rules ban outright (uppercase ADIF-style).
+    banned_modes: Vec<String>,
+    spotting_allowed: bool,
+    cluster_allowed: bool,
+    enforcement: String,
+}
+
+fn fd_ruleset_dto(fd_event: &str) -> FdRulesetDto {
+    let event = tempo_core::fieldday::FdEvent::from_code(fd_event);
+    let rs = tempo_core::fd_rules::ruleset(event, tempo_core::fd_rules::CURRENT_RULES_YEAR);
+    FdRulesetDto {
+        event: match event {
+            tempo_core::fieldday::FdEvent::WinterFd => "wfd".into(),
+            tempo_core::fieldday::FdEvent::ArrlFd => "arrlfd".into(),
+        },
+        rules_year: rs.rules_year,
+        banned_modes: rs.banned_modes.iter().map(|m| m.to_string()).collect(),
+        spotting_allowed: rs.assistance.spotting_allowed,
+        cluster_allowed: rs.assistance.cluster_allowed,
+        enforcement: rs.enforcement.to_string(),
+    }
+}
+
+/// Ruleset facts for the CONFIGURED event (`settings.fd_event`) — deliberately
+/// independent of `fd_active`, so Settings can preview an event's rules before
+/// the master switch goes on.
+#[tauri::command(async)]
+fn get_fd_ruleset(state: State<'_, SharedEngine>) -> Result<FdRulesetDto, String> {
+    let eng = engine_lock(&state);
+    Ok(fd_ruleset_dto(&eng.settings().fd_event))
 }
 
 /// The LEGACY per-profile TLE cache (a bare `Vec<Tle>` array, pre-snapshot
@@ -4134,8 +4754,10 @@ fn sat_excluded(
             },
         });
     }
-    let held: std::collections::HashSet<u32> =
-        tles.iter().filter_map(|t| sat::norad_id(&t.line1)).collect();
+    let held: std::collections::HashSet<u32> = tles
+        .iter()
+        .filter_map(|t| sat::norad_id(&t.line1))
+        .collect();
     for c in catalog.values() {
         if !held.contains(&c.norad) {
             excluded.push(SatExcludedDto {
@@ -4287,7 +4909,11 @@ async fn get_contests() -> Result<Vec<propagation::live::contests::ContestEvent>
 /// [`SatPassDto::aos_clamped`] — `aos_unix == now - VIEW_PASS_BACKSCAN_SECS`,
 /// the exact clamp shape — is how that honest admission reaches the wire.
 const VIEW_PASS_BACKSCAN_SECS: i64 = 21_600;
-fn view_passes(t: &propagation::sat::Tle, obs: (f64, f64), now: i64) -> Vec<propagation::sat::Pass> {
+fn view_passes(
+    t: &propagation::sat::Tle,
+    obs: (f64, f64),
+    now: i64,
+) -> Vec<propagation::sat::Pass> {
     propagation::sat::passes(t, obs, now - VIEW_PASS_BACKSCAN_SECS, 24 + 6)
         .into_iter()
         .filter(|p| p.los_unix > now)
@@ -4984,16 +5610,18 @@ fn tle_refresh_flight(
                 catalog,
                 generated,
                 etag,
-            }) => match tle::validate_tles(&elements, ratchet(TleFetchTarget::Mirror), now_unix()) {
-                Ok(clean) => {
-                    // A schema-1 mirror (or a rollback) sends no catalog:
-                    // keep the one we have rather than blanking every status.
-                    let catalog = (!catalog.is_empty()).then_some(catalog);
-                    tles_install(clean, "mirror", generated, etag, catalog);
-                    Ok(())
+            }) => {
+                match tle::validate_tles(&elements, ratchet(TleFetchTarget::Mirror), now_unix()) {
+                    Ok(clean) => {
+                        // A schema-1 mirror (or a rollback) sends no catalog:
+                        // keep the one we have rather than blanking every status.
+                        let catalog = (!catalog.is_empty()).then_some(catalog);
+                        tles_install(clean, "mirror", generated, etag, catalog);
+                        Ok(())
+                    }
+                    Err(e) => Err((TleFailKind::Failed, format!("mirror TLE set refused: {e}"))),
                 }
-                Err(e) => Err((TleFailKind::Failed, format!("mirror TLE set refused: {e}"))),
-            },
+            }
             Err(e) => {
                 let mirror_raw = format!("TLE mirror fetch failed: {e}");
                 if manual
@@ -5236,7 +5864,11 @@ fn tle_status() -> TleStatus {
         source,
         imported_count,
         element_age_days: currency.median_age_days,
-        blocked_until: if blocked_until > now { blocked_until } else { 0 },
+        blocked_until: if blocked_until > now {
+            blocked_until
+        } else {
+            0
+        },
         last_error: last.as_ref().map(|(_, raw)| raw.clone()),
         last_error_kind: last.map(|(kind, _)| kind.wire()),
     }
@@ -5294,8 +5926,8 @@ async fn fetch_tles_now() -> Result<TleStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         tle_refresh_flight(target, prev_count, prev_source, etag, true)
     })
-        .await
-        .map_err(|e| e.to_string())?;
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(tle_status())
 }
 
@@ -5854,8 +6486,9 @@ async fn set_sat_transponder(
         .and_then(|t| propagation::sat::norad_id(&t.line1))
         .ok_or_else(|| format!("{name}: not in the TLE set"))?;
 
-    let snap = satnogs_snapshot(vec![norad])
-        .ok_or_else(|| "satellite data not fetched yet — open the bird's detail first".to_string())?;
+    let snap = satnogs_snapshot(vec![norad]).ok_or_else(|| {
+        "satellite data not fetched yet — open the bird's detail first".to_string()
+    })?;
     let rows: Vec<_> = snap
         .transmitters
         .iter()
@@ -6238,7 +6871,10 @@ struct SatTrackDto {
 /// because it is an I/O outcome, not a policy: rotctld refuses `P az el` on a
 /// mount with no elevation axis, and the only way to find out is to try. The
 /// driver is told which happened and decides what it means.
-fn send_rot_step(addr: &str, step: tempo_core::rotator::RotStep) -> tempo_core::rotator::RotOutcome {
+fn send_rot_step(
+    addr: &str,
+    step: tempo_core::rotator::RotStep,
+) -> tempo_core::rotator::RotOutcome {
     use tempo_core::rotator::{RotOutcome, RotStep};
     match step {
         RotStep::Hold => RotOutcome::AzOk, // never reaches the wire
@@ -7277,6 +7913,41 @@ fn get_sat_transponder(
     }))
 }
 
+/// The NOAA planetary-K outlook — what the disturbance is doing over the next three
+/// days, which is the one propagation question a nowcast cannot answer.
+///
+/// Cached 15 min: SWPC republishes this every 30 min, so a tighter poll would only
+/// re-fetch the same bytes. Serves the last-good outlook on a fetch failure and an
+/// EMPTY one if we never had it — a forecast is never fabricated, and an empty
+/// series is what tells the panel to say it has nothing rather than draw a flat line
+/// at zero.
+#[tauri::command]
+async fn get_kp_forecast(
+    cache: State<'_, KpForecastCache>,
+) -> Result<propagation::KpForecast, String> {
+    const KP_FORECAST_TTL_SECS: u64 = 900;
+    {
+        let g = cache.lock().map_err(|e| e.to_string())?;
+        if let Some((when, v)) = g.as_ref() {
+            if when.elapsed().as_secs() < KP_FORECAST_TTL_SECS {
+                return Ok(v.clone());
+            }
+        }
+    }
+    match propagation::live::swpc::fetch_kp_forecast() {
+        Ok(v) => {
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((std::time::Instant::now(), v.clone()));
+            }
+            Ok(v)
+        }
+        Err(_) => {
+            let g = cache.lock().map_err(|e| e.to_string())?;
+            Ok(g.as_ref().map(|(_, v)| v.clone()).unwrap_or_default())
+        }
+    }
+}
+
 /// Real-time KC2G ionosonde MUF/foF2 station fixes for the Connect map's MUF
 /// overlay. Cached `KC2G_TTL_SECS`; serves the last-good set on a fetch failure,
 /// empty if we never had one (never fabricated).
@@ -7472,6 +8143,7 @@ fn get_meters(meters: State<'_, tempo_app::engine::MeterFeed>) -> Result<MeterRe
     Ok(MeterReadout {
         rx_level: meters.rx_level(),
         smeter_db: meters.smeter_db(),
+        cw_tone_hz: meters.cw_tone_hz(),
     })
 }
 
@@ -7507,7 +8179,6 @@ fn get_settings(state: State<'_, SharedEngine>) -> Result<Settings, String> {
     Ok(s)
 }
 
-
 /// Reset the configuration to factory defaults, keeping the logbook and stored credentials.
 ///
 /// There was no reset at all, so a clean start meant deleting files by hand — and doing THAT
@@ -7537,8 +8208,19 @@ fn reset_settings(
     fresh.ensure_radio_profiles();
     fresh.ensure_distinct_radio_ports();
     fresh.ensure_routing_targets();
-    // Reuse the ordinary save path in full rather than reimplementing its side effects.
-    set_settings(state, spots, live_paths, region_paths, health, cache, fresh)
+    // The ordinary save path in full — its persistence, its feed handling and the process-global
+    // state it resets — but with the ROSTER CONTRACT of a restore. Routing a reset through a form
+    // save keeps the engine's live roster, so every radio the dialog promised to erase survives it.
+    apply_and_persist(
+        state,
+        spots,
+        live_paths,
+        region_paths,
+        health,
+        cache,
+        fresh,
+        true,
+    )
 }
 /// Apply + persist new settings. Returns the refreshed snapshot.
 ///
@@ -7555,7 +8237,43 @@ fn set_settings(
     region_paths: State<'_, SharedRegionPaths>,
     health: State<'_, SharedHealth>,
     cache: State<'_, PropCache>,
+    settings: Settings,
+) -> Result<AppSnapshot, String> {
+    // A form save: the ENGINE's roster wins, so a stale panel cannot revert a rig just added.
+    apply_and_persist(
+        state,
+        spots,
+        live_paths,
+        region_paths,
+        health,
+        cache,
+        settings,
+        false,
+    )
+}
+
+/// The body of a settings save, with ONE thing parameterised: who owns the roster.
+///
+/// `authoritative_roster == false` is a form save — `apply_settings` keeps the engine's live
+/// roster, active radio, peg and tune, so a stale panel cannot revert a rig you just added.
+///
+/// `true` is for settings that REPLACE the station rather than edit it: today the factory reset.
+/// It routes through `apply_restored_settings`, the contract #85 established for backups, because
+/// a reset has a restore's shape and not a save's — the incoming settings are the whole truth.
+///
+/// Everything else is shared deliberately. A reset must also reset the PROCESS-GLOBAL state a save
+/// touches — the LoTW recency window and the unassisted-mode atomic — and must go through the same
+/// persistence and feed handling. Reimplementing that beside this function is how the two drift.
+#[allow(clippy::too_many_arguments)]
+fn apply_and_persist(
+    state: State<'_, SharedEngine>,
+    spots: State<'_, SharedSpots>,
+    live_paths: State<'_, SharedLivePaths>,
+    region_paths: State<'_, SharedRegionPaths>,
+    health: State<'_, SharedHealth>,
+    cache: State<'_, PropCache>,
     mut settings: Settings,
+    authoritative_roster: bool,
 ) -> Result<AppSnapshot, String> {
     // Mirror the legacy single `cluster_host` to the list head (empty when the list is
     // empty), so clearing the node list to go RBN-only actually sticks — otherwise `load`'s
@@ -7633,7 +8351,13 @@ fn set_settings(
         // copies), so saving the raw form here would write a roster that diverges from the engine and
         // revert the active radio on the next launch. Persist eng.settings() post-merge, like every
         // light verb does.
-        eng.apply_settings(settings);
+        if authoritative_roster {
+            // The incoming settings REPLACE the station — see `apply_and_persist`. Keeping the
+            // live roster here would leave a factory reset with every radio it promised to erase.
+            eng.apply_restored_settings(settings);
+        } else {
+            eng.apply_settings(settings);
+        }
         if let Err(e) = eng.settings().save(&settings_path()) {
             eprintln!("tempo: failed to persist settings: {e}");
         }
@@ -7831,7 +8555,6 @@ fn export_general_log(
 
 /// Distinct operators present in the log (#25). Empty for a single-op station, which is what
 
-
 /// Fields stripped from a settings backup (#28 item 4), by their serialised (camelCase) names.
 ///
 /// The bundle is written to Downloads and operators mail these to themselves, so anything a
@@ -7900,19 +8623,25 @@ fn export_settings_bundle(state: State<'_, SharedEngine>) -> Result<String, Stri
 /// with a file that happens to be JSON — a partial restore of a mangled file is worse than a
 /// refusal, because the operator believes they are configured and they are not.
 ///
-/// Applies through `apply_settings`, the same path the Settings panel uses, so every side effect
-/// a settings change normally has (the radio loop reconfiguring, the profile mirrors) happens
-/// exactly as it would have. Writing the file directly would leave a running app disagreeing with
-/// its own config until the next restart.
+/// Applies through `apply_restored_settings`, NOT the panel's `apply_settings`. The two have
+/// opposite contracts: a form save deliberately keeps the engine's live roster so a stale form
+/// cannot revert a rig you just added, and a restore must take the bundle's roster instead. Going
+/// through the form path would silently drop radios 2..n, the routing rules and the blocked-call
+/// list on the case this feature exists for — a backup carried to another machine.
+///
+/// It also PERSISTS. Applying to the running engine alone left the restore to evaporate on the
+/// next relaunch, and left the panel's form stale so the next Save wrote the old values back over
+/// it — a silent revert of an explicit, confirmed, "this cannot be undone" action.
+///
+/// NOT done here, deliberately: the lazy live-feed start that `set_settings` performs. A bundle
+/// carrying a different callsign therefore reaches the cluster/RBN/PSKR feeds on the next launch
+/// rather than immediately. Duplicating that here would mean reimplementing the form path's side
+/// effects, which is what taking the form path wrongly was meant to avoid; a restore is a rare,
+/// confirmed, whole-configuration act and a relaunch after one is reasonable.
 #[tauri::command(async)]
 fn import_settings_bundle(
     text: String,
     state: State<'_, SharedEngine>,
-    spots: State<'_, SharedSpots>,
-    live_paths: State<'_, SharedLivePaths>,
-    region_paths: State<'_, SharedRegionPaths>,
-    health: State<'_, SharedHealth>,
-    cache: State<'_, PropCache>,
 ) -> Result<AppSnapshot, String> {
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|_| "That file is not a Nexus settings backup.")?;
@@ -7939,18 +8668,25 @@ fn import_settings_bundle(
             ui_state_save(map);
         }
     }
-    // Reuse the ordinary save path in full rather than reimplementing its side effects -- the
-    // same reasoning `reset_settings` already follows.
-    //
-    // This used to hand-roll `eng.apply_settings(settings)` and return `()`. That applied the
-    // bundle to the RUNNING engine and nothing else: it never persisted, and it returned no
-    // snapshot, so the panel had nothing to re-render from and went on showing the pre-restore
-    // form. To the operator, Restore changed nothing at all.
-    //
-    // Worse than nothing, in fact: that stale form stayed live, so the next Save wrote the OLD
-    // values straight back over the restored ones -- a silent revert of an explicit, confirmed,
-    // "this cannot be undone" action.
-    set_settings(state, spots, live_paths, region_paths, health, cache, settings)
+    // The bundle is the authority, including for the roster -- see `apply_restored_settings`.
+    // The panel's save path is deliberately NOT reused here: it keeps the engine's live roster,
+    // which is right for a form and wrong for a restore.
+    {
+        let mut eng = engine_lock(&state);
+        eng.apply_restored_settings(settings);
+        // PERSIST. Applying to the running engine alone is what made the restore evaporate on the
+        // next launch while looking like it had worked.
+        if let Err(e) = eng.settings().save(&settings_path()) {
+            return Err(format!(
+                "The settings were restored but could not be saved: {e}"
+            ));
+        }
+        // ...and into the base config, or the launch picker keeps offering the OLD roster.
+        persist_roster_to_base(&eng.settings().radios);
+        persist_routing_to_base(eng.settings());
+    }
+    let snap = { engine_lock(&state).snapshot() };
+    Ok(snap)
 }
 
 /// the UI uses to decide whether a per-operator export is worth offering at all.
@@ -8092,10 +8828,31 @@ struct SerialPortInfo {
     label: String,
     /// Which interface of a multi-interface bridge this is, when known. A CP2105 is DUAL and only
     /// interface 0 carries CAT on the rigs this targets; interface 1 answers nothing and looks
-    /// exactly like a dead radio. `None` when there is one interface, or topology is unavailable.
+    /// exactly like a dead radio. `None` when there is one interface, or topology is unavailable —
+    /// and `None` must read as "unknown", never as "interface 0".
     interface_index: Option<u32>,
-    /// An audio device on the SAME physical USB device — i.e. inside the same radio. `None` when
-    /// nothing is paired, which is normal for a plain serial adapter.
+    /// How many serial interfaces this USB device exposes in total, when known.
+    ///
+    /// ⚠️ WITHOUT THIS, `interface_index` IS NOT ENOUGH. Plenty of single-interface devices number
+    /// their one interface something other than 0 — an LG monitor's control port on this desk is
+    /// interface 2 — so "index > 0" alone would tell an operator their only port is "port 3 of
+    /// this device, CAT is normally on port 1", which is both wrong and alarming. The advice is
+    /// only meaningful when there IS another port to have picked instead.
+    ///
+    /// Counted over ports sharing the EXACT same `locationID`, which on macOS is one physical USB
+    /// device. That is stricter than the parent-hub reasoning used for `paired_audio` below, and
+    /// deliberately so: it cannot be confused by two unrelated devices in one external hub.
+    sibling_ports: Option<u32>,
+    /// An audio device on the same physical USB device — i.e. inside the same radio. `None` when
+    /// nothing is paired, which is normal for a plain serial adapter and is also what every
+    /// non-macOS platform reports, so nothing may be REFUSED on its absence.
+    ///
+    /// ⚠️ This one is a HEURISTIC and weaker than `sibling_ports`. A rig's CAT bridge and codec
+    /// are separate USB devices behind the rig's own internal hub, so they can only be related by
+    /// their PARENT — and two unrelated things in one external hub share a parent too. A USB
+    /// headset plugged into the same hub as a rig's CAT adapter would look "inside" it. That is
+    /// why the only consumer is a warning, and why it speaks solely when both sides are known and
+    /// they DISAGREE.
     paired_audio: Option<String>,
 }
 
@@ -8107,50 +8864,55 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
         let usb = tempo_audio::ports::available_usb_ports();
         // The product string alone is NOT an identity: two radios with the same bridge chip give
         // every one of their ports the byte-identical label ("CP2105 Dual USB to UART Bridge
-        // Controller" ×8 on the ON8ST station), and an operator picking their rig out of that list
-        // saved the FTX-1's profile pointing at the FT-710. Annotate each port with which of the
-        // device's interfaces it is and which sound card is inside the same radio — see `usbtopo`.
-        let mut ports: Vec<tempo_audio::audiodev::AudioDevice> =
-            tempo_audio::ports::available_ports()
-                .into_iter()
-                .map(|name| {
-                    let label = usb
-                        .iter()
-                        .find(|u| u.port_name == name)
-                        .map(|u| u.product.clone())
-                        .unwrap_or_default();
-                    tempo_audio::audiodev::AudioDevice { name, label }
-                })
-                .collect();
-        tempo_audio::usbtopo::label_serial_ports(
-            &mut ports,
-            &tempo_audio::usbtopo::serial_locations(),
-            &tempo_audio::usbtopo::serial_interfaces(),
-            &tempo_audio::usbtopo::audio_locations(true),
-        );
-        // The same facts the label is built from, handed over STRUCTURED so the form can
-        // validate against them instead of pattern-matching display text.
-        let ifaces = tempo_audio::usbtopo::serial_interfaces();
-        let locs = tempo_audio::usbtopo::serial_locations();
-        let audio = tempo_audio::usbtopo::audio_locations(true);
-        ports
+        // Controller" ×8 on a two-radio station), and an operator picking their rig out of that
+        // list saved one radio's profile pointing at the other. So each port also carries the
+        // structured facts topology can prove — which interface of the bridge it is, and which
+        // sound card sits inside the same radio — for the form to validate against.
+        //
+        // ⚠️ ADDITIVE ONLY. Both fields are `Option` and both are `None` off macOS and on any Mac
+        // where IOKit answers nothing. The label and the name are unchanged, so a picker that
+        // ignores these fields behaves exactly as before.
+        let (ifaces, locs, audio) = tempo_audio::usbtopo::serial_topology();
+        tempo_audio::ports::available_ports()
             .into_iter()
-            .map(|d| {
-                let paired_audio = locs.get(&d.name).and_then(|l| {
+            .map(|name| {
+                let label = usb
+                    .iter()
+                    .find(|u| u.port_name == name)
+                    .map(|u| u.product.clone())
+                    .unwrap_or_default();
+                // Same physical device = same parent hub. A rig's internal hub carries its CAT
+                // bridge and its codec; a bare USB-serial adapter shares its hub with nothing, and
+                // then this is correctly `None`.
+                let paired_audio = locs.get(&name).and_then(|l| {
                     let hub = tempo_audio::usbtopo::parent_hub(*l);
                     let mut mates: Vec<&String> = audio
                         .iter()
                         .filter(|(_, al)| tempo_audio::usbtopo::parent_hub(**al) == hub)
                         .map(|(n, _)| n)
                         .collect();
-                    mates.sort();
+                    mates.sort(); // stable across calls — the picker must not reshuffle
                     mates.first().map(|n| (*n).clone())
                 });
+                // Distinct interface numbers on the exact same USB device. `None` rather than
+                // `Some(1)` when this port has no topology: "one interface" and "unknown" are not
+                // the same claim, and the check that reads it must be able to tell them apart.
+                let sibling_ports = locs.get(&name).map(|my_loc| {
+                    let mut seen: Vec<u32> = ifaces
+                        .iter()
+                        .filter(|(n, _)| locs.get(*n) == Some(my_loc))
+                        .map(|(_, i)| *i)
+                        .collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    seen.len() as u32
+                });
                 SerialPortInfo {
-                    interface_index: ifaces.get(&d.name).copied(),
+                    interface_index: ifaces.get(&name).copied(),
+                    sibling_ports,
                     paired_audio,
-                    name: d.name,
-                    label: d.label,
+                    name,
+                    label,
                 }
             })
             .collect()
@@ -8171,13 +8933,18 @@ async fn get_serial_ports_detailed() -> Vec<SerialPortInfo> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioDeviceDto {
-    /// The USB device (parent hub) this sound card belongs to, when resolvable — i.e. which
-    /// radio it is INSIDE. Lets the form check that a chosen codec and a chosen CAT port are
-    /// the same physical rig. Display/validation only: never stored, because it describes where
-    /// the hardware is plugged in at this instant.
-    usb_hub: Option<u32>,
     name: String,
     label: String,
+    /// The USB device (parent hub) this sound card belongs to, when resolvable — i.e. WHICH RADIO
+    /// it is inside. Lets the rig form check that a chosen codec and a chosen CAT port are the same
+    /// physical rig, which a name cannot: two rigs with the same codec chip both enumerate as
+    /// "USB Audio Device" and the positional `" #2"` that separates them is assigned by enumeration
+    /// order, so moving a rig to another USB socket swaps what each stored name means.
+    ///
+    /// ⚠️ Display and validation ONLY, and NEVER persisted — it describes where the hardware is
+    /// plugged in at this instant, so a stored copy would be wrong the next time a cable moves.
+    /// `None` off macOS and wherever topology is unavailable; nothing may be refused on its absence.
+    usb_hub: Option<u32>,
 }
 
 /// Available sound-card input/output devices (for the Settings dropdowns).
@@ -8190,15 +8957,8 @@ struct AudioDevices {
 
 /// Enumerate sound-card devices for the Settings audio-device pickers. Empty
 /// lists when built without the `radio` feature (mirrors `get_serial_ports`).
-///
-/// Takes the engine so each device can be labelled with the RADIO it belongs to: two rigs whose
-/// codecs report the same name (a pair of C-Media dongles both called "USB Audio Device") are
-/// otherwise offered as a bare name and a meaningless " #2", and picking wrong sends TX audio to
-/// the other rig. `usbtopo` resolves it from USB topology — see that module. Labels only; the
-/// `name` each entry is stored under is untouched, so this changes nothing about how a saved
-/// setting resolves.
 #[tauri::command]
-async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevices, String> {
+async fn get_audio_devices() -> AudioDevices {
     #[cfg(feature = "radio")]
     {
         fn dto(
@@ -8207,104 +8967,27 @@ async fn get_audio_devices(state: State<'_, SharedEngine>) -> Result<AudioDevice
         ) -> Vec<AudioDeviceDto> {
             v.into_iter()
                 .map(|d| AudioDeviceDto {
-                    usb_hub: locs.get(&d.name).map(|l| tempo_audio::usbtopo::parent_hub(*l)),
+                    usb_hub: locs
+                        .get(&d.name)
+                        .map(|l| tempo_audio::usbtopo::parent_hub(*l)),
                     name: d.name,
                     label: d.label,
                 })
                 .collect()
         }
-        let (mut input, mut output) = tempo_audio::device::available_devices();
-        // Each radio paired with the USB location of the CAT port it is configured on. Radios
-        // with no port (VOX-only) or a port that is not present contribute nothing, so an
-        // unplugged rig simply stops naming its codec rather than naming it wrongly.
-        let serial_locs = tempo_audio::usbtopo::serial_locations();
-        let rigs: Vec<(String, u32)> = {
-            let eng = state.lock().unwrap_or_else(|e| e.into_inner());
-            eng.settings()
-                .radios
-                .iter()
-                .filter_map(|r| {
-                    serial_locs
-                        .get(r.serial_port.trim())
-                        .map(|loc| (r.name.clone(), *loc))
-                })
-                .collect()
-        };
-        if !rigs.is_empty() {
-            tempo_audio::usbtopo::label_by_rig(
-                &mut input,
-                &tempo_audio::usbtopo::audio_locations(true),
-                &rigs,
-            );
-            tempo_audio::usbtopo::label_by_rig(
-                &mut output,
-                &tempo_audio::usbtopo::audio_locations(false),
-                &rigs,
-            );
-        }
+        let (input, output) = tempo_audio::device::available_devices();
+        // Input and output are separate CoreAudio streams even on one card, so each side needs its
+        // own lookup; both are empty maps where topology is unavailable, and then every `usb_hub`
+        // is `None` and the lists are exactly what they were before.
         let in_locs = tempo_audio::usbtopo::audio_locations(true);
         let out_locs = tempo_audio::usbtopo::audio_locations(false);
-        Ok(AudioDevices {
+        AudioDevices {
             input: dto(input, &in_locs),
             output: dto(output, &out_locs),
-        })
-    }
-    #[cfg(not(feature = "radio"))]
-    {
-        let _ = state;
-        Ok(AudioDevices {
-            input: Vec::new(),
-            output: Vec::new(),
-        })
-    }
-}
-
-/// The audio devices that belong to the SAME RIG as `port` — the ones to offer first.
-///
-/// Answers the configure-time question directly: an operator picks the CAT port, and the audio
-/// pickers should then propose that radio's own codec instead of a list of identically-named
-/// entries to guess between. A rig carrying CAT and audio down one cable is internally a USB hub,
-/// so its codec is the device sharing the CAT port's parent — no naming, no saved profile and no
-/// prior assignment needed, which is what makes this work during first setup.
-///
-/// Empty lists mean "nothing proven", NOT "this rig has no audio": a network-connected rig, a
-/// separate interface box, an analogue card and every non-macOS build all land here. The caller
-/// must fall back to offering everything rather than showing an empty picker.
-#[tauri::command]
-async fn audio_devices_for_port(port: String) -> AudioDevices {
-    #[cfg(feature = "radio")]
-    {
-        let Some(port_loc) = tempo_audio::usbtopo::serial_locations()
-            .get(port.trim())
-            .copied()
-        else {
-            return AudioDevices {
-                input: Vec::new(),
-                output: Vec::new(),
-            };
-        };
-        let (input, output) = tempo_audio::device::available_devices();
-        let pick = |devices: Vec<tempo_audio::audiodev::AudioDevice>, is_input: bool| {
-            let locs = tempo_audio::usbtopo::audio_locations(is_input);
-            let keep = tempo_audio::usbtopo::devices_sharing_usb_device(&devices, &locs, port_loc);
-            devices
-                .into_iter()
-                .filter(|d| keep.contains(&d.name))
-                .map(|d| AudioDeviceDto {
-                    usb_hub: locs.get(&d.name).map(|l| tempo_audio::usbtopo::parent_hub(*l)),
-                    name: d.name,
-                    label: d.label,
-                })
-                .collect()
-        };
-        AudioDevices {
-            input: pick(input, true),
-            output: pick(output, false),
         }
     }
     #[cfg(not(feature = "radio"))]
     {
-        let _ = port;
         AudioDevices {
             input: Vec::new(),
             output: Vec::new(),
@@ -8652,9 +9335,8 @@ fn sync_rotctld(st: &tempo_app::settings::Settings) {
             }
             let slot = &mut *g;
             *slot = None; // kill-on-drop reaps a stale daemon first
-            match tempo_audio::rigctld_proc::spawn_rotctld(
-                params.0, &params.1, params.2, params.3,
-            ) {
+            match tempo_audio::rigctld_proc::spawn_rotctld(params.0, &params.1, params.2, params.3)
+            {
                 Ok(mut proc) => {
                     let port = params.3;
                     // Give it the moment it takes to fail. A rotctld that cannot open the port
@@ -8691,7 +9373,11 @@ fn sync_rotctld(st: &tempo_app::settings::Settings) {
                                      rotator will not answer. Check the port and that the baud \
                                      matches what this model needs.",
                                     params.0,
-                                    if params.1.is_empty() { "(no port set)" } else { &params.1 },
+                                    if params.1.is_empty() {
+                                        "(no port set)"
+                                    } else {
+                                        &params.1
+                                    },
                                     params.2
                                 ),
                                 &proc.said(),
@@ -9135,6 +9821,21 @@ fn rtty_state_dto(eng: &Engine) -> RttyStateDto {
 fn rtty_arm(state: State<'_, SharedEngine>, on: bool) -> Result<RttyStateDto, String> {
     let mut eng = engine_lock(&state);
     eng.set_rtty_armed(on);
+    Ok(rtty_state_dto(&eng))
+}
+
+/// Arm the decoder because the operator ENTERED the RTTY view. Receive-only by construction
+/// (arming the decoder keys nothing): only upgrades from off, refuses once the operator has
+/// explicitly stopped it this session, and refuses for good when the Settings opt-out
+/// (`rtty_rx_auto_arm`) is off. See `Engine::rtty_auto_arm` for the policy — it lives there so
+/// a cockpit remount cannot lose it, exactly as for PSK, APRS and SSTV.
+///
+/// RTTY was the last decode mode without this, and a receive screen with a dead receiver is
+/// the field bug behind the standing "RTTY is not decoding" reports.
+#[tauri::command(async)]
+fn rtty_auto_arm(state: State<'_, SharedEngine>) -> Result<RttyStateDto, String> {
+    let mut eng = engine_lock(&state);
+    eng.rtty_auto_arm();
     Ok(rtty_state_dto(&eng))
 }
 
@@ -9688,8 +10389,8 @@ fn get_sstv_state(state: State<'_, SharedEngine>) -> Result<SstvStateDto, String
 /// "scottiedx", "martin1", …) to its [`tempo_sstv::SstvMode`]. Case-insensitive.
 fn parse_sstv_mode(slug: &str) -> Option<tempo_sstv::SstvMode> {
     use tempo_sstv::SstvMode::{
-        Martin1, Martin2, Pd120, Pd160, Pd180, Pd240, Pd290, Pd50, Pd90, Robot24, Robot36,
-        Robot72, Scottie1, Scottie2, ScottieDx,
+        Martin1, Martin2, Pd120, Pd160, Pd180, Pd240, Pd290, Pd50, Pd90, Robot24, Robot36, Robot72,
+        Scottie1, Scottie2, ScottieDx,
     };
     Some(match slug.trim().to_ascii_lowercase().as_str() {
         "pd50" => Pd50,
@@ -9855,7 +10556,11 @@ fn b64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
@@ -10441,6 +11146,71 @@ fn get_portless_rig_models() -> Vec<u32> {
     }
 }
 
+/// Models whose CAT CW keyer is UNPROVEN and cannot report its own failure — the CW settings
+/// page shows a caution when the operator has picked the CAT keyer on one of them. See
+/// [`tempo_audio::rigmodels::cat_cw_unproven_rig_models`] for the measurement and for why this
+/// is a notice rather than a block.
+///
+/// An empty result means "could not be determined" (built without the `radio` feature), and the
+/// form simply shows no caution — the same direction as the portless rule: a rule that cannot be
+/// read must never be the reason an operator is warned off a keyer that works for him.
+#[tauri::command]
+fn get_cat_cw_unproven_rig_models() -> Vec<u32> {
+    #[cfg(feature = "radio")]
+    {
+        tempo_audio::rigmodels::cat_cw_unproven_rig_models()
+    }
+    #[cfg(not(feature = "radio"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Ask a configured amplifier for one thing: `"bandDown"`, `"bandUp"` or `"operate"`.
+///
+/// ⛔ THREE INTENTS, AND THE SET IS CLOSED. An unrecognised name is refused rather than
+/// forwarded, so this boundary cannot become a way to put an arbitrary byte on the wire — SPE's
+/// keystroke table has `SWITCH OFF` at `0x0A` immediately after `TUNE`, and a string that
+/// reached a numeric opcode would put both one typo away from an operator's amplifier.
+///
+/// These are INTENTS, not commands: the poll thread translates each one for the family that is
+/// actually connected, because only it knows the current state. SPE flips Operate with a
+/// keystroke; Elecraft names the state it wants and needs a reading to know which.
+///
+/// Returns false when the queue is full, which the caller must surface: a keystroke the
+/// operator watched themselves make and that silently vanished reads as a broken control.
+///
+/// The transmit interlock is NOT here. It lives in the poll thread, which holds a status frame
+/// from a moment earlier and so knows whether the amplifier is keyed; this layer has no reading
+/// of its own and a check written here would be a guess wearing a guard's clothes.
+#[tauri::command]
+fn amp_command(_which: String) -> bool {
+    #[cfg(feature = "radio")]
+    {
+        use tempo_audio::amplifier::AmpIntent;
+        let cmd = match _which.as_str() {
+            "bandDown" => AmpIntent::BandDown,
+            "bandUp" => AmpIntent::BandUp,
+            "operate" => AmpIntent::ToggleOperate,
+            _ => return false,
+        };
+        tempo_audio::amppoll::queue_amp_command(cmd)
+    }
+    #[cfg(not(feature = "radio"))]
+    {
+        false
+    }
+}
+
+// The band-plan channel list drives BOTH the band selector AND the frequency-preset dropdown —
+// they are one list. #184 once trimmed it to the enabled radios' band COVERAGE, but that
+// coverage list is a dual-radio ROUTING signal ("which rig owns this band"), not a capability
+// limit: a rig with a partial coverage list still physically tunes every other band. Trimming
+// the preset list by it made standard calling frequencies vanish and read "custom" (#231/#232,
+// a 1.10.2 regression), so the trim is gone. If the selector should again hide bands no radio
+// can reach, that belongs on a real per-radio CAPABILITY signal, not the routing coverage —
+// `Settings::any_radio_covers` stays (with its tests) for whoever builds that.
+
 /// Tempo's proposed calling-frequency band plan (HF + VHF/UHF), for the band
 /// selector. Each entry is General-legal + clear of the existing watering holes.
 #[tauri::command(async)]
@@ -10450,7 +11220,9 @@ fn get_band_plan(
     // Tier-aware (FT8/FT4 → the standard WSJT-X watering holes; FT1/DX1 →
     // native plan) WITH the operator's Settings ▸ Frequencies overrides applied
     // — the band picker must show the dials the engine will actually QSY to.
-    Ok(engine_lock(&state).band_plan())
+    let eng = engine_lock(&state);
+    let plan = eng.band_plan();
+    Ok(plan)
 }
 
 /// Set the operator's amateur license class (Technician/General/Extra/Open) — drives the
@@ -10476,38 +11248,42 @@ fn licensed_bands(
 ) -> Vec<tempo_app::bandplan::BandChannel> {
     use tempo_app::bandplan::BandChannel;
     use tempo_app::settings::OperatingMode;
-    const BANDS: &[(&str, &str)] = &[
-        ("160m", "HF"),
-        ("80m", "HF"),
-        ("40m", "HF"),
-        ("30m", "HF"),
-        ("20m", "HF"),
-        ("17m", "HF"),
-        ("15m", "HF"),
-        ("12m", "HF"),
-        ("10m", "HF"),
-        ("6m", "VHF"),
+    // Band, UI group, and a LISTENING dial — somewhere sensible to park when this class has
+    // no transmit segment here (#184, akhepcat: "there are no restrictions on receiving").
+    // These are calling/activity frequencies, not segment starts, because a receive-only row
+    // has no segment to start at.
+    const BANDS: &[(&str, &str, f64)] = &[
+        ("160m", "HF", 1.845),
+        ("80m", "HF", 3.573),
+        ("40m", "HF", 7.074),
+        ("30m", "HF", 10.136),
+        ("20m", "HF", 14.074),
+        ("17m", "HF", 18.100),
+        ("15m", "HF", 21.074),
+        ("12m", "HF", 24.915),
+        ("10m", "HF", 28.074),
+        ("6m", "VHF", 50.313),
         // 4 m is IARU Region 1 only — the US has no allocation at any class (#75). It sits
         // here rather than being left to the FT dropdown because the privilege filter below
         // is what decides who sees it: a US class holds no 4 m segment and never sees the
         // row, while the non-US `Open` class does, in SSB and CW as well as in FT8.
-        ("4m", "VHF"),
-        ("2m", "VHF"),
-        ("1.25m", "VHF"),
-        ("70cm", "UHF"),
+        ("4m", "VHF", 70.200),
+        ("2m", "VHF", 144.174),
+        ("1.25m", "VHF", 222.100),
+        ("70cm", "UHF", 432.174),
         // Batch 3: the named microwave bands. Per-class privilege filtering below keeps
         // each operator's dropdown honest automatically — a band whose class holds no
         // segment (9 cm for every US class) is omitted for them and present for Open.
-        ("33cm", "UHF"),
-        ("23cm", "UHF"),
-        ("13cm", "UHF"),
-        ("9cm", "UHF"),
-        ("6cm", "UHF"),
-        ("3cm", "UHF"),
-        ("1.25cm", "UHF"),
+        ("33cm", "UHF", 903.100),
+        ("23cm", "UHF", 1296.100),
+        ("13cm", "UHF", 2304.100),
+        ("9cm", "UHF", 3400.100),
+        ("6cm", "UHF", 5760.100),
+        ("3cm", "UHF", 10368.100),
+        ("1.25cm", "UHF", 24192.100),
     ];
     let mut out = Vec::new();
-    for (band, group) in BANDS {
+    for (band, group, rx_dial) in BANDS {
         // PHONE goes through THE phone home (`privileges::phone_home`), which lifts an LSB
         // home clear of the segment edge — the bare edge is a dial the transmit gate refuses,
         // and this command recomputing it from `segment_start` is how the dropdown used to
@@ -10528,16 +11304,37 @@ fn licensed_bands(
                 (dial, "USB")
             })
         };
-        if let Some((dial, sideband)) = home {
-            out.push(BandChannel {
-                band: band.to_string(),
-                group: group.to_string(),
-                dial_mhz: dial,
-                mode: sideband.to_string(),
-                label: format!("{band} · {dial:.3} MHz"),
-                note: String::new(),
-            });
-        }
+        // ⚠️ A BAND WITH NO TRANSMIT SEGMENT IS LISTED, NOT DROPPED (#184, akhepcat).
+        //
+        // This used to `if let Some(..)` and skip, which applied a TRANSMIT rule to a TUNING
+        // list: no licence restricts listening, and the radio itself tunes there quite
+        // happily. A US General could not select 4 m at all — not "could listen but not
+        // key" — which is neither what the rules say nor what the rig does.
+        //
+        // So the row is emitted either way; `tx` carries which it is, and the UI marks the
+        // receive-only ones. Nothing here reaches the transmit gate:
+        // `privileges::tx_allowed` is untouched and still refuses the over, with the licence
+        // reason, exactly as before.
+        let (dial, sideband) = match home {
+            Some((dial, sideband)) => (dial, sideband),
+            None => (*rx_dial, "USB"),
+        };
+        // ⚠️ ASK THE GATE, do not re-derive it. The obvious spelling — "we found a segment
+        // start, therefore transmit is allowed" — is WRONG for the `Open` class: it holds no
+        // segments above 23 cm, yet `tx_allowed` short-circuits Open to true (it is the
+        // non-US / undeclared class and is trusted), so that spelling labelled a non-US
+        // operator's own microwave bands receive-only. Reading the real gate keeps this flag
+        // and the refusal in agreement by construction rather than by duplicated logic.
+        let tx = tempo_app::privileges::tx_allowed(class, dial, mode);
+        out.push(BandChannel {
+            band: band.to_string(),
+            group: group.to_string(),
+            dial_mhz: dial,
+            mode: sideband.to_string(),
+            label: format!("{band} · {dial:.3} MHz"),
+            note: String::new(),
+            tx,
+        });
     }
     out
 }
@@ -10561,19 +11358,28 @@ fn get_licensed_band_plan(
     let lower = mode.to_ascii_lowercase();
     if lower == "rtty" || lower == "sstv" || lower == "psk" {
         let (plan, priv_mode) = if lower == "rtty" {
-            (tempo_app::bandplan::rtty_band_plan(), OperatingMode::Digital)
+            (
+                tempo_app::bandplan::rtty_band_plan(),
+                OperatingMode::Digital,
+            )
         } else if lower == "psk" {
-            (tempo_app::bandplan::psk_band_plan(), OperatingMode::Keyboard)
+            (
+                tempo_app::bandplan::psk_band_plan(),
+                OperatingMode::Keyboard,
+            )
         } else {
             (tempo_app::bandplan::sstv_band_plan(), OperatingMode::Phone)
         };
         return Ok(plan
             .into_iter()
-            .filter(|c| {
+            .map(|mut c| {
                 // Channel band ids may carry a suffix ("2m-call") — privilege-check
                 // the base band, via THE canonicaliser (one home, not a hand-split).
-                let base = tempo_app::bandplan::canonical_band(&c.band);
-                tempo_app::privileges::segment_start(class, &base, priv_mode).is_some()
+                // MARK, don't drop: see the note in `licensed_bands`. A class with no
+                // segment here may still listen, and the transmit gate still refuses.
+                // Same rule as `licensed_bands`: ask the gate, so `Open` is not mislabelled.
+                c.tx = tempo_app::privileges::tx_allowed(class, c.dial_mhz, priv_mode);
+                c
             })
             .collect());
     }
@@ -10774,7 +11580,11 @@ fn set_cw_peer_info(
 
 /// Set the CW keyer speed in WPM (5–50).
 #[tauri::command(async)]
-fn set_cw_wpm(state: State<'_, SharedEngine>, wpm: u32, commit: bool) -> Result<AppSnapshot, String> {
+fn set_cw_wpm(
+    state: State<'_, SharedEngine>,
+    wpm: u32,
+    commit: bool,
+) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
     eng.set_cw_wpm(wpm);
     // `commit` gates the DISK write, not the live change. Two reasons it isn't unconditional:
@@ -10841,6 +11651,23 @@ fn set_mic_gain(state: State<'_, SharedEngine>, gain: f32) -> Result<AppSnapshot
 fn set_nr_level(state: State<'_, SharedEngine>, level: f32) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
     eng.set_nr_level(level);
+    Ok(eng.snapshot())
+}
+
+/// Set the speech-processor depth as a 0.0–1.0 fraction (#95 — the COMP toggle had no level).
+#[tauri::command(async)]
+fn set_comp_level(state: State<'_, SharedEngine>, level: f32) -> Result<AppSnapshot, String> {
+    let mut eng = engine_lock(&state);
+    eng.set_comp_level(level);
+    Ok(eng.snapshot())
+}
+
+/// Set the MANUAL-NOTCH frequency in Hz (#95 — a notch you cannot place is not a notch).
+/// Clamped by the engine to the audio passband a notch can usefully sit in.
+#[tauri::command(async)]
+fn set_notch_freq(state: State<'_, SharedEngine>, hz: f32) -> Result<AppSnapshot, String> {
+    let mut eng = engine_lock(&state);
+    eng.set_notch_freq_hz(hz);
     Ok(eng.snapshot())
 }
 
@@ -11393,8 +12220,14 @@ fn set_blocked_calls(
 fn panel_default_inner(slug: &str) -> (f64, f64) {
     match slug {
         "operate" => (1140.0, 760.0),
+        // The POTA map pop-out: a bare MapView needs the same room the Operate cockpit
+        // does, not the generic 760×660 — a cramped globe is the whole feature undersold.
+        "operatemap" => (1140.0, 760.0),
         "bandmapPhone" | "bandmapCw" => (420.0, 780.0),
         "fieldday" => (560.0, 760.0), // the scoreboard: operator + tiles + sections board
+        // The club band board is set in glance type (it is watched across the tent, not
+        // read at the keyboard), so it opens wider and shorter than the generic default.
+        "fdclub" => (860.0, 620.0),
         "waterfall" => (900.0, 300.0), // a wide, short monitoring strip
         _ => (760.0, 660.0),
     }
@@ -11406,6 +12239,10 @@ fn panel_default_inner(slug: &str) -> (f64, f64) {
 fn panel_min_inner(slug: &str) -> (f64, f64) {
     match slug {
         "waterfall" => (380.0, 180.0),
+        // Its six columns in glance type do not survive the generic 420 wide: at the 65%
+        // zoom floor that window could only ever show a 646 px box, and the board's
+        // natural is 820. 560 raises the ceiling above it.
+        "fdclub" => (560.0, 400.0),
         _ => (420.0, 360.0),
     }
 }
@@ -11455,6 +12292,9 @@ async fn open_panel_window(
         "needed" => "Nexus — Needed".to_string(),
         "operate" => "Nexus — Operate".to_string(),
         "fieldday" => "Nexus — Field Day".to_string(),
+        "fdclub" => "Nexus — Club band board".to_string(),
+        "pota" => "Nexus — POTA / SOTA".to_string(),
+        "operatemap" => "Nexus — Map".to_string(),
         "waterfall" => "Nexus — Waterfall".to_string(),
         "bandmapPhone" => "Nexus — Band map (Phone)".to_string(),
         "bandmapCw" => "Nexus — Band map (CW)".to_string(),
@@ -11498,14 +12338,11 @@ async fn open_panel_window(
         Instance::Main => format!("index.html?panel={slug}"),
         other => format!("index.html?panel={slug}&instance={other}"),
     };
-    let mut builder = tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(url.into()),
-    )
-    .title(title)
-    .inner_size(w, h)
-    .min_inner_size(min_w, min_h);
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+            .title(title)
+            .inner_size(w, h)
+            .min_inner_size(min_w, min_h);
     if let Some(g) = &saved {
         if matches!(free, Some((_, _, false))) {
             // FREE window whose saved top-left no longer lands on any monitor (unplugged or
@@ -11771,21 +12608,78 @@ fn edit_qso(
     Ok(eng.snapshot())
 }
 
+/// What a `via` argument MEANS on [`mark_qsl_sent`] — the one decision the command layer owns
+/// in the #180 sandwich (UI `'B'|'D'|'E'|null` → here → `Engine::mark_qsl_sent(.., Option<QslVia>)`).
+///
+/// EXACTLY ONE VALUE WITHDRAWS THE MARK: `null`, which the UI sends from its own explicit
+/// "clear" menu entry. Everything else must name a real method or be refused — including the
+/// EMPTY string, and that arm is the safety of the whole thing rather than a nicety. Empty is
+/// the select's PLACEHOLDER, the state the control sits in when the operator has chosen
+/// nothing; it is a non-choice, not a decision, and honouring it as a withdrawal would erase
+/// a mark nobody asked to erase. Same loss as reading a typo as a withdrawal, and likelier:
+/// a placeholder is a value the UI can emit by accident, and a typo is not.
+///
+/// So: `None` clears; an unknown or empty non-null value is an error the caller must fix.
+fn qsl_via_arg(via: Option<&str>) -> Result<Option<tempo_core::logbook::QslVia>, String> {
+    let Some(raw) = via else {
+        return Ok(None); // the explicit withdrawal, and the only one
+    };
+    let code = raw.trim();
+    if code.is_empty() {
+        return Err(
+            "No QSL-sent method given — use B, D, or E, or the menu's Clear entry to \
+             withdraw the mark."
+                .into(),
+        );
+    }
+    tempo_core::logbook::QslVia::from_code(code)
+        .map(Some)
+        .ok_or_else(|| format!("Unknown QSL-sent method '{code}' — use B, D, or E."))
+}
+
 /// Mark logbook entry `index` (oldest-first, as returned by `get_log`) as
 /// QSL-sent — operator-declared truth that a card/request was sent `via`
 /// "B"(ureau) / "D"(irect) / "E"(lectronic), dated now. A request is NOT a
 /// confirmation: this never flips `confirmed`/`awardConfirmed`. Returns the
 /// refreshed snapshot.
+///
+/// `via: null` — and ONLY null — WITHDRAWS the mark instead (#180). Sending is once-only, so
+/// before this a mis-click made the three send entries vanish with nothing to put the row back,
+/// while the inbound side had `mark_qsl_card(index, false)` all along. See [`qsl_via_arg`] for
+/// why an unknown code, and an EMPTY one, are both errors rather than withdrawals.
+///
+/// ⚠️ The withdrawal is an OPERATOR DECISION and outranks a later ADIF import that still says
+/// sent — the core records the cleared state as such so merge can tell "never sent" from
+/// "operator un-sent it". Nothing in this layer re-derives the mark or offers an import a way
+/// around that: the command forwards the operator's word and nothing else.
 #[tauri::command(async)]
 fn mark_qsl_sent(
     state: State<'_, SharedEngine>,
     index: usize,
-    via: String,
+    via: Option<String>,
 ) -> Result<AppSnapshot, String> {
-    let via = tempo_core::logbook::QslVia::from_code(&via)
-        .ok_or_else(|| format!("Unknown QSL-sent method '{via}' — use B, D, or E."))?;
+    let via = qsl_via_arg(via.as_deref())?;
     let mut eng = engine_lock(&state);
     if !eng.mark_qsl_sent(index, via) {
+        return Err("That contact no longer exists — reload the log and try again.".into());
+    }
+    Ok(eng.snapshot())
+}
+
+/// Record whether a PAPER QSL card arrived for logbook entry `index` (#152).
+///
+/// The operator is the only authority for this: LoTW, eQSL and QRZ report their own
+/// confirmations and Nexus syncs those, but nothing knows a card reached a letterbox. It is
+/// award-eligible — `QslRcvd::award` is card OR LoTW — so leaving it unrecordable left the
+/// awards view understating what the operator can actually claim.
+#[tauri::command(async)]
+fn mark_qsl_card(
+    state: State<'_, SharedEngine>,
+    index: usize,
+    received: bool,
+) -> Result<AppSnapshot, String> {
+    let mut eng = engine_lock(&state);
+    if !eng.mark_qsl_card(index, received) {
         return Err("That contact no longer exists — reload the log and try again.".into());
     }
     Ok(eng.snapshot())
@@ -11995,6 +12889,10 @@ struct SpotRow {
     /// (own decodes / PSK Reporter). `None` for a cluster/RBN spot of a station not yet heard with
     /// a grid, or a non-US station — cluster spots carry no grid of their own.
     state: Option<String>,
+    /// The station's OWN grid, when one is known: the roster's cached decode grid first, else
+    /// the grid token off the RBN skimmer comment ([`rbn_comment_grid`] — machine wire only).
+    /// Drives the panel's exact heading; `None` leaves the ~entity-centroid fallback.
+    grid: Option<String>,
     /// Band label ("20m"), "" if off the band plan.
     band: String,
     freq_mhz: f64,
@@ -12118,6 +13016,11 @@ fn get_all_spots(spots: State<'_, SharedSpots>, state: State<'_, SharedEngine>) 
             // decode grid for rovers. See us_state_hint.
             let roster_grid = roster_grids.get(&cs.dx_call).map(String::as_str);
             let state = us_state_hint(&cs.dx_call, roster_grid);
+            // Heading source, most-trusted first: our own decode cache, else the skimmer
+            // wire's grid token (rbn-gated). Never human free-text.
+            let grid = roster_grid
+                .or_else(|| cs.rbn.then(|| rbn_comment_grid(&cs.comment)).flatten())
+                .map(str::to_string);
             let age_secs = if cs.received_unix > 0 {
                 (now - cs.received_unix as i64).max(0)
             } else {
@@ -12138,6 +13041,7 @@ fn get_all_spots(spots: State<'_, SharedSpots>, state: State<'_, SharedEngine>) 
                 entity,
                 zone,
                 state,
+                grid,
                 band,
                 freq_mhz: freq,
                 mode: mode_label.to_string(),
@@ -12368,6 +13272,7 @@ async fn get_need_alerts(
     let snap = eng.snapshot();
     // Operator "wanted" watch list (W1.5) — captured before the lock drops.
     let wanted_calls = eng.settings().wanted_calls.clone();
+    let confirm_tier = eng.settings().alert_confirm_tier;
     // License class for the privilege gate below — a station on a frequency the operator may not
     // transmit to is not a "need". Open (non-US) short-circuits tx_allowed to true, so no gate.
     let license_class = eng.settings().license_class;
@@ -12476,6 +13381,13 @@ async fn get_need_alerts(
         }
     }
     let mut alerts = propagation::rank_needs(&heard, &needs, &needs.slots());
+    // The Confirm (worked-but-unconfirmed / LoTW opportunity) tier is opt-out. This is
+    // the ONE seam both surfaces share — the Needed board and the decode/roster chips
+    // are all views over this list — and it runs BEFORE the DXped/POTA/SOTA appends so
+    // an appended chip cannot keep alive a row the operator asked not to see.
+    if !confirm_tier {
+        propagation::strip_confirm_tier(&mut alerts);
+    }
     // Never alert on the operator's own call (their PSKR "heard me" echoes can
     // otherwise surface it as a phantom row).
     let me_up = snap.mycall.to_uppercase();
@@ -12685,6 +13597,7 @@ const QRZ_LOGBOOK_KEYCHAIN_USER: &str = "qrz-logbook-key";
 const HAMQTH_KEYCHAIN_USER: &str = "hamqth-password";
 const CLUBLOG_KEYCHAIN_USER: &str = "clublog-password";
 const HRDLOG_KEYCHAIN_USER: &str = "hrdlog-code";
+const WRL_KEYCHAIN_USER: &str = "wrl-key";
 const CLOUDLOG_KEYCHAIN_USER: &str = "cloudlog-key";
 
 /// Client name Nexus sends to HRDLog.net's `NewEntry.aspx` as `App` (aids their
@@ -12766,9 +13679,92 @@ const CONN_LOG_CAP: usize = 200;
 /// lie in a new costume.
 ///
 /// `Vec::new()` is const (a `HashMap` would not be), and n ≤ 2, so a linear scan is right.
-#[allow(clippy::type_complexity)]
-static CONN_HEALTH: Mutex<Vec<(&'static str, Option<i64>, Option<(i64, String)>)>> =
-    Mutex::new(Vec::new());
+type ConnHealthRows = Vec<(&'static str, Option<i64>, Option<(i64, String)>)>;
+static CONN_HEALTH: Mutex<ConnHealthRows> = Mutex::new(Vec::new());
+/// Whether `conn-health.json` has been read into [`CONN_HEALTH`] this process. Lazy, on the
+/// first lock, rather than a `run()` step: the three launch paths (main window, profile
+/// picker, panel) would each need the wiring, and the first reader is the right moment.
+static CONN_HEALTH_LOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The connector ids the health rows may carry — the `CredStatus` slug set. Ids are
+/// `&'static str` in memory, so a row read back from disk has to resolve to one of these
+/// or be dropped (a slug from a build that no longer has that connector says nothing).
+const CONN_HEALTH_IDS: &[&str] = &[
+    "cloudlog",
+    "clublog",
+    "eqsl",
+    "hrdlog",
+    "lotw",
+    "qrz-logbook",
+    "qrz-xml",
+    "repeaterbook",
+    "wrl",
+];
+
+/// On-disk shape of one connector's health row. Lives in `conn-health.json` beside
+/// settings.json — per profile, backed up with everything else, tiny.
+///
+/// ⚠️ WHY THIS FILE EXISTS (2026-09-02, an HRDLog field report). Health used to be
+/// process memory only, so every launch reset every connector to "stored — not verified
+/// yet" until that session's first push — and for HRDLog, WRL and Cloudlog, which stamp no
+/// per-QSO upload state, that line was the ONLY evidence the code worked. An operator whose
+/// uploads were fine read "not verified" at every start and reported a bug in the uploads.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConnHealthRow {
+    id: String,
+    last_ok_unix: Option<i64>,
+    last_fail_unix: Option<i64>,
+    last_fail_detail: Option<String>,
+}
+
+fn conn_health_path() -> PathBuf {
+    config_dir().join("conn-health.json")
+}
+
+/// Parse `conn-health.json`. Malformed = nothing (never a startup failure over a status
+/// file); an unknown id is dropped, a failure row without a detail keeps its time.
+fn conn_health_from_json(text: &str) -> ConnHealthRows {
+    let rows: Vec<ConnHealthRow> = serde_json::from_str(text).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|r| {
+            let id = CONN_HEALTH_IDS.iter().copied().find(|k| *k == r.id)?;
+            let fail = r
+                .last_fail_unix
+                .map(|w| (w, r.last_fail_detail.clone().unwrap_or_default()));
+            Some((id, r.last_ok_unix, fail))
+        })
+        .collect()
+}
+
+fn conn_health_to_json(m: &ConnHealthRows) -> String {
+    let rows: Vec<ConnHealthRow> = m
+        .iter()
+        .map(|(id, ok, fail)| ConnHealthRow {
+            id: (*id).to_string(),
+            last_ok_unix: *ok,
+            last_fail_unix: fail.as_ref().map(|(w, _)| *w),
+            last_fail_detail: fail.as_ref().map(|(_, d)| d.clone()),
+        })
+        .collect();
+    serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The health rows, loaded from disk on first use. A row noted before the load (a push
+/// that beat the first read) is kept; the file fills in only what memory lacks.
+fn conn_health_lock() -> std::sync::MutexGuard<'static, ConnHealthRows> {
+    let mut m = CONN_HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    if !CONN_HEALTH_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if let Ok(text) = std::fs::read_to_string(conn_health_path()) {
+            for row in conn_health_from_json(&text) {
+                if !m.iter().any(|(k, _, _)| *k == row.0) {
+                    m.push(row);
+                }
+            }
+        }
+    }
+    m
+}
 
 /// Record a real round trip for a session-only connector. `ok` picks the half; the other
 /// half is left exactly as it was.
@@ -12776,7 +13772,7 @@ fn note_conn_health(id: &'static str, ok: bool, detail: String) {
     let now = now_unix();
     // Poisoned-lock recovery, the conn_log pattern: a panicked command holding this must
     // not silently freeze the health panel for the rest of the session.
-    let mut m = CONN_HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = conn_health_lock();
     let slot = match m.iter_mut().find(|(k, _, _)| *k == id) {
         Some(s) => s,
         None => {
@@ -12789,12 +13785,17 @@ fn note_conn_health(id: &'static str, ok: bool, detail: String) {
     } else {
         slot.2 = Some((now, detail));
     }
+    let text = conn_health_to_json(&m);
+    drop(m);
+    // Persist every change: a push is rare enough that the write is free, and surviving
+    // the next launch is the row's whole value.
+    write_json_atomic(&conn_health_path(), &text);
 }
 
 /// Read one connector's session health back as `(last_success, last_failure_when,
 /// last_failure_detail)`.
 fn conn_health_of(id: &str) -> (Option<i64>, Option<i64>, Option<String>) {
-    let m = CONN_HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    let m = conn_health_lock();
     match m.iter().find(|(k, _, _)| *k == id) {
         Some((_, ok, fail)) => (
             *ok,
@@ -12935,12 +13936,14 @@ fn get_credentials_status(state: State<'_, SharedEngine>) -> Result<Vec<CredStat
                 st.clublog_upload,
                 st.eqsl_upload,
                 st.hrdlog_upload,
+                st.wrl_upload,
                 st.cloudlog_upload && !st.cloudlog_url.trim().is_empty(),
-            )
+            ),
         )
     };
-    let (qrz_book_on, clublog_on, eqsl_on, hrdlog_on, cloudlog_on) = toggles;
+    let (qrz_book_on, clublog_on, eqsl_on, hrdlog_on, wrl_on, cloudlog_on) = toggles;
     let (hrdlog_ok, hrdlog_fail, hrdlog_detail) = conn_health_of("hrdlog");
+    let (wrl_ok, wrl_fail, wrl_detail) = conn_health_of("wrl");
     let (cloudlog_ok, cloudlog_fail, cloudlog_detail) = conn_health_of("cloudlog");
     let has = |entry: Result<keyring::Entry, String>| {
         entry
@@ -13040,6 +14043,22 @@ fn get_credentials_status(state: State<'_, SharedEngine>) -> Result<Vec<CredStat
             paused: false,
         },
         CredStatus {
+            id: "wrl".into(),
+            connector: "World Radio League".into(),
+            stored: has(wrl_keychain()),
+            // The key covers the whole WRL account; nothing account-identifying is
+            // stored client-side, so no identity string to show.
+            identity: String::new(),
+            uploads: true,
+            enabled: wrl_on,
+            // Session-only, same honesty rule as HRDLog: no per-QSO stamp survives a
+            // restart, so this reads "not verified yet" until the next QSO.
+            last_success_unix: wrl_ok,
+            last_failure_unix: wrl_fail,
+            last_failure_detail: wrl_detail,
+            paused: false,
+        },
+        CredStatus {
             id: "cloudlog".into(),
             connector: "Cloudlog".into(),
             stored: has(cloudlog_keychain()),
@@ -13122,6 +14141,11 @@ fn cloudlog_keychain() -> Result<keyring::Entry, String> {
 fn hrdlog_keychain() -> Result<keyring::Entry, String> {
     keyring::Entry::new(LOTW_KEYCHAIN_SERVICE, HRDLOG_KEYCHAIN_USER)
         .map_err(|e| format!("couldn't open the system keychain: {e}"))
+}
+
+fn wrl_keychain() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(LOTW_KEYCHAIN_SERVICE, WRL_KEYCHAIN_USER)
+        .map_err(|e| format!("keychain unavailable: {e}"))
 }
 
 /// Delete a keychain entry idempotently — a missing entry counts as success
@@ -13293,6 +14317,7 @@ enum UploadToggle {
     Clublog,
     Eqsl,
     Hrdlog,
+    Wrl,
 }
 
 /// Flip a connector's auto-upload toggle (persisted) when its credential
@@ -13313,6 +14338,7 @@ fn set_upload_toggle(state: &State<'_, SharedEngine>, which: UploadToggle, on: b
                 UploadToggle::Clublog => ("ClubLog", s.clublog_upload),
                 UploadToggle::Eqsl => ("eQSL", s.eqsl_upload),
                 UploadToggle::Hrdlog => ("HRDLog.net", s.hrdlog_upload),
+                UploadToggle::Wrl => ("World Radio League", s.wrl_upload),
             }
         };
         if already == on {
@@ -13323,6 +14349,7 @@ fn set_upload_toggle(state: &State<'_, SharedEngine>, which: UploadToggle, on: b
             UploadToggle::Clublog => eng.set_upload_toggles(None, Some(on), None),
             UploadToggle::Eqsl => eng.set_upload_toggles(None, None, Some(on)),
             UploadToggle::Hrdlog => eng.set_hrdlog_upload(on),
+            UploadToggle::Wrl => eng.set_wrl_upload(on),
         };
         if let Err(e) = updated.save(&settings_path()) {
             eprintln!("tempo: couldn't persist settings: {e}");
@@ -13466,8 +14493,20 @@ fn download_lotw_report_impl(state: &SharedEngine) -> Result<LotwSyncResult, Str
     }; // `query` + `url` (both hold the password) dropped here
 
     if !tempo_core::lotw::is_lotw_adif(&body) {
+        // ⚠️ DO NOT BLAME THE CREDENTIALS HERE — the exact sibling of the eQSL guard below,
+        // and the same reasoning. `fetch_report` has already returned a body, so the login
+        // worked; a wrong password fails earlier with its own message. eQSL demonstrated the
+        // failure mode on 2026-08-28: it changed the wording its download opens with, the
+        // structural check started rejecting good files, and operators were told to re-enter
+        // passwords that were provably correct because their UPLOADS were still landing.
+        // LoTW can change its wording the same way, and it is the one that carries award
+        // credit, so it should not be the place we find this out again.
         return Err(
-            "LoTW returned an unexpected response — check your username/password.".to_string(),
+            "LoTW answered, but the download was not the report file it should have been. Your \
+             username and password are fine — this is not a login problem. LoTW may be \
+             returning an error page, or may be down for maintenance. Try again shortly, and \
+             if it keeps happening please report it."
+                .to_string(),
         );
     }
 
@@ -13738,11 +14777,12 @@ async fn download_eqsl_report(state: State<'_, SharedEngine>) -> Result<LotwSync
 }
 
 fn download_eqsl_report_impl(state: &SharedEngine) -> Result<LotwSyncResult, String> {
-    let (username, since) = {
+    let (username, qth_nickname, since) = {
         let eng = engine_lock(state);
         let s = eng.settings();
         (
             s.eqsl_username.trim().to_string(),
+            s.eqsl_qth_nickname.trim().to_string(),
             s.eqsl_last_sync.trim().to_string(),
         )
     };
@@ -13765,14 +14805,28 @@ fn download_eqsl_report_impl(state: &SharedEngine) -> Result<LotwSyncResult, Str
             username,
             password,
             rcvd_since: Some(since).filter(|s| !s.is_empty()),
+            // Required by eQSL for a multi-QTH callsign; empty = omitted, and a
+            // single-profile account's URL is byte-identical to before.
+            qth_nickname: Some(qth_nickname).filter(|n| !n.is_empty()),
         };
         let url = tempo_core::eqsl::build_inbox_url(&query);
         propagation::live::eqsl::fetch_inbox(&url)?
     }; // `query` + `url` (both hold the password) dropped here
 
     if !tempo_core::eqsl::is_eqsl_adif(&body) {
+        // ⚠️ DO NOT BLAME THE CREDENTIALS HERE. This point is only reached AFTER the fetch
+        // succeeded, so the login worked: a wrong password fails earlier, in `fetch_inbox`,
+        // with its own message. Saying "check your username/password" sent an operator to
+        // re-enter a password that was correct — reported 2026-08-28 by an operator whose
+        // uploads were landing in his eQSL Outbox (proving the credentials) while every sync
+        // returned this string. The real cause that day was eQSL changing the wording its
+        // download opens with, which `is_eqsl_adif` was matching on (#176).
         return Err(
-            "eQSL returned an unexpected response — check your username/password.".to_string(),
+            "eQSL answered, but the download was not the log file it should have been. Your \
+             username and password are fine — this is not a login problem. eQSL may be \
+             returning an error page, or may have changed the format again. Try once more in \
+             a few minutes, and if it keeps happening please report it."
+                .to_string(),
         );
     }
 
@@ -14100,9 +15154,12 @@ async fn qrz_lookup(
         if !hamqth_username.is_empty() {
             if let Ok(password) = hamqth_keychain()?.get_password() {
                 queried_any = true;
-                if let Some(dto) =
-                    hamqth_lookup_attempt(cand, &hamqth_username, &password, hamqth_session.inner())?
-                {
+                if let Some(dto) = hamqth_lookup_attempt(
+                    cand,
+                    &hamqth_username,
+                    &password,
+                    hamqth_session.inner(),
+                )? {
                     return Ok(dto);
                 }
                 // HamQTH was queried and answered — a genuine miss for THIS candidate. Only the
@@ -14335,10 +15392,19 @@ fn set_clublog_password(password: String, state: State<'_, SharedEngine>) -> Res
         eng.requeue_failed_clublog()
     };
     if requeued > 0 {
+        // Say it is PACED and roughly how long (#193). The catch-up can run for the best
+        // part of an hour at the far end of the 256-record cap, and an operator watching
+        // old contacts trickle out with no explanation is the report this line prevents.
+        let spacing = tempo_app::engine::CATCHUP_UPLOAD_SPACING_SECS;
+        let mins = (requeued as u64 * spacing as u64).div_ceil(60);
         conn_log(
             "ClubLog",
             "info",
-            format!("app-password saved — re-queued {requeued} un-uploaded QSO(s) for ClubLog"),
+            format!(
+                "app-password saved — re-queued {requeued} un-uploaded QSO(s) for ClubLog, \
+                 sending one every {spacing}s (about {mins} min) so the catch-up doesn't \
+                 look like a flood"
+            ),
         );
     }
     set_upload_toggle(&state, UploadToggle::Clublog, true);
@@ -14401,6 +15467,161 @@ fn clear_hrdlog_code(state: State<'_, SharedEngine>) -> Result<(), String> {
     r
 }
 
+/// Save the World Radio League API key (write-only, OS keychain) and resolve the
+/// destination logbook ONCE, so pushing stays configuration-free afterwards.
+///
+/// Validation happens at save — WRL gives us `GET /v1/me` for exactly this, so a
+/// mistyped key fails HERE with a clear message instead of on the first QSO. The
+/// logbook resolution follows the API's own guidance: the account default when one
+/// exists; else the account's single logbook; several with no default is a real
+/// ambiguity the operator resolves on the WRL site (we say so and refuse to guess).
+#[tauri::command]
+async fn set_wrl_key(key: String, state: State<'_, SharedEngine>) -> Result<(), String> {
+    let entry = wrl_keychain()?;
+    if key.is_empty() {
+        clear_keychain_entry(&entry)?;
+        conn_log("World Radio League", "info", "API key cleared from the OS keychain");
+        set_upload_toggle(&state, UploadToggle::Wrl, false);
+        return Ok(());
+    }
+    // Validate + resolve BEFORE saving, off the async executor (blocking HTTP).
+    let probe_key = key.clone();
+    let resolved = tauri::async_runtime::spawn_blocking(move || wrl_resolve_logbook(&probe_key))
+        .await
+        .map_err(|e| format!("validation task failed: {e}"))??;
+    entry
+        .set_password(&key)
+        .map_err(|e| format!("couldn't save to the system keychain: {e}"))?;
+    {
+        let mut eng = engine_lock(&state);
+        let updated = eng.set_wrl_logbook_id(resolved.as_deref().unwrap_or(""));
+        if let Err(e) = updated.save(&settings_path()) {
+            eprintln!("tempo: couldn't persist settings: {e}");
+        }
+    }
+    conn_log("World Radio League", "ok", "API key verified and saved to the OS keychain");
+    set_upload_toggle(&state, UploadToggle::Wrl, true);
+    Ok(())
+}
+
+/// `GET /v1/me` (key check) then, when the account has no default logbook, resolve a
+/// destination: the account's SINGLE logbook, or a clear error when there are several.
+/// Returns `Ok(None)` when the default logbook applies (omit `logbookId` per QSO).
+fn wrl_resolve_logbook(key: &str) -> Result<Option<String>, String> {
+    let (status, body) = propagation::live::wrl::get_json(tempo_core::wrl::WRL_ME_URL, key)?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| "World Radio League answered with something unreadable".to_string())?;
+    if status != 200 {
+        let code = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        return Err(match code {
+            "INVALID_KEY" | "MISSING_CREDENTIALS" => {
+                "That key was refused — check it against Integrations ▸ Developer API on \
+                 worldradioleague.com."
+                    .to_string()
+            }
+            "KEY_REVOKED" => "That key has been revoked — generate a new one on worldradioleague.com.".to_string(),
+            other => format!("World Radio League refused the key ({other})"),
+        });
+    }
+    let has_default = v
+        .get("data")
+        .and_then(|d| d.get("defaultLogbook"))
+        .and_then(|l| l.get("logbookId"))
+        .map(|id| !id.is_null())
+        .unwrap_or(false);
+    if has_default {
+        return Ok(None);
+    }
+    // No default: a single logbook is unambiguous; several is the operator's call.
+    let (status, body) =
+        propagation::live::wrl::get_json(tempo_core::wrl::WRL_LOGBOOKS_URL, key)?;
+    if status != 200 {
+        return Err("Couldn't list your World Radio League logbooks — try again.".to_string());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| "World Radio League answered with something unreadable".to_string())?;
+    let books = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    match books.len() {
+        1 => Ok(books[0].get("id").and_then(|i| i.as_str()).map(str::to_string)),
+        0 => Err("Your World Radio League account has no logbook yet — create one there first.".to_string()),
+        _ => Err(
+            "Your World Radio League account has several logbooks and no default — set a \
+             default logbook on worldradioleague.com, then save the key again."
+                .to_string(),
+        ),
+    }
+}
+
+/// Remove the stored World Radio League API key (idempotent); also turns WRL
+/// auto-upload off (no credential to push with).
+#[tauri::command(async)]
+fn clear_wrl_key(state: State<'_, SharedEngine>) -> Result<(), String> {
+    let r = clear_keychain_entry(&wrl_keychain()?);
+    if r.is_ok() {
+        conn_log("World Radio League", "info", "API key cleared from the OS keychain");
+        set_upload_toggle(&state, UploadToggle::Wrl, false);
+    }
+    r
+}
+
+/// Push one logged QSO to World Radio League (`POST /v1/contacts`).
+#[tauri::command]
+async fn wrl_push_qso(
+    record: LoggedQso,
+    state: State<'_, SharedEngine>,
+) -> Result<tempo_app::dto::WrlPushResultDto, String> {
+    let who = record.call.clone();
+    let engine = state.inner().clone();
+    let res = tauri::async_runtime::spawn_blocking(move || wrl_push_qso_impl(record, &engine))
+        .await
+        .map_err(|e| format!("upload task failed: {e}"))?;
+    let res = conn_logged(
+        "World Radio League",
+        |r| format!("pushed {} — {}", who, r.result),
+        res,
+    );
+    if let Ok(r) = &res {
+        note_conn_health(
+            "wrl",
+            matches!(r.result.as_str(), "accepted" | "duplicate"),
+            r.result.clone(),
+        );
+    }
+    res
+}
+
+fn wrl_push_qso_impl(
+    record: LoggedQso,
+    engine: &SharedEngine,
+) -> Result<tempo_app::dto::WrlPushResultDto, String> {
+    let (callsign, logbook_id) = {
+        let eng = engine_lock(engine);
+        let s = eng.settings();
+        (s.mycall.trim().to_string(), s.wrl_logbook_id.clone())
+    };
+    if callsign.is_empty() {
+        return Err("Set your station callsign in Settings first.".to_string());
+    }
+    let key = wrl_keychain()?
+        .get_password()
+        .map_err(|_| "No World Radio League API key stored — set it in Settings.".to_string())?;
+    let rec: tempo_core::logbook::QsoRecord = record.into();
+    let body = tempo_core::wrl::build_contact_json(
+        &rec,
+        &callsign,
+        (!logbook_id.is_empty()).then_some(logbook_id.as_str()),
+    );
+    // POST without the lock; the key rides the header — never logged.
+    let (status, resp) =
+        propagation::live::wrl::post_contact(tempo_core::wrl::WRL_CONTACTS_URL, &key, body)?;
+    let outcome = tempo_core::wrl::classify_response(status, &resp);
+    Ok(outcome.into())
+}
+
 /// Push one logged QSO to HRDLog.net (`NewEntry.aspx`). Resolves the station
 /// callsign (`mycall`) + the keychain upload code, uploads one ADIF record, and
 /// classifies the XML response. HRDLog.net is a live-logging/awards site — NOT an
@@ -14416,11 +15637,21 @@ async fn hrdlog_push_qso(
     let res = tauri::async_runtime::spawn_blocking(move || hrdlog_push_qso_impl(record, &engine))
         .await
         .map_err(|e| format!("upload task failed: {e}"))?;
-    conn_logged(
+    let res = conn_logged(
         "HRDLog.net",
         |r| format!("pushed {} — {}", who, r.result),
         res,
-    )
+    );
+    // A manual push is exactly as much evidence as an automatic one — and for HRDLog it is
+    // the evidence an operator reaches for when the row says "not verified yet".
+    if let Ok(r) = &res {
+        note_conn_health(
+            "hrdlog",
+            matches!(r.result.as_str(), "ok" | "duplicate"),
+            r.message.clone().unwrap_or_else(|| r.result.clone()),
+        );
+    }
+    res
 }
 
 fn hrdlog_push_qso_impl(
@@ -14588,9 +15819,13 @@ fn eqsl_push_qso_impl(record: LoggedQso, engine: &SharedEngine) -> Result<Upload
                 .to_string(),
         );
     }
-    let user = {
+    let (user, qth_nickname) = {
         let eng = engine_lock(&engine);
-        eng.settings().eqsl_username.trim().to_string()
+        let s = eng.settings();
+        (
+            s.eqsl_username.trim().to_string(),
+            s.eqsl_qth_nickname.trim().to_string(),
+        )
     };
     if user.is_empty() {
         return Err("Set your eQSL username in Settings first.".to_string());
@@ -14603,7 +15838,12 @@ fn eqsl_push_qso_impl(record: LoggedQso, engine: &SharedEngine) -> Result<Upload
 
     // Build + POST without the lock; the body carries the password — never logged.
     let resp = {
-        let body = tempo_core::eqsl::build_upload_body(&user, &password, &adif);
+        let body = tempo_core::eqsl::build_upload_body(
+            &user,
+            &password,
+            &adif,
+            (!qth_nickname.is_empty()).then_some(qth_nickname.as_str()),
+        );
         propagation::live::eqsl::post_form(tempo_core::eqsl::EQSL_IMPORT_URL, body)?
     }; // `body` (holds the password) dropped here
 
@@ -14742,7 +15982,10 @@ fn dxkeeper_push_async(host: String, base_port: u16, uploads: bool, adif: String
                 "ok",
                 // Deliberately not "logged" — we cannot know that. DXKeeper replies to
                 // nothing; its Server Log is the only place a rejection shows up.
-                format!("sent to {host}:{}", tempo_net::dxkeeper::port_for_base(base_port)),
+                format!(
+                    "sent to {host}:{}",
+                    tempo_net::dxkeeper::port_for_base(base_port)
+                ),
             ),
             Err(e) => conn_log("DXKeeper", "error", e),
         }
@@ -14788,6 +16031,7 @@ fn auto_push_one(
     clublog_on: bool,
     eqsl_on: bool,
     hrdlog_on: bool,
+    wrl_on: bool,
     n3fjp_on: bool,
     cloudlog_on: bool,
     owed: u8,
@@ -14805,7 +16049,7 @@ fn auto_push_one(
                 conn_log(
                     "QRZ Logbook",
                     if ok { "ok" } else { "error" },
-                    format!("auto-push {call} — {}", r.result),
+                    format!("auto-push QSO with {call} — {}", r.result),
                 );
                 let part = match r.result.as_str() {
                     "ok" => "QRZ ✓".to_string(),
@@ -14821,7 +16065,11 @@ fn auto_push_one(
                 (part, ok, false)
             }
             Err(e) => {
-                conn_log("QRZ Logbook", "error", format!("auto-push {call} — {e}"));
+                conn_log(
+                    "QRZ Logbook",
+                    "error",
+                    format!("auto-push QSO with {call} — {e}"),
+                );
                 (format!("QRZ ✗ {e}"), false, true) // transport error → retry
             }
         };
@@ -14838,7 +16086,7 @@ fn auto_push_one(
                 conn_log(
                     "ClubLog",
                     if ok { "ok" } else { "error" },
-                    format!("auto-push {call} — {}", r.result),
+                    format!("auto-push QSO with {call} — {}", r.result),
                 );
                 let part = match r.result.as_str() {
                     "ok" | "modified" => "ClubLog ✓".to_string(),
@@ -14851,7 +16099,11 @@ fn auto_push_one(
                 (part, ok, r.result.as_str() == "serverError")
             }
             Err(e) => {
-                conn_log("ClubLog", "error", format!("auto-push {call} — {e}"));
+                conn_log(
+                    "ClubLog",
+                    "error",
+                    format!("auto-push QSO with {call} — {e}"),
+                );
                 (format!("ClubLog ✗ {e}"), false, true)
             }
         };
@@ -14868,7 +16120,7 @@ fn auto_push_one(
                 conn_log(
                     "HRDLog.net",
                     if ok { "ok" } else { "error" },
-                    format!("auto-push {call} — {}", r.result),
+                    format!("auto-push QSO with {call} — {}", r.result),
                 );
                 // HRDLog.net is a live-logging/awards site — never DXCC/WAS credit.
                 let part = match r.result.as_str() {
@@ -14882,7 +16134,11 @@ fn auto_push_one(
                 (part, ok, r.result.as_str() == "unknown")
             }
             Err(e) => {
-                conn_log("HRDLog.net", "error", format!("auto-push {call} — {e}"));
+                conn_log(
+                    "HRDLog.net",
+                    "error",
+                    format!("auto-push QSO with {call} — {e}"),
+                );
                 (format!("HRDLog ✗ {e}"), false, true)
             }
         };
@@ -14902,7 +16158,7 @@ fn auto_push_one(
                 conn_log(
                     "eQSL",
                     if ok { "ok" } else { "error" },
-                    format!("auto-push {call} — {}", r.outcome),
+                    format!("auto-push QSO with {call} — {}", r.outcome),
                 );
                 let part = match r.outcome.as_str() {
                     "accepted" => "eQSL ✓".to_string(),
@@ -14921,7 +16177,7 @@ fn auto_push_one(
                 (part, ok, r.outcome.as_str() == "retry")
             }
             Err(e) => {
-                conn_log("eQSL", "error", format!("auto-push {call} — {e}"));
+                conn_log("eQSL", "error", format!("auto-push QSO with {call} — {e}"));
                 (format!("eQSL ✗ {e}"), false, true)
             }
         };
@@ -14929,6 +16185,42 @@ fn auto_push_one(
         all_ok &= ok;
         if transient {
             failed |= legs::EQSL;
+        }
+    }
+    if wrl_on && owed & legs::WRL != 0 {
+        let (part, ok, transient) = match wrl_push_qso_impl(dto.clone(), engine) {
+            Ok(r) => {
+                let ok = matches!(r.result.as_str(), "accepted" | "duplicate");
+                conn_log(
+                    "World Radio League",
+                    if ok { "ok" } else { "error" },
+                    format!("auto-push QSO with {call} — {}", r.result),
+                );
+                let part = match r.result.as_str() {
+                    "accepted" => "WRL ✓".to_string(),
+                    "duplicate" => "WRL dup".to_string(),
+                    "authFail" => "WRL ✗ key invalid — check Settings".to_string(),
+                    // "pending" = rate limit / server trouble → the record is fine,
+                    // the moment was not; retry.
+                    "pending" => "WRL ✗ busy".to_string(),
+                    _ => "WRL ✗ rejected".to_string(),
+                };
+                (part, ok, r.result.as_str() == "pending")
+            }
+            Err(e) => {
+                conn_log(
+                    "World Radio League",
+                    "error",
+                    format!("auto-push QSO with {call} — {e}"),
+                );
+                (format!("WRL ✗ {e}"), false, true)
+            }
+        };
+        note_conn_health("wrl", ok, part.clone());
+        parts.push(part);
+        all_ok &= ok;
+        if transient {
+            failed |= legs::WRL;
         }
     }
     if n3fjp_on && owed & legs::N3FJP != 0 {
@@ -15061,6 +16353,301 @@ fn get_ota_spots(
         .collect())
 }
 
+/// One activator, placed, for the Connect map's parks-and-summits layer.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OtaMapSpot {
+    program: String,
+    reference: String,
+    name: String,
+    activator: String,
+    freq_mhz: f64,
+    mode: String,
+    lat: f64,
+    lon: f64,
+    /// Placed by grid square (~4 km) rather than the feed's own coordinates.
+    approx: bool,
+    age_secs: i64,
+    /// This reference has never been logged — a new park for the hunter.
+    new_ref: bool,
+}
+
+/// How long a cached activator list serves the map before it is refetched. The map
+/// polls faster than this on purpose: the TTL, not the poll, decides how often
+/// anyone's API is actually hit, so opening Connect and the POTA board at once
+/// still costs one request.
+const OTA_MAP_TTL_SECS: i64 = 120;
+
+/// Build the Connect TV page's payload from the caches the app already keeps.
+///
+/// This is the ENTIRE data path of the LAN page: the serve thread holds this closure
+/// and nothing else, so there is no route from an inbound request to a setter, to
+/// CAT, or to the transmit path.
+///
+/// ⚠️ What goes in is deliberate. The propagation nowcast is public weather; the
+/// callsign and grid are on every QSO the station makes anyway. The dial frequency,
+/// the log and the needs board are NOT here and must not be added — that is what the
+/// station is doing, which is a different thing from what the ionosphere is doing,
+/// and only the second is what a wall display is for. A payload-shape test in
+/// `tempo_app::connect_web` fails if a field like that appears.
+///
+/// `None` before the first propagation snapshot exists, which the page renders as
+/// "waiting" rather than as a quiet band plan.
+fn build_connect_board(
+    engine: &SharedEngine,
+    prop: &PropCache,
+    kp: &KpForecastCache,
+) -> Option<tempo_app::connect_web::ConnectBoardData> {
+    use tempo_app::connect_web::{ConnectBand, ConnectBoardData, ConnectOpening};
+    // One bounded clone under each lock; everything else is built off-lock.
+    let snap = prop.lock().ok()?.as_ref().map(|(_, p)| p.clone())?;
+    let (call, grid) = {
+        let e = engine_lock(engine);
+        let s = e.settings();
+        (s.mycall.clone(), s.mygrid.clone())
+    };
+    // The forecast is best-effort: the page simply omits the line when we have none,
+    // rather than showing a peak of zero, which would read as "quiet" — a forecast we
+    // do not have.
+    let peak = kp
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, f)| f.clone()))
+        .and_then(|f| f.peak_ahead().cloned());
+    Some(ConnectBoardData {
+        call,
+        grid,
+        headline: snap.advisory.headline.clone(),
+        banners: snap.advisory.banners.clone(),
+        bands: snap
+            .advisory
+            .bands
+            .iter()
+            .map(|b| ConnectBand {
+                band: b.band.clone(),
+                tier: format!("{:?}", b.tier),
+                modeled: b.modeled.clone(),
+                stations: b.n_i_hear.saturating_add(b.n_hear_me),
+                reason: b.reason.clone(),
+            })
+            .collect(),
+        openings: snap
+            .openings
+            .iter()
+            .map(|o| ConnectOpening {
+                band: o.band.clone(),
+                mode: o.mode.clone(),
+                octant: o.octant.clone(),
+                stations: o.stations,
+                confidence: o.confidence.clone(),
+                is_new: o.is_new,
+            })
+            .collect(),
+        sfi: snap.space_wx.sfi,
+        kp: snap.space_wx.kp,
+        a_index: snap.space_wx.a_index,
+        xray_class: snap.space_wx.xray_class.clone(),
+        insights: snap.insights.iter().map(|i| i.plain.clone()).collect(),
+        kp_peak_ahead: peak.as_ref().map(|p| p.kp),
+        kp_peak_unix: peak.as_ref().map(|p| p.time_unix),
+        source: snap.source.clone(),
+        as_of_unix: snap.as_of,
+    })
+}
+
+/// The app handle the TV page's closures read at call time. Set once in `.setup()`;
+/// before that, assets resolve to `None` (→ the summary page) and RPCs error.
+static TV_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// One bundled frontend file, from the SAME embedded assets the desktop webview
+/// loads — nothing is read from disk and nothing can differ from the shipped UI.
+fn tv_asset(path: &str) -> Option<(Vec<u8>, String)> {
+    let app = TV_APP.get()?;
+    let resolver = app.asset_resolver();
+    let asset = resolver
+        .get(format!("/{path}"))
+        .or_else(|| resolver.get(path.to_string()))?;
+    Some((asset.bytes, asset.mime_type))
+}
+
+/// The read-only RPC dispatcher behind the TV page.
+///
+/// ⚠️ EVERY ARM IS HAND-WRITTEN — there is deliberately no generic "invoke any
+/// command" bridge, so what the LAN can reach is this list and nothing else, even if
+/// the allowlist check upstream were wrong. The allowlist in
+/// `tempo_app::connect_web::RPC_ALLOWLIST` gates first (and its tests prove a name
+/// off the list never reaches here); this match is defence in depth, and its
+/// `_` arm refuses.
+fn tv_rpc(cmd: &str, args: &str) -> tempo_app::connect_web::RpcOutcome {
+    use tempo_app::connect_web::RpcOutcome as O;
+    let Some(app) = TV_APP.get() else {
+        return O::Err("still starting up".into());
+    };
+    if !tempo_app::connect_web::RPC_ALLOWLIST.contains(&cmd) {
+        return O::NotAllowed;
+    }
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+    fn ok<T: serde::Serialize>(r: Result<T, String>) -> O {
+        match r {
+            Ok(t) => match serde_json::to_string(&t) {
+                Ok(body) => O::Ok(body),
+                Err(e) => O::Err(e.to_string()),
+            },
+            Err(e) => O::Err(e),
+        }
+    }
+    tauri::async_runtime::block_on(async {
+        match cmd {
+            "get_propagation" => ok(get_propagation(
+                app.state(),
+                app.state(),
+                app.state(),
+                app.state(),
+                app.state(),
+                app.state(),
+                app.state(),
+            )
+            .await),
+            "get_kc2g_muf" => ok(get_kc2g_muf(app.state()).await),
+            "get_space_wx_scales" => ok(get_space_wx_scales(app.state()).await),
+            "get_xray_now" => ok(get_xray_now().await),
+            "get_aurora" => ok(get_aurora(app.state()).await),
+            "get_pca" => ok(get_pca(app.state(), app.state()).await),
+            "get_satellites" => ok(get_satellites(app.state()).await),
+            "get_ota_map_spots" => ok(get_ota_map_spots(app.state(), app.state())),
+            "get_kp_forecast" => ok(get_kp_forecast(app.state()).await),
+            "get_band_outlook" => ok(get_band_outlook(app.state(), app.state()).await),
+            "get_path_outlook" => {
+                let grid = v.get("grid").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                ok(get_path_outlook(grid, app.state(), app.state()).await)
+            }
+            "get_getting_out" => ok(get_getting_out(app.state(), app.state()).await),
+            "get_dxped_windows" => {
+                let days = v.get("days").and_then(|x| x.as_u64()).map(|d| d as u32);
+                ok(get_dxped_windows(app.state(), app.state(), days).await)
+            }
+            "get_openings_log" => ok(Ok::<_, String>(get_openings_log())),
+            "get_declination" => ok(get_declination(app.state())),
+            // Callsign + grid ONLY — built by hand so the TV page never needs
+            // get_settings, which carries every knob the station has.
+            "tv_station" => {
+                let st = app.state::<SharedEngine>();
+                let eng = engine_lock(&st);
+                let s = eng.settings();
+                ok(Ok::<_, String>(serde_json::json!({
+                    "call": s.mycall,
+                    "grid": s.mygrid,
+                })))
+            }
+            // Allowlisted upstream but unhandled here = a wiring bug, not a browser
+            // asking for too much. Refuse rather than guess.
+            _ => O::Err(format!("'{cmd}' is allowlisted but has no dispatch arm")),
+        }
+    })
+}
+
+/// What the Settings row shows for the Connect web page: running?, the port, the URL
+/// to type into the TV, and the last bind error if it is not running.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectWebStatusDto {
+    running: bool,
+    port: u16,
+    url: String,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn connect_web_status(state: State<'_, SharedConnectWebState>) -> ConnectWebStatusDto {
+    let st = state.lock().unwrap_or_else(|e| e.into_inner());
+    let url = if st.running {
+        let host = lan_ip_hint().unwrap_or_else(|| "this-computer".to_string());
+        format!("http://{host}:{}", st.port)
+    } else {
+        String::new()
+    };
+    ConnectWebStatusDto {
+        running: st.running,
+        port: st.port,
+        url,
+        error: st.error.clone(),
+    }
+}
+
+/// Where a park goes on the map: the feed's own coordinates when it has them, else
+/// the grid square's centre, else nowhere.
+///
+/// Split out from the command so the fallback is testable — it is the part with a
+/// real decision in it. `approx` is the second case and must be reported, because a
+/// grid places a park only to ~4 km and a marker claiming more precision than it has
+/// is a lie the operator cannot see.
+fn place_ota(sp: &propagation::OtaSpot) -> Option<(f64, f64, bool)> {
+    match (sp.lat, sp.lon) {
+        (Some(la), Some(lo)) => Some((la, lo, false)),
+        _ => {
+            let (la, lo) = propagation::geo::maidenhead_to_latlon(sp.grid.as_deref()?)?;
+            Some((la, lo, true))
+        }
+    }
+}
+
+/// Activators for the map layer. Serves the shared cache when it is fresh and
+/// fetches only when it is not, so this can be polled from a view without adding
+/// load to the POTA feed.
+///
+/// POTA only, deliberately. A SOTA spot carries no position — its payload has an
+/// association and summit code and nothing else — so a summit cannot be plotted
+/// from that feed without a second lookup against a different endpoint.
+#[tauri::command(async)]
+fn get_ota_map_spots(
+    state: State<'_, SharedEngine>,
+    ota_cache: State<'_, SharedOtaSpots>,
+) -> Result<Vec<OtaMapSpot>, String> {
+    let now = now_unix();
+    let cached = ota_cache.lock().ok().and_then(|c| {
+        c.get("POTA")
+            .filter(|(stamp, _)| now.saturating_sub(*stamp) <= OTA_MAP_TTL_SECS)
+            .map(|(_, v)| v.clone())
+    });
+    let spots = match cached {
+        Some(v) => v,
+        None => {
+            let fresh = propagation::live::pota::fetch_pota_spots()?;
+            if let Ok(mut c) = ota_cache.lock() {
+                c.insert("POTA".into(), (now, fresh.clone()));
+            }
+            fresh
+        }
+    };
+    let worked: std::collections::HashSet<String> = {
+        let eng = engine_lock(&state);
+        spots
+            .iter()
+            .filter(|sp| eng.park_worked(&sp.reference))
+            .map(|sp| sp.reference.to_uppercase())
+            .collect()
+    };
+    Ok(spots
+        .into_iter()
+        .filter_map(|sp| {
+            let (lat, lon, approx) = place_ota(&sp)?;
+            Some(OtaMapSpot {
+                new_ref: !worked.contains(&sp.reference.to_uppercase()),
+                age_secs: sp.spot_time_unix.map(|t| now.saturating_sub(t)).unwrap_or(0),
+                program: sp.program,
+                reference: sp.reference,
+                name: sp.name,
+                activator: sp.activator,
+                freq_mhz: sp.freq_khz / 1000.0,
+                mode: sp.mode,
+                lat,
+                lon,
+                approx,
+            })
+        })
+        .collect())
+}
+
 /// One-click hunt: remember the activator + park so the next QSO logged with
 /// that call auto-tags SIG/SIG_INFO (the hunter-side ADIF credit).
 #[tauri::command(async)]
@@ -15075,8 +16662,11 @@ fn set_hunt_target(
     Ok(eng.snapshot())
 }
 
-/// Log a Field Day contact from the CW/Phone cockpits (all-mode FD). `mode` =
-/// "CW" | "PH". Err when FD mode is off; Ok(false) = band+mode dupe.
+/// Log a Field Day contact from the CW/Phone/PSK/RTTY cockpits (all-mode FD).
+/// `mode` = the scoring class "CW" | "PH" | "DIG"; `submode` names the mode that
+/// was actually on the air behind a "DIG" class (RTTY, PSK31…) so the export
+/// emits it instead of the FT tier `current_submode` happens to hold. Err when
+/// FD mode is off; Ok(false) = band+mode dupe.
 #[tauri::command(async)]
 fn fd_log_manual(
     state: State<'_, SharedEngine>,
@@ -15084,13 +16674,89 @@ fn fd_log_manual(
     class: String,
     section: String,
     mode: String,
+    submode: Option<String>,
 ) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
-    let logged = eng.fd_log_manual(&call, &class, &section, &mode)?;
+    let logged = match submode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sub) => eng.fd_log_manual_submode(&call, &class, &section, &mode, sub)?,
+        None => eng.fd_log_manual(&call, &class, &section, &mode)?,
+    };
     if !logged {
         return Err(format!("{call} is a dupe on this band/mode"));
     }
     Ok(eng.snapshot())
+}
+
+/// One club event heard on the LAN by [`fd_discover_events`].
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FdEventBeacon {
+    event: String,
+    call: String,
+    /// `ip:port`, ready to drop into the join-address field.
+    host: String,
+}
+
+/// Listen ~2 s for club-sync host beacons — the "Find club events" button.
+/// Empty = nothing announcing on this segment (or the Wi-Fi eats broadcast;
+/// the manual host:port field always remains).
+#[tauri::command(async)]
+fn fd_discover_events() -> Result<Vec<FdEventBeacon>, String> {
+    tempo_net::fdsync::discover(2)
+        .map(|found| {
+            found
+                .into_iter()
+                .map(|b| FdEventBeacon {
+                    event: b.event,
+                    call: b.call,
+                    host: b.host,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Export the merged CLUB log from the host, deduped earliest-wins by
+/// `(call, band, mode class)`. `format` = "cabrillo" | "adif". Err when this
+/// instance is not hosting (positions export their own log as before).
+#[tauri::command(async)]
+fn fd_club_export(state: State<'_, SharedEngine>, format: String) -> Result<String, String> {
+    let eng = engine_lock(&state);
+    eng.fd_club_export(format == "cabrillo")
+        .ok_or_else(|| "this station is not hosting a club event".to_string())
+}
+
+/// Best-effort LAN IP via the UDP-connect trick: no packet is sent — connect()
+/// on a datagram socket just resolves the route, so `local_addr` answers even
+/// on an offline site LAN. `None` = no route at all; the Settings row words
+/// the URL around a placeholder instead.
+fn lan_ip_hint() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("10.254.254.254:1").ok()?;
+    Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+/// What the Settings row shows for the spectator scoreboard: running?, the
+/// URL a TV on the LAN should open, the last bind error.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FdScoreboardStatusDto {
+    running: bool,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+#[tauri::command(async)]
+fn fd_scoreboard_status(state: State<'_, SharedFdBoardState>) -> FdScoreboardStatusDto {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    FdScoreboardStatusDto {
+        running: s.running,
+        url: s.running.then(|| {
+            let host = lan_ip_hint().unwrap_or_else(|| "<this computer's IP>".to_string());
+            format!("http://{host}:{}/scoreboard", s.port)
+        }),
+        error: s.error.clone(),
+    }
 }
 
 #[tauri::command(async)]
@@ -15784,42 +17450,255 @@ fn qsy_stop(state: State<'_, SharedEngine>) -> Result<AppSnapshot, String> {
     Ok(eng.snapshot())
 }
 
+/// A CAT-broker listener bind that FAILED, remembered so the manager thread can wait instead
+/// of hammering (#165). Without it `running` stayed `None`, the manager's `want != have` test
+/// stayed true, and the bind + its error log re-ran on every 1 Hz tick forever.
+struct BrokerBindFailure {
+    port: u16,
+    attempts: u32,
+    retry_at: std::time::Instant,
+}
+
+/// How long to wait before re-attempting a bind that failed: 2 s, 4 s, 8 s … capped at a
+/// minute. A port conflict is usually permanent for the session (the operator's own rigctld
+/// owns 4532), so the retry exists to catch the case where the other program exits — it does
+/// not need to be quick, and it must never be a busy loop.
+fn broker_bind_backoff(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.saturating_pow(attempts.clamp(1, 6)).min(60))
+}
+
+/// May the manager attempt to bind `port` right now? A record for a DIFFERENT port never
+/// holds one back — moving the broker to a free port is the operator's fix for this, and it
+/// must take effect on the next tick.
+fn broker_may_attempt(
+    failure: Option<&BrokerBindFailure>,
+    port: u16,
+    now: std::time::Instant,
+) -> bool {
+    match failure {
+        Some(f) if f.port == port => now >= f.retry_at,
+        _ => true,
+    }
+}
+
+/// Record a failed bind and schedule the retry. Returns true only for the FIRST failure on a
+/// port — the one that earns a connection-log line. Everything after it is the same failure
+/// still failing, and saying so once a second is the defect, not the report.
+fn broker_record_failure(
+    failure: &mut Option<BrokerBindFailure>,
+    port: u16,
+    now: std::time::Instant,
+) -> bool {
+    match failure {
+        Some(f) if f.port == port => {
+            f.attempts = f.attempts.saturating_add(1);
+            f.retry_at = now + broker_bind_backoff(f.attempts);
+            false
+        }
+        _ => {
+            *failure = Some(BrokerBindFailure {
+                port,
+                attempts: 1,
+                retry_at: now + broker_bind_backoff(1),
+            });
+            true
+        }
+    }
+}
+
+/// A CAT mode word reduced to what distinguishes one EMISSION from another (#140).
+///
+/// The broker has to answer "did you set what I asked?" honestly, and that is not string
+/// equality. `PKTUSB`, `DATA-U` and `USB-D` are one mode under three vendors' names, while
+/// `USB` and `PKTUSB` are two modes that differ in where the rig takes its transmit audio —
+/// on the air, the difference between a voice signal and a data signal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CatMode {
+    family: CatFamily,
+    /// `Some(true)` = LSB side, `Some(false)` = USB side, `None` = the word names no side.
+    ///
+    /// `None` for CW and RTTY on purpose: `CW`/`CWR` and `RTTY`/`RTTYR` differ in which side
+    /// of the carrier the rig's BFO sits, which changes the pitch a listener hears and not the
+    /// emission — a client that asked for CW and got CW-L got CW. `None` also for a bare
+    /// `DATA`, which names a family and leaves the side to us.
+    lsb: Option<bool>,
+}
+
+/// The mode CLASS — what the rig is doing, as opposed to which side of the carrier it does it
+/// on. This is the axis a foreign client may NOT move: it belongs to the operator's section.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CatFamily {
+    /// Plain SSB — transmit audio from the mic.
+    Ssb,
+    /// An SSB-side DATA submode (Yaesu DATA-U/L, Icom USB-D, Kenwood DATA) — transmit audio
+    /// from the USB codec, which is what makes a soundcard mode radiate at all.
+    Data,
+    /// The FM data submode (`PKTFM`) — packet/SSTV on an FM channel.
+    DataFm,
+    Cw,
+    Rtty,
+    Am,
+    Fm,
+}
+
+impl CatMode {
+    /// Does the mode Nexus is COMMANDING deliver what this request asked for?
+    fn satisfied_by(self, commanded: CatMode) -> bool {
+        self.family == commanded.family && (self.lsb.is_none() || self.lsb == commanded.lsb)
+    }
+
+    /// The `settings.sideband` word that would move this request's side — `None` when the
+    /// request names no side, or when the family does not ride the sideband at all (CW, RTTY,
+    /// AM and FM are commanded by the section, not by which sideband is selected).
+    fn sideband_word(self) -> Option<&'static str> {
+        match (self.family, self.lsb) {
+            (CatFamily::Ssb | CatFamily::Data, Some(true)) => Some("LSB"),
+            (CatFamily::Ssb | CatFamily::Data, Some(false)) => Some("USB"),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a CAT mode word — Hamlib's vocabulary plus the vendor spellings clients actually
+/// send. `None` for anything unrecognised, which the broker reports as a refusal: a word we
+/// cannot place is a word we cannot promise to have set.
+fn parse_cat_mode(word: &str) -> Option<CatMode> {
+    // Fold the punctuation vendors disagree about: DATA-U / DATA_U / "DATA U" are one word.
+    let up: String = word
+        .trim()
+        .to_ascii_uppercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let m = |family, lsb| Some(CatMode { family, lsb });
+    match up.as_str() {
+        "USB" => m(CatFamily::Ssb, Some(false)),
+        "LSB" => m(CatFamily::Ssb, Some(true)),
+        "PKTUSB" | "PKTU" | "DATAU" | "DATAUSB" | "USBD" | "DIGU" => {
+            m(CatFamily::Data, Some(false))
+        }
+        "PKTLSB" | "PKTL" | "DATAL" | "DATALSB" | "LSBD" | "DIGL" => m(CatFamily::Data, Some(true)),
+        // A family with no side named — honoured by whichever side we are already on.
+        "PKT" | "DATA" | "DIG" => m(CatFamily::Data, None),
+        "PKTFM" | "DATAFM" | "FMD" => m(CatFamily::DataFm, None),
+        "CW" | "CWU" | "CWR" | "CWL" => m(CatFamily::Cw, None),
+        "RTTY" | "RTTYR" | "RTTYL" | "FSK" | "FSKR" => m(CatFamily::Rtty, None),
+        "AM" => m(CatFamily::Am, None),
+        "FM" | "FMN" | "NFM" => m(CatFamily::Fm, None),
+        _ => None,
+    }
+}
+
+/// True the first time this exact refusal is seen, recording it — the de-dup behind the
+/// broker's connection-log lines. A client that retries on a timer says the same thing over
+/// and over, and the operator needs to read it once.
+fn refusal_is_new(slot: &Mutex<Option<String>>, line: &str) -> bool {
+    let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() == Some(line) {
+        return false;
+    }
+    *last = Some(line.to_string());
+    true
+}
+
+/// Forget the last refusal, so the NEXT one is reported even if it repeats an old line.
+fn clear_refusal(slot: &Mutex<Option<String>>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Bridges the CAT broker (rigctld server) to Nexus's live engine: other apps read
 /// the dial/mode/PTT and can retune Nexus. CAT-sharing (freq/mode) is always on;
 /// foreign PTT is ARBITRATED (Engine::broker_ptt): allowed only behind the
 /// cat_broker_ptt opt-in, with TX enabled/legal and Nexus idle — Nexus's own key
 /// always wins, and un-key is always honored.
 #[cfg(feature = "radio")]
-struct EngineRig(SharedEngine);
+struct EngineRig {
+    engine: SharedEngine,
+    /// The last mode refusal and the last PTT refusal we WROTE to the connection log.
+    /// A client that re-sends `M` or `T 1` on a timer would otherwise fill the log at its own
+    /// poll rate — the same 1 Hz spam the bind retry used to produce (#165). Only a refusal
+    /// that says something NEW gets a line; a grant clears the slot, so the next one is
+    /// reported again.
+    last_mode_refusal: Mutex<Option<String>>,
+    last_ptt_refusal: Mutex<Option<String>>,
+}
+
+#[cfg(feature = "radio")]
+impl EngineRig {
+    fn new(engine: SharedEngine) -> Self {
+        Self {
+            engine,
+            last_mode_refusal: Mutex::new(None),
+            last_ptt_refusal: Mutex::new(None),
+        }
+    }
+
+    /// Say — once per distinct refusal — that a client asked for a mode this radio is not in.
+    /// The client already has its `RPRT -1`; this is the operator's half, because "my logger
+    /// cannot put Nexus in DATA" left no trace anywhere in the app before it.
+    fn refuse_mode(&self, asked: &str, commanded: &str) {
+        let line = format!(
+            "refused mode {asked}: this radio is in {commanded}. \
+             The mode follows the section you are operating in — change it in Nexus, not over CAT."
+        );
+        if refusal_is_new(&self.last_mode_refusal, &line) {
+            conn_log("CAT broker", "error", line);
+        }
+    }
+}
 
 #[cfg(feature = "radio")]
 impl tempo_audio::rigctld_server::RigBackend for EngineRig {
+    fn send_voice_mem(&self, ch: u32) -> Option<bool> {
+        // Queue for the radio loop; RPRT 0 = accepted by Nexus, the broker's whole
+        // write-surface contract. The RIG transmits the message itself (a front-panel PB
+        // press over the wire) and a backend refusal is surfaced on the CAT diagnostics,
+        // exactly like a rejected send_morse.
+        engine_lock(&self.engine).request_voice_mem(ch);
+        Some(true)
+    }
+    fn stop_voice_mem(&self) -> Option<bool> {
+        engine_lock(&self.engine).request_voice_mem_stop();
+        Some(true)
+    }
+
     fn freq_hz(&self) -> u64 {
-        (engine_lock(&self.0).settings().dial_mhz * 1_000_000.0).round() as u64
+        (engine_lock(&self.engine).settings().dial_mhz * 1_000_000.0).round() as u64
     }
     fn mode(&self) -> (String, u32) {
-        // Report the CAT mode to a foreign app sharing the radio. When Nexus sets
-        // the mode, report that; when it's obeying the radio (rig_mode empty),
-        // best-effort report the sideband.
+        // Report the mode the radio was actually COMMANDED — `rig_mode_effective`, the same
+        // write-side canon `set_mode` judges a request against, so the answer to `m` and the
+        // answer to `M` can never describe different radios.
+        //
+        // ⚠️ IT USED TO ANSWER `settings.rig_mode()`, WHICH IS THE SECTION POLICY, NOT THE
+        // RADIO (#140, readback lane). The two agree in the ordinary case and part company
+        // exactly where it matters: an APRS or FM-channel park, and an SSTV image in flight,
+        // all command something the band/section policy would not have chosen (FM or the FM
+        // data submode). A client was then told a mode the rig was not in — the same broken
+        // promise as answering RPRT 0 for a mode we never set, pointed the other way.
+        //
+        // The sideband fallback is kept for the case the canon has nothing to say.
         let m = {
-            let e = engine_lock(&self.0);
-            let s = e.settings();
-            let rm = s.rig_mode();
-            if !rm.is_empty() {
-                rm
-            } else if s.sideband.trim().is_empty() {
-                "USB".into()
+            let e = engine_lock(&self.engine);
+            let commanded = e.rig_mode_effective();
+            if !commanded.trim().is_empty() {
+                commanded
             } else {
-                s.sideband.clone()
+                let s = e.settings();
+                if s.sideband.trim().is_empty() {
+                    "USB".into()
+                } else {
+                    s.sideband.clone()
+                }
             }
         };
         (m, 2700)
     }
     fn ptt(&self) -> bool {
-        engine_lock(&self.0).snapshot().radio.transmitting
+        engine_lock(&self.engine).snapshot().radio.transmitting
     }
     fn set_freq(&self, hz: u64) -> bool {
-        let mut e = engine_lock(&self.0);
+        let mut e = engine_lock(&self.engine);
         let mhz = hz as f64 / 1_000_000.0;
         // Derive the band label from the freq; keep the current band if off-plan.
         let band = propagation::model::Band::from_mhz(mhz)
@@ -15836,23 +17715,65 @@ impl tempo_audio::rigctld_server::RigBackend for EngineRig {
         e.set_frequency(mhz, &band, &mode);
         true
     }
+    /// Set the mode a foreign client asked for — or say honestly that we did not (#140).
+    ///
+    /// ⚠️ THE OLD BEHAVIOUR WAS A FALSE SUCCESS, and a false success on a mode is how a data
+    /// signal ends up in a voice emission. Every word that was not LSB or FM was collapsed to
+    /// plain USB and answered `RPRT 0`, so VarAC or FreeDV asking for `PKTUSB`/`DATA-U` was
+    /// told "done" while the rig sat in SSB. The reporter's frequency control worked and the
+    /// mode-to-DATA silently did not.
+    ///
+    /// What the broker may change, and it is deliberately narrow: **the sideband SIDE, inside
+    /// the mode family the operator's own section already put the rig in.** The section (Phone
+    /// / Digital / CW / RTTY) is the operator's choice and drives the whole TX chain — routing,
+    /// power caps, the audio path — so a foreign `M` is not allowed to move it. Anything else
+    /// is `RPRT -1` plus one connection-log line naming what was asked and what this radio is
+    /// actually in, because "my logger cannot set DATA" needs a trace somewhere in the app.
+    ///
+    /// The comparison is against [`Engine::rig_mode_effective`] — the write-side canon for the
+    /// rig's own `M` verb, i.e. the mode the radio is really in — read back AFTER any change,
+    /// so a side the section refuses (Phone's below-10-MHz LSB convention, say) is reported as
+    /// the refusal it is rather than assumed to have landed.
+    ///
+    /// ⚠️ NEEDS-BENCH. Unit-tested only; there is no rig on this box. Bench list: WSJT-X and
+    /// VarAC asking `PKTUSB` with Nexus in Digital (must set and answer `RPRT 0`) and with
+    /// Nexus in Phone (must answer `RPRT -1` and log one line); a client's `M LSB` on 40 m
+    /// Phone; and that a refused `M` leaves the rig where it was. Same pass covers the
+    /// READBACK half ([`RigBackend::mode`]): a client's `m` on a 2 m FM channel, during an
+    /// APRS park and with an SSTV image in flight must each name the mode the rig is really
+    /// in — those three are exactly where the old answer diverged.
     fn set_mode(&self, mode: &str, _passband_hz: u32) -> bool {
-        let mut e = engine_lock(&self.0);
-        let (mhz, band) = {
-            let s = e.settings();
-            (s.dial_mhz, s.band.clone())
-        };
-        // Collapse data submodes (PKTUSB/DATA-U/FT8/…) to the underlying sideband.
-        let up = mode.to_ascii_uppercase();
-        let sb = if up.contains("LSB") {
-            "LSB"
-        } else if up == "FM" {
-            "FM"
-        } else {
-            "USB"
-        };
-        e.set_frequency(mhz, &band, sb);
-        true
+        let mut e = engine_lock(&self.engine);
+        let commanded = e.rig_mode_effective();
+        if let (Some(req), Some(cur)) = (parse_cat_mode(mode), parse_cat_mode(&commanded)) {
+            if req.satisfied_by(cur) {
+                drop(e);
+                clear_refusal(&self.last_mode_refusal);
+                return true;
+            }
+            // A side flip WITHIN the family the section is already in — the one thing that is
+            // the broker's to change.
+            if req.family == cur.family {
+                if let Some(sb) = req.sideband_word() {
+                    let (mhz, band) = {
+                        let s = e.settings();
+                        (s.dial_mhz, s.band.clone())
+                    };
+                    e.set_frequency(mhz, &band, sb);
+                    let now = e.rig_mode_effective();
+                    drop(e);
+                    if parse_cat_mode(&now).is_some_and(|n| req.satisfied_by(n)) {
+                        clear_refusal(&self.last_mode_refusal);
+                        return true;
+                    }
+                    self.refuse_mode(mode, &now);
+                    return false;
+                }
+            }
+        }
+        drop(e);
+        self.refuse_mode(mode, &commanded);
+        false
     }
     fn set_ptt(&self, on: bool) -> bool {
         // v2 arbitration: a foreign app may key ONLY when the operator opted in
@@ -15861,7 +17782,50 @@ impl tempo_audio::rigctld_server::RigBackend for EngineRig {
         // and it must land on a POISONED engine too: this call is the broker's
         // client-disconnect fail-safe, and a raw .lock() here left the rig keyed
         // in exactly the panic case the recovering accessor exists for.
-        engine_lock(&self.0).broker_ptt(on)
+        //
+        // ⚠️ THE REFUSAL IS LOG-ONLY (#140). Everything the arbiter checks is a transmit-safety
+        // invariant and stays exactly as it is — above all `tx_enabled`, the TX-enable latch,
+        // which defaults OFF at launch and is the app's universal transmit gate. What was
+        // missing is that a refused client got `RPRT -1` and the operator got NOTHING: no line
+        // anywhere, which is why pressing PTT in Phone looked like it "woke the broker up" (it
+        // armed Nexus, not the radio). The reasons are read BEFORE the arbiter runs so the line
+        // describes the state it actually judged.
+        let mut e = engine_lock(&self.engine);
+        let opted_in = e.settings().cat_broker_ptt;
+        let tx_enabled = e.tx_enabled();
+        let tx_allowed = e.tx_allowed();
+        let owner = e.tx_owner();
+        let granted = e.broker_ptt(on);
+        drop(e);
+        if !on {
+            return granted; // un-key always lands; nothing to explain
+        }
+        if granted {
+            clear_refusal(&self.last_ptt_refusal);
+            return true;
+        }
+        // First matching gate, in the order the arbiter applies them. The fallthrough is the
+        // context hold — the band or radio moved under a client that had permission — which
+        // has no accessor of its own and is the only remaining way to get here.
+        let why = if !opted_in {
+            "\"Other programs may key transmit\" is off in Settings ▸ Radio".to_string()
+        } else if !tx_enabled {
+            "Enable TX is off in Nexus — arm transmit before an external program can key"
+                .to_string()
+        } else if !tx_allowed {
+            "transmit is not allowed here (license privileges or band edge on this dial)"
+                .to_string()
+        } else if let Some(o) = owner {
+            o.busy_reason()
+        } else {
+            "the band or radio changed since this client last keyed — re-arm transmit in Nexus"
+                .to_string()
+        };
+        let line = format!("refused PTT from a client: {why}");
+        if refusal_is_new(&self.last_ptt_refusal, &line) {
+            conn_log("CAT broker", "error", line);
+        }
+        false
     }
     fn client_event(&self, peer: &str, connected: bool) {
         // #53: the broker is the advertised share endpoint, so "is VarAC actually
@@ -15871,7 +17835,11 @@ impl tempo_audio::rigctld_server::RigBackend for EngineRig {
             "info",
             format!(
                 "client {} {peer}",
-                if connected { "connected:" } else { "disconnected:" }
+                if connected {
+                    "connected:"
+                } else {
+                    "disconnected:"
+                }
             ),
         );
     }
@@ -15960,8 +17928,105 @@ fn update_install_block(state: State<'_, SharedEngine>) -> Result<Option<String>
 /// thread would skip those events entirely — its own docs say so.)
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) {
-    tempo_core::applog::info("updater", "install finished — restarting through quit_cleanup");
+    tempo_core::applog::info(
+        "updater",
+        "install finished — restarting through quit_cleanup",
+    );
     app.request_restart();
+}
+
+// ─── Opt-in BETA update channel ────────────────────────────────────────────────────────────
+//
+// The STABLE self-updater (useSelfUpdate.ts → the plugin's own JS commands) is UNTOUCHED: every
+// non-beta user keeps that proven path byte-for-byte. This is a SEPARATE path only a user who
+// turned on `beta_updates` ever reaches. GitHub's `/releases/latest` redirect excludes
+// pre-releases, so the stable feed can never see a beta; the beta path lists releases via the
+// GitHub API, picks the newest build (pre-releases included, see
+// `tempo_app::update::newest_release_manifest`), and points the updater at THAT release's
+// manifest. ONLY the endpoint differs — the signing key, download, signature verification and the
+// flush/restart choreography are the plugin's own, shared with the stable path
+// (`prepare_update_install` / `restart_app`).
+
+/// The GitHub releases API — lists pre-releases too (unlike the `/releases/latest` redirect the
+/// stable feed uses). 20 is far more than the few betas a cycle ever has in flight.
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/kd9taw/Nexus/releases?per_page=20";
+
+/// Holds the pending beta `Update` between the check that found it and the install the operator
+/// presses — the JS side cannot carry a Rust `Update` handle, so it lives here. `None` until a
+/// check finds a newer beta; taken (not cloned) at install time so a double-press can't double-run.
+#[derive(Default)]
+struct BetaUpdateState(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BetaUpdateInfo {
+    /// The target build's version, from the resolved release's manifest.
+    version: String,
+    /// The release notes the manifest carries, if any.
+    notes: Option<String>,
+}
+
+/// Check the BETA channel for a newer build. Resolves the newest release (pre-releases included)
+/// from the GitHub API, points the updater at its manifest, and — if it is newer than the running
+/// build — stashes the `Update` for [`install_beta_update`] and returns its version. `Ok(None)` =
+/// up to date or nothing installable; `Err` = a fetch/parse failure (the frontend treats it
+/// silently, exactly as the stable check does). Called only while `beta_updates` is on.
+#[tauri::command]
+async fn check_beta_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BetaUpdateState>,
+) -> Result<Option<BetaUpdateInfo>, String> {
+    let body = tauri::async_runtime::spawn_blocking(|| fetch_text(GITHUB_RELEASES_URL))
+        .await
+        .map_err(|e| e.to_string())??;
+    let clear = || *state.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let Some((_ver, manifest_url)) = tempo_app::update::newest_release_manifest(&body) else {
+        clear();
+        return Ok(None);
+    };
+    let url = tauri::Url::parse(&manifest_url).map_err(|e| e.to_string())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => {
+            let info = BetaUpdateInfo {
+                version: update.version.clone(),
+                notes: update.body.clone(),
+            };
+            *state.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(update);
+            Ok(Some(info))
+        }
+        None => {
+            clear();
+            Ok(None)
+        }
+    }
+}
+
+/// Download and install the beta `Update` the last check stashed. Mirrors the stable path's
+/// choreography, reusing its pieces: the frontend calls `update_install_block` (refuse while the
+/// radio is busy) and `prepare_update_install` (flush before Windows' in-`install()` `exit(0)`)
+/// FIRST, then this; on macOS/Linux it returns and the frontend calls `restart_app`, on Windows
+/// the plugin's `install()` execs the installer and exits the process here. The `Update` was taken
+/// out of state above, so a second press finds nothing to install. Progress is deliberately not
+/// streamed — the beta banner shows an indeterminate "installing" state, which keeps this opt-in
+/// path free of the Tauri `Channel` plumbing the codebase has no other use of.
+#[tauri::command]
+async fn install_beta_update(state: tauri::State<'_, BetaUpdateState>) -> Result<(), String> {
+    let update = state
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .ok_or("no beta update is ready to install")?;
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Our own update endpoint (schema 1): a `version.json` with a direct `"latest"` field. Primary,
@@ -15992,7 +18057,11 @@ struct UpdateInfo {
 fn fetch_text(url: &str) -> Result<String, String> {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .user_agent(concat!("nexus/", env!("CARGO_PKG_VERSION"), " (+update-check)"))
+        .user_agent(concat!(
+            "nexus/",
+            env!("CARGO_PKG_VERSION"),
+            " (+update-check)"
+        ))
         .build()
         .map_err(|e| e.to_string())?
         .get(url)
@@ -16042,7 +18111,11 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
         &format!(
             "checked: running {current}, feed says {}, update {}",
             latest.as_deref().unwrap_or("<unknown>"),
-            if update_available { "available" } else { "not needed" }
+            if update_available {
+                "available"
+            } else {
+                "not needed"
+            }
         ),
     );
     Ok(UpdateInfo {
@@ -16053,14 +18126,112 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
     })
 }
 
-/// Open the download page (GitHub Releases) in the operator's default browser. Opened from Rust via
-/// the opener plugin, so no JS package or ACL capability entry is required.
-#[tauri::command]
+/// How long to watch a freshly-spawned launcher before deciding it took the URL. Long enough
+/// for `xdg-open` to look up the handler and give up (it exits in tens of milliseconds when it
+/// is going to), short enough that the operator never notices the wait.
+#[cfg(target_os = "linux")]
+const LAUNCHER_PROBE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Hand a URL to one desktop launcher and report whether the launcher ACCEPTED it.
+///
+/// ⚠️ THIS EXISTS BECAUSE A DETACHED SPAWN CANNOT FAIL. The opener plugin's Linux arm is
+/// `open::that_detached`, which returns `Ok` the moment `xdg-open` is spawned and never reads
+/// its exit status — so "no handler registered" (exit 3) and "the handler failed" (exit 4)
+/// both reported success, and upstream the UI recorded the version as dismissed forever on the
+/// strength of it. Windows (`ShellExecuteExW`) and macOS (`/usr/bin/open`) return real errors,
+/// which is why this arm is Linux-only.
+///
+/// The rule, and it is the whole subtlety: a launcher that has EXITED tells us its verdict, and
+/// one still alive at the deadline has taken the URL — it is waiting on the browser, or it IS
+/// the browser. Waiting for that to exit would block for the browser's whole lifetime, which is
+/// what the detached spawn was avoiding in the first place.
+#[cfg(target_os = "linux")]
+fn spawn_launcher(program: &str, args: &[&str], url: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    let deadline = std::time::Instant::now() + LAUNCHER_PROBE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("{program} exited with {status}")),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("{program}: {e}")),
+        }
+    }
+}
+
+/// Open a URL in the operator's browser, reporting a failure as a failure (Linux).
+///
+/// The candidate list mirrors the `open` crate's: the freedesktop launcher first, then GIO
+/// (present where `xdg-open` may not be), then the WSL bridge and the Debian browser
+/// alternative. The first launcher that ACCEPTS the URL wins; if every one of them refuses,
+/// so does this, carrying what each said.
+#[cfg(target_os = "linux")]
+fn open_url_checked(url: &str) -> Result<(), String> {
+    const LAUNCHERS: [(&str, &[&str]); 5] = [
+        ("xdg-open", &[]),
+        ("gio", &["open"]),
+        ("kde-open", &[]),
+        ("wslview", &[]),
+        ("x-www-browser", &[]),
+    ];
+    let mut refusals = Vec::new();
+    for (program, args) in LAUNCHERS {
+        match spawn_launcher(program, args, url) {
+            Ok(()) => return Ok(()),
+            Err(e) => refusals.push(e),
+        }
+    }
+    Err(format!("no launcher opened it ({})", refusals.join("; ")))
+}
+
+/// Open the download page (GitHub Releases) in the operator's default browser.
+///
+/// ⚠️ THE RESULT IS LOAD-BEARING: the frontend dismisses the update prompt and remembers the
+/// version on the strength of it, so one click on an open that never happened silences update
+/// notices for good. On Linux that promise cannot come from the opener plugin — see
+/// [`spawn_launcher`] — so the launcher is driven directly and its verdict is read. Windows and
+/// macOS keep the plugin, whose errors there are real.
+///
+/// `async` so the launcher probe runs off the UI thread, and logged either way: `check_for_update`
+/// writes a line per check, and a reporter's log used to show "update available" and then silence.
+#[tauri::command(async)]
 fn open_download_page(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(DOWNLOAD_PAGE_URL, None::<&str>)
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "linux")]
+    let result = {
+        let _ = &app;
+        open_url_checked(DOWNLOAD_PAGE_URL)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(DOWNLOAD_PAGE_URL, None::<&str>)
+            .map_err(|e| e.to_string())
+    };
+    match &result {
+        Ok(()) => tempo_core::applog::info(
+            "updater",
+            &format!("opened the download page ({DOWNLOAD_PAGE_URL})"),
+        ),
+        Err(e) => tempo_core::applog::error(
+            "updater",
+            &format!("could NOT open the download page ({DOWNLOAD_PAGE_URL}): {e}"),
+        ),
+    }
+    result
 }
 
 /// Stamp POTA/SOTA park refs from a pota.app hunter/activator ADIF export onto
@@ -16075,7 +18246,10 @@ struct PotaStampResult {
 }
 
 #[tauri::command(async)]
-fn import_pota_log(state: State<'_, SharedEngine>, text: String) -> Result<PotaStampResult, String> {
+fn import_pota_log(
+    state: State<'_, SharedEngine>,
+    text: String,
+) -> Result<PotaStampResult, String> {
     let mut eng = engine_lock(&state);
     let (stamped, already, unmatched) = eng.import_pota_log(&text);
     Ok(PotaStampResult {
@@ -16369,6 +18543,7 @@ struct BuildDeps {
     prop_cache: PropCache,
     aurora_cache: AuroraCache,
     kc2g_cache: Kc2gCache,
+    kp_forecast_cache: KpForecastCache,
     proton_cache: ProtonCache,
     scales_cache: ScalesCache,
     spots: SharedSpots,
@@ -16377,6 +18552,8 @@ struct BuildDeps {
     parks: SharedParks,
     region_paths: SharedRegionPaths,
     health: SharedHealth,
+    fd_board: SharedFdBoardState,
+    connect_web: SharedConnectWebState,
     /// The pounce detector's receiver — the one thing here that cannot be cloned. Shared as a
     /// take-once cell; see where it is claimed in the setup hook.
     pounce_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<pouncer::SpotHint>>>>,
@@ -16433,7 +18610,10 @@ fn rebuild_after_setting_webview_data_aside(
                 match std::fs::rename(&dir, &aside) {
                     Ok(()) => tempo_core::applog::warn(
                         "webview",
-                        &format!("set the WebView2 user-data folder aside as {}", aside.display()),
+                        &format!(
+                            "set the WebView2 user-data folder aside as {}",
+                            aside.display()
+                        ),
                     ),
                     Err(e) => tempo_core::applog::warn(
                         "webview",
@@ -16628,7 +18808,10 @@ pub fn run() {
     if settings.diag_debug_log {
         // Said out loud, because a reader months from now must never mistake the extra
         // traffic for a fault, nor a QUIET log for a healthy one when the level was simply low.
-        tempo_core::applog::info("diag", "DEBUG tier is ON for this session (operator setting)");
+        tempo_core::applog::info(
+            "diag",
+            "DEBUG tier is ON for this session (operator setting)",
+        );
     }
     // A milestone, not the settings themselves — this file is designed to be emailed to a
     // stranger, and `Settings` is where the operator's callsign and connector accounts live.
@@ -16640,6 +18823,21 @@ pub fn run() {
             settings.radios.len()
         ),
     );
+
+    // DXCC country file: activate the downloaded cty.dat (if any, and only if it beats the
+    // embedded seed) BEFORE anything can resolve a callsign. The resolver is a set-once
+    // OnceLock and whoever touches it first locks a file in for the whole session — the
+    // POTA/cluster feed threads spawned below resolve on their very first spot — so this
+    // must stay ahead of EVERY thread spawn and of engine construction. Parse cost is
+    // single-digit ms. A file downloaded mid-session activates at the NEXT launch (no live
+    // swap; the Settings status line says so).
+    cty_load_from_disk();
+
+    // Field Day rules data: same startup-only OnceLock discipline as cty — activate a
+    // downloaded fd-rules.json (if any, and only if it beats the bundled seed) BEFORE the
+    // engine builds, because fd_score reads the ruleset in the engine's very first
+    // snapshot and whoever touches the table first locks the data in for the session.
+    fd_rules_load_from_disk();
 
     let bound_radio = bound_radio_id();
 
@@ -16729,9 +18927,9 @@ pub fn run() {
         }
         let mut changed = false;
         for f in fields {
-            if let Some(cu) = tempo_audio::ports::heal_tty_twin_with(f, |p| {
-                std::path::Path::new(p).exists()
-            }) {
+            if let Some(cu) =
+                tempo_audio::ports::heal_tty_twin_with(f, |p| std::path::Path::new(p).exists())
+            {
                 eprintln!(
                     "tempo: stored serial port {f} is a /dev/tty.* node (offered by a \
                      1.5.0–1.6.1 picker) — rewriting it to its callout twin {cu}"
@@ -17005,6 +19203,23 @@ pub fn run() {
                 });
             }
         }
+        // cty.dat country file: background refresh when missing or > 7 days old (AD1C
+        // releases every few weeks; the manifest compare keys on `ver`, so an unchanged
+        // release costs one small JSON fetch). This only STAGES the file — it activates at
+        // the next launch (cty_load_from_disk above, before any resolve).
+        {
+            let stale = {
+                let m = cty_meta();
+                m.fetched_at == 0 || now_unix() - m.fetched_at > 7 * 86_400
+            };
+            if stale {
+                std::thread::spawn(|| {
+                    if let Err(e) = cty_download_if_newer() {
+                        eprintln!("tempo: cty.dat auto-refresh failed: {e}");
+                    }
+                });
+            }
+        }
         // Orbital elements: load the persisted shared TLE snapshot (so the
         // satellite surfaces serve from disk at first paint), then refresh
         // IF DUE after 0–120 s of jitter so a fleet of installs doesn't
@@ -17044,10 +19259,27 @@ pub fn run() {
                 .is_some_and(|t| now_unix() - t <= max_secs)
         });
         eng.set_log_path(logbook_path());
+        // Club-sync position identity: generated once (8 hex), persisted, and
+        // never edited — QSO ids are (posid, seq), so a changed id would
+        // re-push every contact as new.
+        let (posid, generated) = eng.fd_ensure_position_id();
+        if generated {
+            if let Err(e) = eng.settings().save(&settings_path()) {
+                eprintln!("tempo: couldn't persist the FD position id: {e}");
+            }
+        }
         // The Field Day contest log journals to its own ADIF beside the logbook —
         // written per contact and restored when FD mode starts, so a mid-event
-        // restart loses nothing.
-        eng.set_fd_log_path(fd_backup_path());
+        // restart loses nothing. Per-POSITION file (suffixed by posid), with a
+        // one-time rename of the legacy shared name — which is also the fix for
+        // two instances in one settings dir clobbering each other's backup.
+        let fd_path = fd_backup_path_for(&posid);
+        if !fd_path.exists() && fd_backup_path().exists() {
+            if let Err(e) = std::fs::rename(fd_backup_path(), &fd_path) {
+                eprintln!("tempo: FD journal migration failed: {e}");
+            }
+        }
+        eng.set_fd_log_path(fd_path);
         // A contact left in the confirm-before-log popup by a previous session (crash, power
         // loss, or a quit with the popup open) is a REAL QSO — the other station logged it.
         // Restore the hold so the operator can still log it. Best-effort: a missing or corrupt
@@ -17125,7 +19357,11 @@ pub fn run() {
             let (on, hours, last) = {
                 let eng = engine_lock(&sync_engine);
                 let s = eng.settings();
-                (s.qrz_auto_sync, s.qrz_sync_hours.max(1), s.qrz_last_sync_unix)
+                (
+                    s.qrz_auto_sync,
+                    s.qrz_sync_hours.max(1),
+                    s.qrz_last_sync_unix,
+                )
             };
             if !on {
                 continue;
@@ -17219,10 +19455,8 @@ pub fn run() {
                         // record: none of these heal on their own, so stop rather than
                         // re-sign the same batch every six hours.
                         "authfail" | "rejected" => {
-                            LOTW_AUTO_SUSPENDED
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            if !LOTW_AUTO_ANNOUNCED
-                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            LOTW_AUTO_SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if !LOTW_AUTO_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed)
                             {
                                 conn_log(
                                     "LoTW",
@@ -17290,17 +19524,30 @@ pub fn run() {
         let push_engine = engine.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            let (recs, qrz_on, clublog_on, eqsl_on, hrdlog_on, n3fjp_on, cloudlog_on, dxk, cl_email, cl_key) = {
+            let (
+                recs,
+                qrz_on,
+                clublog_on,
+                eqsl_on,
+                hrdlog_on,
+                wrl_on,
+                n3fjp_on,
+                cloudlog_on,
+                dxk,
+                cl_email,
+                cl_key,
+            ) = {
                 // Recover a poisoned lock (conn_log pattern) — a panicked command
                 // holding the engine must not silently kill auto-upload forever.
                 let mut eng = push_engine.lock().unwrap_or_else(|e| e.into_inner());
-                let (q, c, e, h, hrd, n, cl, dxk, cl_email, cl_key) = {
+                let (q, c, e, h, w, hrd, n, cl, dxk, cl_email, cl_key) = {
                     let s = eng.settings();
                     (
                         s.qrz_logbook_upload,
                         s.clublog_upload,
                         s.eqsl_upload,
                         s.hrdlog_upload,
+                        s.wrl_upload,
                         // HRD Logbook (QSO Forwarding, UDP 2333) — a DIFFERENT feature from
                         // hrdlog_upload (HRDLog.net) above, and the distinction is issue #87.
                         s.hrd_logging,
@@ -17332,7 +19579,9 @@ pub fn run() {
                 // correctly showed not one datagram on udp/2333. The comment above records the
                 // IDENTICAL bug being fixed for DXKeeper; the lesson generalises: every
                 // connector whose drain lives below must appear in this gate.
-                if !(q || c || e || h || hrd || n || cl || dxk.is_some()) {
+                // ⚠️ w (WRL) IS IN THIS GATE — the comment above records two connectors
+                // shipping without it, each silently draining nothing.
+                if !(q || c || e || h || w || hrd || n || cl || dxk.is_some()) {
                     // Nothing enabled: LEAVE the queue intact (bounded at 256) so
                     // flipping a toggle on later still uploads this session's
                     // recent QSOs — log-first-configure-later must not lose them.
@@ -17344,6 +19593,7 @@ pub fn run() {
                     c,
                     e,
                     h,
+                    w,
                     n,
                     cl,
                     dxk,
@@ -17360,8 +19610,44 @@ pub fn run() {
             // cannot heal without an operator visit to Settings, so skip the leg session-
             // wide and announce ONCE — save_settings/set_clublog_password clear the flag,
             // and the credential-change rescan re-queues what was skipped.
-            let creds_ready = clublog_credentials_ready(&cl_email, &cl_key);
-            if clublog_on && !creds_ready && !CLUBLOG_NO_CREDS_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            // ⚠️ NOTHING TO UPLOAD => DO NOT ASK WHETHER WE COULD. `clublog_credentials_ready`
+            // is not a flag read — it calls `get_password()`, and on Linux that is a D-Bus
+            // round trip opening a Secret Service session against gnome-keyring/kwallet. This
+            // worker ticks every 2 SECONDS, and the early-`continue` above only fires when NO
+            // connector is enabled at all, so any operator with ClubLog configured was paying
+            // that read forever whether or not a single QSO was queued.
+            //
+            // That is #154 again, at more than twice the rate: the 1.8.0 fix swept Settings'
+            // 5 s per-connector poll (which restarted gnome-keyring in a loop on Fedora) and
+            // missed this worker — one of a pair fixed, its twin left. Windows and macOS are
+            // local API calls and never showed it, which is exactly why it survived.
+            //
+            // The queue is drained ABOVE this point, so `recs` empty means there is nothing a
+            // credential answer could change.
+            // `None` = NOT ASKED this tick (nothing queued). Deliberately three-valued rather
+            // than a bool: collapsing "not asked" into "not ready" would fire the announcement
+            // below at an operator whose credentials are perfectly fine, simply because their
+            // upload queue was empty — a false "auto-upload paused" every session.
+            //
+            // ⚠️ DUE, not merely QUEUED — and pacing is what made the difference matter.
+            // The guard above was written when a non-empty queue meant work this tick. A
+            // paced catch-up leaves up to 255 NOT-YET-DUE records sitting in the queue for
+            // the best part of an hour, so `!recs.is_empty()` would be true on every 2 s
+            // tick for that whole time: ~1900 keyring round trips where there used to be
+            // one, which on Linux is a Secret Service D-Bus call and is precisely what
+            // restarted gnome-keyring in a loop in #154. Asking only when something is
+            // actually due restores the original premise — a credential answer can only
+            // change the outcome for a record we are about to send.
+            let due_now = now_unix();
+            let anything_due = recs.iter().any(|p| p.retry_after_unix <= due_now);
+            let creds_ready: Option<bool> = if !anything_due {
+                None
+            } else {
+                Some(clublog_credentials_ready(&cl_email, &cl_key))
+            };
+            if clublog_on
+                && creds_ready == Some(false)
+                && !CLUBLOG_NO_CREDS_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 conn_log(
                     "ClubLog",
@@ -17369,21 +19655,44 @@ pub fn run() {
                     "auto-upload paused — no ClubLog credentials stored (set them in Settings ▸ Confirmations)",
                 );
             }
-            if creds_ready {
+            if creds_ready == Some(true) {
                 CLUBLOG_NO_CREDS_ANNOUNCED.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let clublog_live = clublog_on
-                && creds_ready
+                && creds_ready == Some(true)
                 && !CLUBLOG_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed);
             let now_unix = now_unix();
+            // How many CATCH-UP records this drain is carrying (#193). Counted before the
+            // loop so the operator-facing line below can say how much is left rather than
+            // just "one more went out" — "why are contacts from March uploading?" is the
+            // question this answers, and the Connections log is where they'll look.
+            let mut catchup_left = recs
+                .iter()
+                .filter(|p| p.origin == tempo_app::engine::UploadOrigin::CatchUp)
+                .count();
             for p in recs {
                 // BACKOFF: a record not yet due goes back on the queue untouched — no push,
                 // no attempt spent, no toast. This is what turns 20-in-40-seconds into one
-                // push every few minutes for a genuinely-down service.
+                // push every few minutes for a genuinely-down service. It is ALSO what
+                // paces the catch-up: `requeue_failed_clublog` stamps those records one
+                // spacing apart, so all but the one whose slot has come round land here.
                 if p.retry_after_unix > now_unix {
                     let mut eng = push_engine.lock().unwrap_or_else(|e| e.into_inner());
-                    eng.requeue_upload_at(p.rec, p.legs, p.attempts, p.retry_after_unix);
+                    eng.requeue_upload_at(p.rec, p.legs, p.attempts, p.retry_after_unix, p.origin);
                     continue;
+                }
+                if p.origin == tempo_app::engine::UploadOrigin::CatchUp {
+                    catchup_left = catchup_left.saturating_sub(1);
+                    conn_log(
+                        "ClubLog",
+                        "info",
+                        format!(
+                            "catch-up: sending an older QSO with {} — {catchup_left} still \
+                             queued, one every {}s so ClubLog isn't flooded",
+                            p.rec.call,
+                            tempo_app::engine::CATCHUP_UPLOAD_SPACING_SECS,
+                        ),
+                    );
                 }
                 let rec = p.rec.clone();
                 // DXKeeper is deliberately OUTSIDE the legs/retry machinery: it never
@@ -17405,6 +19714,7 @@ pub fn run() {
                     clublog_live,
                     eqsl_on,
                     hrdlog_on,
+                    wrl_on,
                     n3fjp_on,
                     cloudlog_on,
                     p.legs,
@@ -17416,7 +19726,15 @@ pub fn run() {
                     let attempts = p.attempts.saturating_add(1);
                     let due = now_unix + tempo_app::engine::upload_backoff_secs(attempts);
                     let mut eng = push_engine.lock().unwrap_or_else(|e| e.into_inner());
-                    eng.requeue_upload_at(rec, failed, attempts, due);
+                    // `p.origin` CARRIED, not re-derived: a catch-up record that blips on
+                    // the network must come back as a catch-up record, or the retry would
+                    // re-enter the queue as if it were a live contact (#193).
+                    // PACED, not stamped-and-forgotten. `requeue_after_failure` keeps a
+                    // catch-up record in the pacing lane instead of letting its backoff put
+                    // it back in the free-for-all: a busy ClubLog fails everything that
+                    // comes due, and without this they would all be due in the past when it
+                    // recovers and leave inside one tick — the burst again, compressed.
+                    eng.requeue_after_failure(rec, failed, attempts, due, p.origin);
                 }
             }
             // HRD Logbook drain (F4MQS): the datagram used to be fire-and-forget from
@@ -17465,9 +19783,7 @@ pub fn run() {
         // config dir, shared by every profile on purpose: any instance may sweep any dead
         // instance's orphans, and the identity+parent checks inside keep a LIVE sibling
         // instance's daemons untouched.
-        tempo_audio::rigctld_proc::init_orphan_ledger(
-            config_dir_for(None).join("daemon-pids"),
-        );
+        tempo_audio::rigctld_proc::init_orphan_ledger(config_dir_for(None).join("daemon-pids"));
         let radio_engine = engine.clone();
         std::thread::spawn(move || {
             // The radio loop is the heartbeat — if it dies (error OR panic), TX/RX
@@ -17517,6 +19833,10 @@ pub fn run() {
         std::thread::spawn(move || {
             // The running broker as (port, shutdown flag); None = not serving.
             let mut running: Option<(u16, std::sync::Arc<AtomicBool>)> = None;
+            // …and the bind that FAILED, which is the other half of "not serving" (#165).
+            // Without it a failed bind left `running` as None, `want != have` stayed true,
+            // and both the bind and its error line re-ran every second, forever.
+            let mut failure: Option<BrokerBindFailure> = None;
             loop {
                 let want = {
                     let e = engine_lock(&mgr_engine);
@@ -17530,30 +19850,306 @@ pub fn run() {
                     if let Some((_, shutdown)) = running.take() {
                         shutdown.store(true, Ordering::Relaxed);
                     }
-                    // Start on the wanted port.
-                    if let Some(port) = want {
+                    // Start on the wanted port, unless a recent failure on THIS port says to
+                    // wait. A different port is always tried at once — changing it is the
+                    // operator's fix for a conflict and must take effect on the next tick.
+                    let now = std::time::Instant::now();
+                    if let Some(port) =
+                        want.filter(|p| broker_may_attempt(failure.as_ref(), *p, now))
+                    {
                         match std::net::TcpListener::bind(("127.0.0.1", port)) {
                             Ok(l) => {
                                 let shutdown = std::sync::Arc::new(AtomicBool::new(false));
                                 let backend: std::sync::Arc<
                                     dyn tempo_audio::rigctld_server::RigBackend,
-                                > = std::sync::Arc::new(EngineRig(mgr_engine.clone()));
+                                > = std::sync::Arc::new(EngineRig::new(mgr_engine.clone()));
                                 let sd = shutdown.clone();
                                 std::thread::spawn(move || {
                                     tempo_audio::rigctld_server::serve_until(l, backend, sd)
                                 });
                                 running = Some((port, shutdown));
+                                failure = None;
                                 conn_log(
                                     "CAT broker",
                                     "info",
                                     format!("sharing this radio on 127.0.0.1:{port}"),
                                 );
                             }
-                            Err(e) => conn_log(
-                                "CAT broker",
-                                "error",
-                                format!("couldn't bind 127.0.0.1:{port}: {e}"),
-                            ),
+                            Err(e) => {
+                                if broker_record_failure(&mut failure, port, now) {
+                                    // ONE line, naming the port and the cause an operator can
+                                    // act on. The retry carries on quietly behind the backoff.
+                                    let msg = format!(
+                                        "couldn't bind 127.0.0.1:{port}: {e} — another program \
+                                         is already listening there (your own rigctld, a second \
+                                         copy of Nexus, or this radio's own daemon on 4534). \
+                                         Sharing is OFF until it frees up; change the Sharing \
+                                         port in Settings ▸ Radio, or stop the other program. \
+                                         Retrying quietly."
+                                    );
+                                    tempo_core::applog::error("cat", &msg);
+                                    conn_log("CAT broker", "error", msg);
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
+    }
+
+    // Field Day club sync: one manager thread in the CAT-broker mold above —
+    // poll settings 1 s, hot-apply both roles. HOST role (fd_host_enable) =
+    // the club listener on 0.0.0.0:fd_host_port (the app's one deliberate
+    // non-loopback inbound socket — data-plane only, see tempo_net::fdsync's
+    // module header; enabling the setting IS the LAN opt-in) + the once-a-
+    // second discovery beacon + a loopback self-client, so the host's own
+    // contacts take the identical path as everyone else's ("a host is just
+    // another position"). POSITION role (fd_join_addr set) = one persistent
+    // client pump with reconnect backoff. The dual-push interop sinks
+    // (N3FJP/N1MM/WSJT-X in tempo-audio's slot loop) are untouched by all of
+    // this — the sync pump is a separate thread reading the engine outbox.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mgr_engine = engine.clone();
+        std::thread::spawn(move || {
+            // Running host as (port, shutdown); running client as (addr, shutdown).
+            let mut hosting: Option<(u16, Arc<AtomicBool>)> = None;
+            let mut client: Option<(String, Arc<AtomicBool>)> = None;
+            // The failed-bind half of "not hosting" (#165's lesson): retry
+            // quietly on a timer instead of re-erroring every second.
+            let mut bind_failed: Option<(u16, std::time::Instant)> = None;
+            loop {
+                let (want_host, want_addr) = {
+                    let e = engine_lock(&mgr_engine);
+                    let s = e.settings();
+                    let want_host = s.fd_host_enable.then_some(s.fd_host_port);
+                    // The host joins ITSELF over loopback; otherwise the
+                    // operator's join address (empty = no client).
+                    let want_addr = if s.fd_host_enable {
+                        Some(format!("127.0.0.1:{}", s.fd_host_port))
+                    } else {
+                        let a = s.fd_join_addr.trim().to_string();
+                        (!a.is_empty()).then_some(a)
+                    };
+                    (want_host, want_addr)
+                };
+
+                // --- host listener + beacon reconcile ---
+                if want_host != hosting.as_ref().map(|(p, _)| *p) {
+                    if let Some((_, shutdown)) = hosting.take() {
+                        shutdown.store(true, Ordering::Relaxed);
+                        engine_lock(&mgr_engine).fd_host_stop();
+                        conn_log("FD sync", "info", "club hosting stopped");
+                    }
+                    let now = std::time::Instant::now();
+                    let may_try = |p: u16| {
+                        bind_failed
+                            .map(|(fp, at)| fp != p || now.duration_since(at).as_secs() >= 10)
+                            .unwrap_or(true)
+                    };
+                    if let Some(port) = want_host.filter(|p| may_try(*p)) {
+                        // Journal + club log first, so the first join sees state.
+                        let started = {
+                            let mut e = engine_lock(&mgr_engine);
+                            let name = e.settings().fd_event_name.clone();
+                            e.fd_host_start(fd_event_journal_path(&name))
+                        };
+                        let bound = started
+                            .map_err(|e| e.to_string())
+                            .and_then(|()| {
+                                std::net::TcpListener::bind(("0.0.0.0", port))
+                                    .map_err(|e| e.to_string())
+                            });
+                        match bound {
+                            Ok(listener) => {
+                                let shutdown = Arc::new(AtomicBool::new(false));
+                                let backend: Arc<dyn tempo_net::fdsync::ClubBackend> = Arc::new(
+                                    tempo_app::fdbridge::EngineClubBackend(mgr_engine.clone()),
+                                );
+                                let sd = shutdown.clone();
+                                std::thread::spawn(move || {
+                                    tempo_net::fdsync::serve_until(listener, backend, sd)
+                                });
+                                // The discovery beacon, once a second while
+                                // hosting (best-effort: AP-isolated Wi-Fi eats
+                                // broadcast, which is why manual entry stays).
+                                let sd = shutdown.clone();
+                                let beacon_engine = mgr_engine.clone();
+                                std::thread::spawn(move || {
+                                    let sock = tempo_net::fdsync::beacon_socket();
+                                    while !sd.load(Ordering::Relaxed) {
+                                        if let Ok(sock) = &sock {
+                                            let (event, call) = {
+                                                let e = engine_lock(&beacon_engine);
+                                                (
+                                                    e.fd_event_label().unwrap_or_default(),
+                                                    e.settings().mycall.clone(),
+                                                )
+                                            };
+                                            tempo_net::fdsync::send_beacon(
+                                                sock, &event, &call, port,
+                                            );
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_secs(1));
+                                    }
+                                });
+                                hosting = Some((port, shutdown));
+                                bind_failed = None;
+                                conn_log(
+                                    "FD sync",
+                                    "info",
+                                    format!(
+                                        "hosting the club event on this LAN, port {port} \
+                                         (positions can Find club events or join by address)"
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                engine_lock(&mgr_engine).fd_host_stop();
+                                if bind_failed.map(|(p, _)| p != port).unwrap_or(true) {
+                                    conn_log(
+                                        "FD sync",
+                                        "error",
+                                        format!(
+                                            "couldn't host on port {port}: {e} — change the \
+                                             Host port in Settings ▸ Contesting or stop the \
+                                             program using it. Retrying quietly."
+                                        ),
+                                    );
+                                }
+                                bind_failed = Some((port, now));
+                            }
+                        }
+                    }
+                }
+
+                // --- position client reconcile ---
+                if want_addr != client.as_ref().map(|(a, _)| a.clone()) {
+                    if let Some((_, shutdown)) = client.take() {
+                        shutdown.store(true, Ordering::Relaxed);
+                        let mut e = engine_lock(&mgr_engine);
+                        e.fd_mirror_mut().on_link(false, now_unix() as u64);
+                    }
+                    if let Some(addr) = want_addr {
+                        // No posid yet (fresh profile that never finished
+                        // startup init) = don't connect; next tick retries.
+                        let ready = !engine_lock(&mgr_engine)
+                            .fd_sync_identity()
+                            .0
+                            .is_empty();
+                        if ready {
+                            let shutdown = Arc::new(AtomicBool::new(false));
+                            let backend: Arc<dyn tempo_net::fdsync::PositionSync> = Arc::new(
+                                tempo_app::fdbridge::EnginePositionSync(mgr_engine.clone()),
+                            );
+                            let (a2, sd) = (addr.clone(), shutdown.clone());
+                            std::thread::spawn(move || {
+                                tempo_net::fdsync::run_position_until(&a2, backend, sd)
+                            });
+                            client = Some((addr, shutdown));
+                        }
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
+    }
+
+    // Field Day spectator scoreboard: one manager thread in the same mold —
+    // poll settings 1 s, hot-apply. While `fd_scoreboard` is on, the
+    // read-only board server (`tempo_app::fd_scoreboard` — GET/HEAD only,
+    // fed snapshot JSON through a `BoardSource`, structurally unable to
+    // reach a setter) binds 0.0.0.0:fd_scoreboard_port; the toggle IS the
+    // LAN opt-in and the module header carries the threat model. Real data
+    // only in the host role — elsewhere the page says "served from the host
+    // station". Deliberately NOT under cfg(feature = "radio"): a scoreboard
+    // needs no soundcard.
+    let fd_board_state: SharedFdBoardState = Arc::new(Mutex::new(FdBoardState::default()));
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mgr_engine = engine.clone();
+        let mgr_state = fd_board_state.clone();
+        std::thread::spawn(move || {
+            // The running server as (port, shutdown flag); None = not serving.
+            let mut running: Option<(u16, Arc<AtomicBool>)> = None;
+            // The failed-bind half of "not serving" (#165's lesson): retry
+            // quietly on a timer instead of re-erroring every second.
+            let mut bind_failed: Option<(u16, std::time::Instant)> = None;
+            loop {
+                let want = {
+                    let e = engine_lock(&mgr_engine);
+                    let s = e.settings();
+                    s.fd_scoreboard.then_some(s.fd_scoreboard_port)
+                };
+                if want != running.as_ref().map(|(p, _)| *p) {
+                    if let Some((_, shutdown)) = running.take() {
+                        shutdown.store(true, Ordering::Relaxed);
+                        let mut st = mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.running = false;
+                        st.error = None;
+                        drop(st);
+                        conn_log("FD board", "info", "spectator scoreboard stopped");
+                    }
+                    let now = std::time::Instant::now();
+                    let may_try = |p: u16| {
+                        bind_failed
+                            .map(|(fp, at)| fp != p || now.duration_since(at).as_secs() >= 10)
+                            .unwrap_or(true)
+                    };
+                    if let Some(port) = want.filter(|p| may_try(*p)) {
+                        match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                            Ok(listener) => {
+                                let shutdown = Arc::new(AtomicBool::new(false));
+                                // The board's whole data path: one bounded
+                                // clone under the engine lock, everything else
+                                // built off-lock behind the 1 s cache.
+                                let eng = mgr_engine.clone();
+                                let source: Arc<dyn tempo_app::fd_scoreboard::BoardSource> =
+                                    Arc::new(tempo_app::fd_scoreboard::CachedBoard::new(
+                                        move || engine_lock(&eng).fd_board_snapshot(),
+                                    ));
+                                let sd = shutdown.clone();
+                                std::thread::spawn(move || {
+                                    tempo_app::fd_scoreboard::serve_until(listener, source, sd)
+                                });
+                                running = Some((port, shutdown));
+                                bind_failed = None;
+                                {
+                                    let mut st =
+                                        mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.running = true;
+                                    st.port = port;
+                                    st.error = None;
+                                }
+                                conn_log(
+                                    "FD board",
+                                    "info",
+                                    format!(
+                                        "spectator scoreboard serving on the LAN, port {port} \
+                                         — open this computer's IP :{port}/scoreboard on the TV"
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "couldn't serve the scoreboard on port {port}: {e} — \
+                                     change the Board port in Settings ▸ Contesting or stop \
+                                     the program using it. Retrying quietly."
+                                );
+                                {
+                                    let mut st =
+                                        mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.running = false;
+                                    st.error = Some(msg.clone());
+                                }
+                                if bind_failed.map(|(p, _)| p != port).unwrap_or(true) {
+                                    conn_log("FD board", "error", msg);
+                                }
+                                bind_failed = Some((port, now));
+                            }
                         }
                     }
                 }
@@ -17565,8 +20161,115 @@ pub fn run() {
     let prop_cache: PropCache = Arc::new(Mutex::new(None));
     let aurora_cache: AuroraCache = Arc::new(Mutex::new(None));
     let kc2g_cache: Kc2gCache = Arc::new(Mutex::new(None));
+    let kp_forecast_cache: KpForecastCache = Arc::new(Mutex::new(None));
     let proton_cache: ProtonCache = Arc::new(Mutex::new(None));
     let scales_cache: ScalesCache = Arc::new(Mutex::new(None));
+
+    // Connect on the shack TV: the same manager-thread shape as the spectator
+    // scoreboard — poll settings 1 s, hot-apply, retry a failed bind quietly on a
+    // timer. While `connect_web` is on, `tempo_app::connect_web` serves through the
+    // scoreboard's GET/HEAD-only server on 0.0.0.0:connect_web_port, and the toggle
+    // IS the LAN opt-in.
+    //
+    // ⚠️ Its threat model is NOT the scoreboard's — see the module header. The
+    // provider below is the ONLY thing the serve thread can reach, and it hands over
+    // the propagation picture plus callsign and grid: no dial frequency, no log, no
+    // needs board. A payload-shape test in `connect_web` fails if that widens.
+    let connect_web_state: SharedConnectWebState = Arc::new(Mutex::new(ConnectWebState::default()));
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mgr_engine = engine.clone();
+        let mgr_state = connect_web_state.clone();
+        let mgr_prop = prop_cache.clone();
+        let mgr_kp = kp_forecast_cache.clone();
+        std::thread::spawn(move || {
+            let mut running: Option<(u16, Arc<AtomicBool>)> = None;
+            let mut bind_failed: Option<(u16, std::time::Instant)> = None;
+            loop {
+                let want = {
+                    let e = engine_lock(&mgr_engine);
+                    let s = e.settings();
+                    s.connect_web.then_some(s.connect_web_port)
+                };
+                if want != running.as_ref().map(|(p, _)| *p) {
+                    if let Some((_, shutdown)) = running.take() {
+                        shutdown.store(true, Ordering::Relaxed);
+                        let mut st = mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.running = false;
+                        st.error = None;
+                        drop(st);
+                        conn_log("Connect web", "info", "Connect web page stopped");
+                    }
+                    let now = std::time::Instant::now();
+                    let may_try = |p: u16| {
+                        bind_failed
+                            .map(|(fp, at)| fp != p || now.duration_since(at).as_secs() >= 10)
+                            .unwrap_or(true)
+                    };
+                    if let Some(port) = want.filter(|p| may_try(*p)) {
+                        match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                            Ok(listener) => {
+                                let shutdown = Arc::new(AtomicBool::new(false));
+                                let eng = mgr_engine.clone();
+                                let prop = mgr_prop.clone();
+                                let kp = mgr_kp.clone();
+                                // The FULL page: the app's own bundled UI plus the
+                                // read-only RPC. Both closures read TV_APP at call
+                                // time, so a request in the first milliseconds before
+                                // setup() runs degrades to the summary page instead of
+                                // racing the handle.
+                                let source: Arc<dyn tempo_app::fd_scoreboard::BoardSource> =
+                                    Arc::new(tempo_app::connect_web::FullConnect::new(
+                                        move || build_connect_board(&eng, &prop, &kp),
+                                        Arc::new(tv_asset),
+                                        Arc::new(tv_rpc),
+                                    ));
+                                let sd = shutdown.clone();
+                                std::thread::spawn(move || {
+                                    tempo_app::fd_scoreboard::serve_until(listener, source, sd)
+                                });
+                                running = Some((port, shutdown));
+                                bind_failed = None;
+                                {
+                                    let mut st =
+                                        mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.running = true;
+                                    st.port = port;
+                                    st.error = None;
+                                }
+                                conn_log(
+                                    "Connect web",
+                                    "info",
+                                    format!(
+                                        "Connect is on the LAN, port {port} — open this \
+                                         computer's IP :{port} on the TV"
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "couldn't serve Connect on port {port}: {e} — change the \
+                                     port in Settings ▸ Appearance or stop the program using \
+                                     it. Retrying quietly."
+                                );
+                                {
+                                    let mut st =
+                                        mgr_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.running = false;
+                                    st.error = Some(msg.clone());
+                                }
+                                if bind_failed.map(|(p, _)| p != port).unwrap_or(true) {
+                                    conn_log("Connect web", "error", msg);
+                                }
+                                bind_failed = Some((port, now));
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
+    }
 
     // NOT registered as managed state, deliberately. `Chains` would have to be keyed by
     // `RadioProfile::id`, and the only id available here is a BOOT SNAPSHOT of
@@ -17598,6 +20301,7 @@ pub fn run() {
         prop_cache,
         aurora_cache,
         kc2g_cache,
+        kp_forecast_cache,
         proton_cache,
         scales_cache,
         spots,
@@ -17606,6 +20310,8 @@ pub fn run() {
         parks,
         region_paths,
         health,
+        fd_board: fd_board_state,
+        connect_web: connect_web_state,
         // The pounce receiver is the one non-clonable thing the chain takes. Shared as a
         // take-once cell so both attempts can hold the bundle: whichever setup runs first
         // gets the receiver, and a retry whose predecessor already consumed it skips the
@@ -17665,6 +20371,7 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
         .manage(d.prop_cache)
         .manage(d.aurora_cache)
         .manage(d.kc2g_cache)
+        .manage(d.kp_forecast_cache)
         .manage(d.proton_cache)
         .manage(d.scales_cache)
         .manage(d.spots)
@@ -17673,14 +20380,20 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
         .manage(d.parks)
         .manage(d.region_paths)
         .manage(d.health)
+        .manage(d.fd_board)
+        .manage(d.connect_web)
         .manage(SharedOpeningTracker::default())
         .manage(SharedWxHistory::default())
         .manage(SharedQrzSession::default())
         .manage(SharedHamQthSession::default())
+        .manage(BetaUpdateState::default())
         .invoke_handler(tauri::generate_handler![
+            display_metrics,
             update_install_block,
             prepare_update_install,
             restart_app,
+            check_beta_update,
+            install_beta_update,
             log_operators,
             export_settings_bundle,
             import_settings_bundle,
@@ -17730,7 +20443,6 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             get_serial_ports,
             get_serial_ports_detailed,
             get_audio_devices,
-            audio_devices_for_port,
             detect_rigs,
             probe_cat_ports,
             point_rotator,
@@ -17754,6 +20466,7 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             preview_cw,
             cw_skim,
             rtty_arm,
+            rtty_auto_arm,
             get_rtty_state,
             aprs_arm,
             aprs_auto_arm,
@@ -17796,6 +20509,8 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             get_rig_models,
             get_all_rig_models,
             get_portless_rig_models,
+            get_cat_cw_unproven_rig_models,
+            amp_command,
             get_band_plan,
             set_license_class,
             get_licensed_band_plan,
@@ -17821,6 +20536,8 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             set_rf_power,
             set_mic_gain,
             set_nr_level,
+            set_comp_level,
+            set_notch_freq,
             set_agc,
             set_split,
             set_rig_func,
@@ -17881,6 +20598,9 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             set_hunt_target,
             clear_hunt_target,
             fd_log_manual,
+            fd_discover_events,
+            fd_club_export,
+            fd_scoreboard_status,
             n3fjp_test_connection,
             set_hold_tx_freq,
             set_blocked_calls,
@@ -17899,6 +20619,7 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             resolve_entity,
             edit_qso,
             mark_qsl_sent,
+            mark_qsl_card,
             delete_qso,
             purge_log,
             get_awards,
@@ -17934,8 +20655,14 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             eqsl_push_qso,
             set_hrdlog_code,
             clear_hrdlog_code,
+            set_wrl_key,
+            clear_wrl_key,
+            wrl_push_qso,
             hrdlog_push_qso,
             get_ota_spots,
+            get_ota_map_spots,
+            get_kp_forecast,
+            connect_web_status,
             search_parks,
             parks_count,
             hunted_parks_count,
@@ -17970,6 +20697,11 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             fetch_lotw_users,
             get_fcc_states_status,
             fetch_fcc_states,
+            get_cty_status,
+            fetch_cty,
+            get_fd_rules_status,
+            fetch_fd_rules,
+            get_fd_ruleset,
             get_tle_status,
             fetch_tles_now,
             import_tles,
@@ -17997,6 +20729,12 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             if let Ok(res) = app.path().resource_dir() {
                 let _ = RESOURCE_DIR.set(res);
             }
+            // The TV page's asset + RPC closures read this at call time (see TV_APP).
+            let _ = TV_APP.set(app.handle().clone());
+            // Probe the display's physical density HERE, on the main thread, where GDK is safe
+            // to call. The frontend reads the cached answer through `display_metrics` and uses
+            // it to seed the UI scale cap on a first launch only. No-op off Linux.
+            let _ = DISPLAY_DPI.set(probe_physical_dpi());
             // The operator-facing folders. Captured here for the same reason as the resource dir:
             // the functions that need them are free functions with no handle. A failure to resolve
             // is not an error — the legacy in-config location is still a working default.
@@ -18120,11 +20858,24 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
                     }
                 }
             }
-            // RTTY + PSK + SSTV RX decode threads — RX ONLY (arming is per-session
-            // runtime state; nothing here can key PTT or emit TX audio).
+            // RTTY + PSK + SSTV RX decode threads, and the amplifier status poll — RX ONLY
+            // (arming is per-session runtime state; nothing here can key PTT or emit TX audio).
+            //
+            // The amplifier belongs in THIS family and nowhere else, and that is the whole
+            // isolation argument spent in one place. It must never be folded into the radio
+            // loop's heavy CAT block: that loop ticks every 20 ms and caps its entire read-back
+            // at HEAVY_POLL_BUDGET_MS = 250, asking have_budget() before every single read,
+            // while ONE amplifier poll is 0.5-2.4 s of blocking serial (SPE: two read_exact at
+            // a 500 ms budget; KPA: six sequential verbs at 400 ms each) — 25 to 120 ticks. A
+            // reader that long inside the budget does not fail loudly; it silently STARVES the
+            // readers after it, which is exactly what \dump_caps did to the split read it was
+            // meant to qualify. Nor may it live in RadioLoop, and nor may it become a
+            // spawn_blocking per UI poll: that model reopens its transport on every call, which
+            // for a serial amplifier means opening and closing a COM port every second.
             #[cfg(feature = "radio")]
             {
                 tempo_audio::rttyrx::spawn_rtty_rx(app.state::<SharedEngine>().inner().clone());
+                tempo_audio::amppoll::spawn_amp_poll(app.state::<SharedEngine>().inner().clone());
                 tempo_audio::pskrx::spawn_psk_rx(app.state::<SharedEngine>().inner().clone());
                 tempo_audio::aprsrx::spawn_aprs_rx(app.state::<SharedEngine>().inner().clone());
                 tempo_audio::sstvrx::spawn_sstv_rx(
@@ -18161,6 +20912,408 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
 
 #[cfg(test)]
 mod tests {
+    /// `conn-health.json` round-trips, drops ids this build does not know, and treats a
+    /// malformed file as nothing — a status file must never be able to fail a launch.
+    #[test]
+    fn conn_health_json_round_trips_and_drops_the_unknown() {
+        let rows: super::ConnHealthRows = vec![
+            ("hrdlog", Some(1_700_000_000), None),
+            ("wrl", None, Some((1_700_000_500, "AuthFail".to_string()))),
+        ];
+        let text = super::conn_health_to_json(&rows);
+        assert_eq!(super::conn_health_from_json(&text), rows);
+        // An id from a build that no longer ships that connector is dropped, the rest kept.
+        let foreign = text.replace("\"hrdlog\"", "\"gone-connector\"");
+        let back = super::conn_health_from_json(&foreign);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, "wrl");
+        // Malformed → empty, never a panic.
+        assert!(super::conn_health_from_json("not json").is_empty());
+        assert!(super::conn_health_from_json("").is_empty());
+    }
+
+    /// The Spots-heading grid off the RBN skimmer wire (the ~309° report): the strict RBN
+    /// spelling matches, and the shapes a HUMAN comment is full of do not — that asymmetry
+    /// is the whole safety argument for mining the token at all.
+    #[test]
+    fn rbn_comment_grid_takes_the_skimmer_token_and_nothing_looser() {
+        // The wire shapes seen in the field report, 4- and 6-char.
+        assert_eq!(super::rbn_comment_grid("FT8 -15 dB DM03 CQ"), Some("DM03"));
+        assert_eq!(super::rbn_comment_grid("FT8 5 dB EN52wc CQ"), Some("EN52wc"));
+        // Nothing grid-shaped: the usual RBN CW comment.
+        assert_eq!(super::rbn_comment_grid("CW 21 dB 25 WPM CQ"), None);
+        // Human spellings that a folded or loose pattern would swallow: lowercase field,
+        // uppercase subsquare, wrong lengths, out-of-range field letter.
+        for c in ["worked dm03 earlier", "EN52WC", "DM0", "DM034", "SM03", "TU 599 73"] {
+            assert_eq!(super::rbn_comment_grid(c), None, "{c:?} must not match");
+        }
+    }
+
+    /// #171: the country resolver and the state resolver never spoke to each other. Country
+    /// comes from cty.dat prefix arithmetic; state comes from the FCC ULS index, which holds
+    /// the licensee's MAILING address. WL7E was reported as country "Alaska", state "CA" —
+    /// and it is not a display-only wrong: the same hint feeds the WAS "New State" cue, so it
+    /// credits a state that was never worked.
+    ///
+    /// No FCC index is loaded in a unit test, so the wrong answers here arrive by the OTHER
+    /// road into the same defect — `state_for_grid`, whose table is US state polygons and
+    /// which will happily place an Alaskan or a Mexican station in California. Both roads end
+    /// at the same missing cross-check, and the entity closes both.
+    #[test]
+    fn the_entity_outranks_a_state_resolver_that_does_not_know_the_country() {
+        // An Alaskan station heard from a California grid: the entity is Alaska, so the
+        // subdivision is AK. Nothing else may answer.
+        assert_eq!(
+            super::subdivision_hint("WL7E", Some("CM87")).as_deref(),
+            Some("AK"),
+            "an Alaska entity settles its own state"
+        );
+        assert_eq!(
+            super::subdivision_hint("KH6ABC", Some("CM87")).as_deref(),
+            Some("HI"),
+            "…and so does Hawaii"
+        );
+        // Outside the United States/Alaska/Hawaii group there is no US state to report, so
+        // the subdivision is DROPPED rather than guessed from a border grid cell.
+        assert_eq!(
+            super::subdivision_hint("XE2ABC", Some("DM12")),
+            None,
+            "a Mexican station never carries a US state, whatever cell it was heard in"
+        );
+        assert_eq!(
+            super::subdivision_hint("KP4ABC", Some("EL96")),
+            None,
+            "Puerto Rico is its own DXCC entity and has no WAS state"
+        );
+        // The lower 48 is untouched — this is the case the FCC index and the grid exist for.
+        assert_eq!(
+            super::subdivision_hint("W9XYZ", Some("EN52")).as_deref(),
+            Some("WI")
+        );
+        // …and so is the Canadian province path, which answers before any of this.
+        assert_eq!(
+            super::subdivision_hint("VE3ABC", Some("EN82")).as_deref(),
+            Some("ON")
+        );
+    }
+
+    /// #180: a QSL-sent mark could not be undone. Sending is once-only, so a mis-click made
+    /// the three send entries vanish with nothing to put the row back — the inbound side has
+    /// had `markQslCard(index, false)` all along. The command layer is the middle of that
+    /// sandwich, and this is the decision it owns: what a `via` argument MEANS.
+    ///
+    /// Two rules, and the second is what keeps the first safe. Absent — `null` from the UI,
+    /// and equally an empty field, which is what an empty form control delivers — is the
+    /// operator WITHDRAWING the mark. An unknown NON-EMPTY code is a mistake and must still
+    /// be refused: accepting it as a clear would turn a typo into an erased mark, which is
+    /// the very loss this exists to undo.
+    #[test]
+    fn a_qsl_sent_mark_can_be_withdrawn_and_a_typo_still_cannot() {
+        use tempo_core::logbook::QslVia;
+        assert_eq!(
+            super::qsl_via_arg(None),
+            Ok(None),
+            "no method named = the operator withdrawing the mark"
+        );
+        // ⚠️ EMPTY IS NOT A WITHDRAWAL — it is a NON-CHOICE, and that distinction is the
+        // whole safety of this. The UI's clear is an explicit menu entry that sends `null`;
+        // the empty string is the select's PLACEHOLDER, the state the control sits in when
+        // the operator has chosen nothing (and today's `else if (v)` guard means it never
+        // even reaches this command). So an empty `via` arriving here is something upstream
+        // sending a non-choice, and honouring it would erase a mark nobody asked to erase —
+        // the same loss as reading a typo as a withdrawal, except a placeholder is a value
+        // the UI can plausibly emit by accident and a typo is not.
+        assert!(
+            super::qsl_via_arg(Some("")).is_err(),
+            "a placeholder is not a decision"
+        );
+        assert!(super::qsl_via_arg(Some("   ")).is_err());
+        // The refusal is something an operator may actually read in a toast, and it is
+        // written across two source lines with a continuation escape — which silently eats
+        // the newline AND the next line's indent, or does not, depending on getting it right.
+        let msg = super::qsl_via_arg(Some("")).unwrap_err();
+        assert!(msg.contains("use B, D, or E"), "{msg}");
+        assert!(
+            !msg.contains("  "),
+            "the continuation escape left a gap: {msg}"
+        );
+        assert_eq!(super::qsl_via_arg(Some("B")), Ok(Some(QslVia::Bureau)));
+        assert_eq!(super::qsl_via_arg(Some("d")), Ok(Some(QslVia::Direct)));
+        assert_eq!(
+            super::qsl_via_arg(Some(" E ")),
+            Ok(Some(QslVia::Electronic))
+        );
+        assert!(
+            super::qsl_via_arg(Some("X")).is_err(),
+            "an unknown code is a mistake, never a silent clear"
+        );
+        assert!(super::qsl_via_arg(Some("BUREAU")).is_err());
+    }
+
+    /// The RTTY view-entry auto-arm reaches the frontend only if the command is DEFINED and
+    /// REGISTERED — `ui/src/api.ts` already calls `invoke('rtty_auto_arm')`, and a name that
+    /// is not in `generate_handler!` fails at runtime with nothing at compile time to catch
+    /// it. RTTY was the last decode mode with no auto-arm, which is the likeliest cause of
+    /// the standing "RTTY is not decoding" reports, so a silently unregistered command would
+    /// leave the field bug exactly where it was.
+    ///
+    /// Source-scanned, like `no_engine_locking_command_runs_on_the_ui_thread`, because
+    /// registration is the property under test and no type sees it.
+    #[test]
+    fn the_rtty_auto_arm_command_the_ui_already_calls_is_defined_and_registered() {
+        let src = include_str!("lib.rs");
+        // ⚠️ COLUMN-ZERO MATCH, not `contains`: `include_str!` pulls in THIS TEST too, so a
+        // `contains("fn rtty_auto_arm(…)")` is satisfied by the string literal inside the
+        // assertion itself and passes with no command defined anywhere. A top-level `fn` is
+        // unindented; every mention inside a test body is not.
+        assert!(
+            src.lines().any(|l| l.starts_with("fn rtty_auto_arm(")),
+            "the command the UI invokes must exist"
+        );
+        let list = src
+            .split_once("tauri::generate_handler![")
+            .expect("the handler list")
+            .1;
+        let list = list
+            .split_once("])")
+            .expect("the end of the handler list")
+            .0;
+        for name in ["rtty_auto_arm", "rtty_arm", "get_rtty_state"] {
+            assert!(
+                list.lines().any(|l| l.trim() == format!("{name},")),
+                "{name} is not registered — invoking it from the UI would fail at runtime"
+            );
+        }
+    }
+
+    /// The advisory DTO carries the ruleset's facts verbatim — and pins the 2026
+    /// seed's DORMANCY: both events ship `spotting/cluster_allowed: true` (the
+    /// sponsors' rules were read 2026-08-29 and restrict neither — see the seed's
+    /// `_provenance`), so the assistance advisory renders NOWHERE today. Flipping
+    /// a flag is a data edit; this test is where that edit becomes visible.
+    #[test]
+    fn fd_ruleset_dto_carries_the_facts_and_the_seed_is_dormant() {
+        // WFD: the WSJT-suite ban (dead data since it was written — the DTO is
+        // what finally wires it to a consumer), warn-only enforcement.
+        let wfd = super::fd_ruleset_dto("wfd");
+        assert_eq!(wfd.event, "wfd");
+        assert!(
+            wfd.banned_modes.iter().any(|m| m == "FT8"),
+            "WFD bans the WSJT modes: {:?}",
+            wfd.banned_modes
+        );
+        assert_eq!(wfd.enforcement, "warn", "warn, never remove — operator ruling");
+        assert!(wfd.spotting_allowed && wfd.cluster_allowed, "2026 seed is dormant");
+
+        // ARRL FD ("" = the settings default): no banned modes, same dormancy.
+        let sfd = super::fd_ruleset_dto("");
+        assert_eq!(sfd.event, "arrlfd");
+        assert!(sfd.banned_modes.is_empty(), "ARRL FD bans no modes");
+        assert!(sfd.spotting_allowed && sfd.cluster_allowed, "2026 seed is dormant");
+        assert!(sfd.rules_year >= 2026);
+    }
+
+    /// …and the state the command hands back reflects the arm, through the DTO the cockpit
+    /// actually reads. The POLICY is the engine's (`Engine::rtty_auto_arm`, tested there);
+    /// this pins the layer I own — that the command returns the FRESH state rather than the
+    /// one from before the arm, which is what the cockpit renders.
+    #[test]
+    fn rtty_auto_arm_hands_back_the_state_it_just_changed() {
+        use tempo_app::settings::Settings;
+        let mut eng = tempo_app::engine::Engine::new("KD9TAW", "EN52", 0);
+        assert!(!super::rtty_state_dto(&eng).armed, "never launches armed");
+        eng.rtty_auto_arm();
+        assert!(
+            super::rtty_state_dto(&eng).armed,
+            "view entry armed the decoder and the DTO says so"
+        );
+
+        // The persisted opt-out refuses it, and the DTO reports the refusal honestly rather
+        // than an arm that did not happen.
+        let mut off = tempo_app::engine::Engine::with_settings(Settings {
+            rtty_rx_auto_arm: false,
+            ..Settings::default()
+        });
+        off.rtty_auto_arm();
+        assert!(!super::rtty_state_dto(&off).armed);
+    }
+
+    /// #140, the same promise in the READBACK direction: the broker answered `m` with
+    /// `settings.rig_mode()` — the band/section policy — while the radio had been commanded
+    /// something else entirely. An FM calling channel is the plainest case: the rig is in FM
+    /// and the policy still says USB, so a client asking "what mode are you in?" was told a
+    /// mode the radio was not in. A false answer here is the same defect as a false success on
+    /// `M`, one lane over.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn the_broker_reports_the_mode_the_radio_was_actually_commanded() {
+        use tempo_audio::rigctld_server::RigBackend;
+        let shared: SharedEngine = std::sync::Arc::new(std::sync::Mutex::new(
+            tempo_app::engine::Engine::new("KD9TAW", "EN52", 0),
+        ));
+        // A 2 m SSTV/FM calling channel: Phone section, FM commanded by the channel.
+        engine_lock(&shared).sstv_tune(145.500, "2m", "FM");
+        {
+            // The fixture is only interesting because the two answers DISAGREE here.
+            let e = engine_lock(&shared);
+            assert_eq!(e.rig_mode_effective(), "FM", "the rig is commanded FM");
+            assert_eq!(
+                e.settings().rig_mode(),
+                "USB",
+                "…while the section policy alone still says USB — the stale answer"
+            );
+        }
+        let rig = super::EngineRig::new(shared);
+        assert_eq!(
+            rig.mode().0,
+            "FM",
+            "the broker must report the mode the radio is in, not the one the policy would pick"
+        );
+
+        // The ordinary path is unchanged: with nothing overriding it, the commanded mode IS
+        // the section policy, and a data client still reads the DATA submode.
+        let digital: SharedEngine = std::sync::Arc::new(std::sync::Mutex::new(
+            tempo_app::engine::Engine::with_settings(tempo_app::settings::Settings {
+                operating_mode: tempo_app::settings::OperatingMode::Digital,
+                band: "20m".into(),
+                dial_mhz: 14.074,
+                sideband: "USB".into(),
+                ..tempo_app::settings::Settings::default()
+            }),
+        ));
+        assert_eq!(super::EngineRig::new(digital).mode().0, "PKTUSB");
+    }
+
+    /// #140, the reported half: the CAT broker answered `RPRT 0` to EVERY mode word. It
+    /// collapsed anything that was not LSB or FM to plain USB and returned true, so VarAC or
+    /// FreeDV asking for `PKTUSB`/`DATA-U` was told "done" while the rig sat in voice USB.
+    /// A false success on a mode is how a data signal ends up in the wrong emission.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn the_broker_never_reports_success_for_a_mode_it_did_not_set() {
+        use tempo_app::settings::{OperatingMode, Settings};
+        use tempo_audio::rigctld_server::RigBackend;
+        let rig_in = |mode: OperatingMode, dial_mhz: f64, sideband: &str| {
+            let s = Settings {
+                operating_mode: mode,
+                band: "20m".into(),
+                dial_mhz,
+                sideband: sideband.into(),
+                ..Settings::default()
+            };
+            let shared: SharedEngine = std::sync::Arc::new(std::sync::Mutex::new(
+                tempo_app::engine::Engine::with_settings(s),
+            ));
+            super::EngineRig::new(shared)
+        };
+
+        // Nexus is in the Phone section, so it commands plain USB. A data client asking for
+        // the DATA submode must be REFUSED — not told yes and left on voice.
+        let phone = rig_in(OperatingMode::Phone, 14.200, "USB");
+        assert_eq!(phone.mode().0, "USB", "fixture: Phone commands plain USB");
+        assert!(
+            !phone.set_mode("PKTUSB", 3000),
+            "PKTUSB is not USB — answering RPRT 0 here puts a data signal in a voice emission"
+        );
+        assert!(
+            !phone.set_mode("DATA-U", 3000),
+            "same mode, vendor spelling"
+        );
+        assert!(
+            !phone.set_mode("FM", 3000),
+            "the sideband field is not the FM switch — the rig stays in SSB"
+        );
+        assert!(
+            !phone.set_mode("CW", 3000),
+            "the section owns the mode class"
+        );
+        assert!(
+            !phone.set_mode("BOGUS", 3000),
+            "an unknown word is not a yes"
+        );
+        // What Phone CAN honour: the plain SSB it is already in.
+        assert!(
+            phone.set_mode("USB", 2700),
+            "USB is exactly what it commands"
+        );
+        assert_eq!(phone.mode().0, "USB", "and it is still in it");
+
+        // The Digital section commands the DATA submode, so the same request succeeds — and a
+        // side flip inside the family is the broker's to make.
+        let digital = rig_in(OperatingMode::Digital, 14.074, "USB");
+        assert_eq!(digital.mode().0, "PKTUSB", "fixture: Digital commands DATA");
+        assert!(digital.set_mode("PKTUSB", 3000));
+        assert!(
+            digital.set_mode("DATA-U", 3000),
+            "vendor spelling of the same"
+        );
+        assert!(digital.set_mode("PKTLSB", 3000), "a side flip within DATA");
+        assert_eq!(digital.mode().0, "PKTLSB", "and it actually moved");
+        assert!(
+            !digital.set_mode("USB", 2700),
+            "plain USB is a different emission from PKTUSB — refuse it"
+        );
+    }
+
+    /// #165: on a bind failure the manager thread recorded NOTHING, so `running` stayed `None`,
+    /// the `want != have` branch re-ran `TcpListener::bind` on the very next tick, and the
+    /// connection log filled with the identical error at 1 Hz forever. Five minutes of a port
+    /// that is never going to be free is the shape of the reporter's log.
+    #[test]
+    fn a_broker_bind_that_keeps_failing_backs_off_and_is_reported_once() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut failure: Option<super::BrokerBindFailure> = None;
+        let (mut attempts, mut logged) = (0u32, 0u32);
+        for tick in 0..300u64 {
+            // The manager's 1 Hz loop, against a port a foreign rigctld owns: every attempt
+            // fails.
+            let now = start + Duration::from_secs(tick);
+            if super::broker_may_attempt(failure.as_ref(), 4532, now) {
+                attempts += 1;
+                if super::broker_record_failure(&mut failure, 4532, now) {
+                    logged += 1;
+                }
+            }
+        }
+        assert_eq!(logged, 1, "one line per failure, not one per second");
+        assert!(
+            attempts <= 10,
+            "five minutes of a busy port must not be 300 bind attempts (was {attempts})"
+        );
+        // A port CHANGE is a fresh situation — the operator moving the broker off the busy
+        // port must be tried at once, not held behind the old port's backoff.
+        assert!(super::broker_may_attempt(
+            failure.as_ref(),
+            4534,
+            start + Duration::from_secs(300)
+        ));
+    }
+
+    /// R3: on Linux the opener plugin's `that_detached` returns `Ok` the moment the launcher is
+    /// SPAWNED and never reads its exit status, so "no handler" (xdg-open exit 3) and "the
+    /// handler failed" (exit 4) both reported success. Upstream, the UI took that success and
+    /// recorded the version as dismissed forever — one click silencing update notices for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launcher_that_refuses_the_url_is_reported_as_a_failure() {
+        let url = "https://example.invalid/nexus";
+        assert!(
+            super::spawn_launcher("sh", &["-c", "exit 3"], url).is_err(),
+            "a launcher that exits non-zero opened nothing"
+        );
+        assert!(super::spawn_launcher("sh", &["-c", "exit 4"], url).is_err());
+        assert!(super::spawn_launcher("sh", &["-c", "exit 0"], url).is_ok());
+        // Still alive at the deadline = it took the URL (it IS the browser, or it is waiting
+        // on one). Waiting for THAT to exit is what the detached spawn exists to avoid, so
+        // "still running" has to read as success.
+        assert!(super::spawn_launcher("sh", &["-c", "sleep 2"], url).is_ok());
+        assert!(
+            super::spawn_launcher("nexus-no-such-launcher-exists", &[], url).is_err(),
+            "a launcher that is not installed is not a success either"
+        );
+    }
+
     /// The roster's State-or-Province column and the log record's ADIF `STATE` both come from
     /// `subdivision_hint`. Two things have to hold, and only the first one did.
     ///
@@ -18220,14 +21373,29 @@ mod tests {
             Some(70.200),
             "a CW pick parks on the 4 m SSB/CW calling frequency"
         );
-        // …and it stays unkeyable-by-omission for every US class: no FCC 4 m allocation
-        // exists, so the row must not reach their dropdown at all. The 2 m control is what
-        // makes each `None` evidence rather than an empty list.
+        // …and for every US class it is RECEIVE-ONLY rather than absent (#184, akhepcat).
+        //
+        // ⚠️ THIS ASSERTION WAS INVERTED ON 2026-08-31, DELIBERATELY. It used to require the
+        // row to be missing entirely — "unkeyable by omission" — which applied a transmit
+        // rule to a tuning list: no licence restricts LISTENING, and the radio tunes 4 m
+        // whatever the operator's class. The reporter put it exactly right: block transmit
+        // out of band, do not prevent reception.
+        //
+        // The safety half did NOT change and is asserted here alongside: no US class may
+        // KEY 4 m, and `privileges::tx_allowed` is what refuses it. Listing a band is not
+        // permission to transmit on it.
         for class in [Technician, General, Extra] {
             for mode in [Phone, Cw] {
+                let row = ch(class, mode).unwrap_or_else(|| {
+                    panic!("{class:?} {mode:?}: 4 m must be listed so it can be listened to")
+                });
                 assert!(
-                    ch(class, mode).is_none(),
-                    "{class:?} {mode:?}: the US has no 4 m allocation"
+                    !row.tx,
+                    "{class:?} {mode:?}: 4 m must be marked receive-only, not keyable"
+                );
+                assert!(
+                    !tempo_app::privileges::tx_allowed(class, row.dial_mhz, mode),
+                    "{class:?} {mode:?}: the US has no 4 m allocation — the gate must refuse"
                 );
                 assert!(
                     super::licensed_bands(class, mode)
@@ -18277,7 +21445,10 @@ mod tests {
         note_conn_health(ID, true, String::new());
         let (ok3, fail3, detail3) = conn_health_of(ID);
         assert!(ok3.is_some());
-        assert_eq!(fail3, fail2, "the failure timestamp must survive a recovery");
+        assert_eq!(
+            fail3, fail2,
+            "the failure timestamp must survive a recovery"
+        );
         assert_eq!(detail3, detail2, "and so must its reason");
 
         // One slot per connector, not one per call — otherwise the vec grows unbounded
@@ -18319,7 +21490,10 @@ mod tests {
         );
         // Stale status: return it, but LABELED stale — never as this test's answer.
         let r = cat_test_timeout("CAT confirmed — rig accepted a command".to_string(), None);
-        assert!(!r.ok, "a timed-out test must not claim green off a stale status");
+        assert!(
+            !r.ok,
+            "a timed-out test must not claim green off a stale status"
+        );
         assert!(
             r.detail.contains("Last known status") && r.detail.contains("CAT confirmed"),
             "{}",
@@ -18336,11 +21510,22 @@ mod tests {
         assert!(w.contains("REJECTED") && w.contains("separate"), "{w}");
         // Exact match (or missing data) → silence.
         assert_eq!(qrz_book_mismatch_warning("F4MQS", "F4MQS"), "");
-        assert_eq!(qrz_book_mismatch_warning("f4mqs", "F4MQS"), "", "case-insensitive");
-        assert_eq!(qrz_book_mismatch_warning("F4MQS/P", ""), "", "unknown owner = silent");
+        assert_eq!(
+            qrz_book_mismatch_warning("f4mqs", "F4MQS"),
+            "",
+            "case-insensitive"
+        );
+        assert_eq!(
+            qrz_book_mismatch_warning("F4MQS/P", ""),
+            "",
+            "unknown owner = silent"
+        );
         // A genuinely different operator (wrong key) gets the milder warning.
         let w2 = qrz_book_mismatch_warning("K1ABC", "W9XYZ");
-        assert!(w2.contains("W9XYZ") && w2.contains("K1ABC") && !w2.contains("separate"), "{w2}");
+        assert!(
+            w2.contains("W9XYZ") && w2.contains("K1ABC") && !w2.contains("separate"),
+            "{w2}"
+        );
     }
 
     #[test]
@@ -18348,32 +21533,40 @@ mod tests {
         use super::plain_qrz_reason;
         let m = plain_qrz_reason("QRZ Internal Error: Unable to add QSO to database");
         assert!(m.contains("Unable to add QSO"), "keeps the raw string: {m}");
-        assert!(m.contains("per exact callsign"), "adds the plain explanation: {m}");
+        assert!(
+            m.contains("per exact callsign"),
+            "adds the plain explanation: {m}"
+        );
         // Unrecognised reasons pass through untouched.
         assert_eq!(plain_qrz_reason("some other error"), "some other error");
     }
 
     use super::{
-        callbook_candidates, redact_for_backup,
-        iso_from_stamp, reconcile_gallery,
-        migrate_sstv_gallery_between,
-        write_qso_wav_in,
-       assistance_posture_changed, b64_decode, b64_encode, catalog_marks, dxped_page_url,
-        engine_lock, install_block_reason, is_complete_lotw_body, iss_pass_from_tles,
-        load_tle_snapshot_from, own_decode_heards, parse_sstv_mode, profile_dir_name, qso_is_sat,
-        cluster_spot_heards, rect_lands_on_work_area, roster_local_spots, roster_spot_age_secs,
-        set_operator_qth, spotter_evidence_rank, spotter_evidence_rank_at,
-        resolve_bird, resolve_birds, run_sat_track, sanitize_profile, sat_excluded,
+        assistance_posture_changed, b64_decode, b64_encode, callbook_candidates, catalog_marks,
+        cluster_spot_heards, dxped_page_url, engine_lock, install_block_reason,
+        is_complete_lotw_body, iso_from_stamp, iss_pass_from_tles, load_tle_snapshot_from,
+        migrate_sstv_gallery_between, own_decode_heards, parse_sstv_mode, profile_dir_name,
+        qso_is_sat, reconcile_gallery, rect_lands_on_work_area, redact_for_backup, resolve_bird,
+        resolve_birds, roster_local_spots, roster_spot_age_secs, run_sat_track, sanitize_profile,
+        sat_excluded, set_operator_qth, spotter_evidence_rank, spotter_evidence_rank_at,
         tle_absorb_foreign, tle_act_gate, tle_extend_aliases, tle_merge_imports,
         tle_merged_elements, tle_record_aliases, tle_seed, tle_seed_floor, tle_seed_path,
-        tle_set_currency, view_passes, write_json_atomic, AssistanceEvent,
+        tle_set_currency, view_passes, write_json_atomic, write_qso_wav_in, AssistanceEvent,
         AssistanceSourceState, SatBird, SatTrackDto, SatTrackLoss, SatTrackRun, SharedEngine,
-        SAT_TRACK, SAT_TRACK_GEN, TLE_ACT_STALE_DAYS, TLE_FETCHING, TLE_STALE_LINE_DAYS,
-        TleFlightGuard, TleSnapshot
+        TleFlightGuard, TleSnapshot, SAT_TRACK, SAT_TRACK_GEN, TLE_ACT_STALE_DAYS, TLE_FETCHING,
+        TLE_STALE_LINE_DAYS,
     };
 
     /// A scratch file path unique to this test process (std-only — no tempfile
     /// dependency), cleaned up by the caller.
+    /// A per-test scratch directory.
+    ///
+    /// ⚠️ `name` MUST BE UNIQUE PER TEST. The pid separates concurrent cargo processes, not the
+    /// tests inside one — those run on threads and share it. Two tests on one name write into
+    /// each other's folder, and one of them `remove_dir_all`s it mid-run, so the pair fails
+    /// intermittently and by test ORDER: `--test-threads=1` is green, the ordinary parallel run
+    /// is red one time in several. Exactly that cost a red gate on 2026-08-23, where it read as a
+    /// fresh break in whatever had just been edited.
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("nexus-test-{}-{name}", std::process::id()))
     }
@@ -18526,7 +21719,10 @@ mod tests {
 
         let out = reconcile_gallery(
             &dir,
-            vec![entry(&gone, "2026-07-16T15:30:00Z"), entry(&there, "2026-07-17T15:30:00Z")],
+            vec![
+                entry(&gone, "2026-07-16T15:30:00Z"),
+                entry(&there, "2026-07-17T15:30:00Z"),
+            ],
         );
         assert_eq!(out.len(), 1, "the missing file's entry is dropped");
         assert_eq!(out[0].path, there.to_string_lossy());
@@ -18540,7 +21736,7 @@ mod tests {
     /// from a bare file and stay zero rather than being invented.
     #[test]
     fn an_image_the_index_never_knew_about_is_adopted() {
-        let dir = scratch("sstv-adopt");
+        let dir = scratch("sstv-adopt-orphan");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let orphan = dir.join("20260717T153000Z_pd120.bmp");
@@ -18548,7 +21744,11 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"not an image").unwrap();
 
         let out = reconcile_gallery(&dir, vec![]);
-        assert_eq!(out.len(), 1, "only the .bmp is adopted, not every file in the folder");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the .bmp is adopted, not every file in the folder"
+        );
         assert_eq!(out[0].path, orphan.to_string_lossy());
         assert_eq!(out[0].mode, "pd120");
         assert_eq!(out[0].finished_utc, "2026-07-17T15:30:00Z");
@@ -18560,7 +21760,10 @@ mod tests {
     /// Adoption must not invent a date from a filename that is not the decoder's shape.
     #[test]
     fn a_stray_bmp_gets_no_fabricated_timestamp() {
-        assert_eq!(iso_from_stamp("20260717T153000Z").as_deref(), Some("2026-07-17T15:30:00Z"));
+        assert_eq!(
+            iso_from_stamp("20260717T153000Z").as_deref(),
+            Some("2026-07-17T15:30:00Z")
+        );
         assert_eq!(iso_from_stamp("holiday-photo"), None);
         assert_eq!(iso_from_stamp("2026071xT153000Z"), None); // non-digit
         assert_eq!(iso_from_stamp("20260717X153000Z"), None); // wrong separator
@@ -18579,12 +21782,18 @@ mod tests {
         std::fs::write(&a, b"BM").unwrap();
         std::fs::write(&b, b"BM").unwrap();
 
-        let given = vec![entry(&b, "2026-07-17T10:00:00Z"), entry(&a, "2026-07-16T10:00:00Z")];
+        let given = vec![
+            entry(&b, "2026-07-17T10:00:00Z"),
+            entry(&a, "2026-07-16T10:00:00Z"),
+        ];
         let out = reconcile_gallery(&dir, given);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, a.to_string_lossy(), "oldest first");
         assert_eq!(out[1].path, b.to_string_lossy());
-        assert_eq!(out[0].freq_mhz, 14.23, "a known entry keeps its real metadata");
+        assert_eq!(
+            out[0].freq_mhz, 14.23,
+            "a known entry keeps its real metadata"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18622,14 +21831,21 @@ mod tests {
         let dir = scratch("rec-ok");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let path = write_qso_wav_in(&dir, "W1AW/P", &[0i16, 100, -100]).expect("write must succeed");
-        assert!(path.exists(), "the file the call returned must actually be there");
+        let path =
+            write_qso_wav_in(&dir, "W1AW/P", &[0i16, 100, -100]).expect("write must succeed");
+        assert!(
+            path.exists(),
+            "the file the call returned must actually be there"
+        );
         assert_eq!(path.parent(), Some(dir.as_path()));
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         // The slash is stripped rather than becoming a directory separator.
         assert!(name.starts_with("qso-W1AWP-"), "unexpected name: {name}");
         assert!(name.ends_with(".wav"));
-        assert!(std::fs::metadata(&path).unwrap().len() > 0, "an empty file is not a recording");
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 0,
+            "an empty file is not a recording"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18712,6 +21928,7 @@ mod tests {
             lotw_user: false,
             freq_hz: None,
             calling: None,
+            cq_dir: None,
             state: None,
         };
         let spots = |stations: &[tempo_app::dto::Station], clock: &SlotClock, period: f64| {
@@ -18802,6 +22019,7 @@ mod tests {
             lotw_user: false,
             freq_hz: None,
             calling: None,
+            cq_dir: None,
             state: None,
         };
         // The renumbering, measured rather than asserted from memory: the FT4 index of
@@ -18821,7 +22039,11 @@ mod tests {
         // is one minute old, inside the 2-minute window, and carries its grid + state
         // hint through.
         let fresh = own_decode_heards(&[st(ft8_now - 4)], ft8_now, 15.0, "6m", "FT8", 120);
-        assert_eq!(fresh.len(), 1, "a one-minute-old own decode is the board's job");
+        assert_eq!(
+            fresh.len(),
+            1,
+            "a one-minute-old own decode is the board's job"
+        );
         assert_eq!(fresh[0].call, "VE3ABC");
         assert_eq!(fresh[0].band, "6m");
         assert_eq!(fresh[0].mode, "FT8");
@@ -18946,7 +22168,7 @@ mod tests {
         const HF: f64 = 14025.0; // 20 m CW
         const SIX: f64 = 50090.0; // 6 m CW
         const TWO: f64 = 144_050.0; // 2 m CW
-        // 78 km from EN52 — inside every VHF near radius, so it counts on both.
+                                    // 78 km from EN52 — inside every VHF near radius, so it counts on both.
         assert_eq!(spotter_evidence_rank_at("K9IMM", SIX, "KD9TAW", en52), 2);
         assert_eq!(spotter_evidence_rank_at("K9IMM", TWO, "KD9TAW", en52), 2);
         // 626 km from EN52 (EN91EF). Inside 2 m's 800 km radius, outside 6 m's 250 km:
@@ -19247,7 +22469,10 @@ mod tests {
         let path = scratch("legacy-tles.json");
         std::fs::write(&path, format!("[{TLE_JSON_BIRD}]")).unwrap();
         let s = load_tle_snapshot_from(&path).expect("legacy array must load");
-        assert_eq!(s.fetched_at, 0, "unknown provenance must read as due, never fresh");
+        assert_eq!(
+            s.fetched_at, 0,
+            "unknown provenance must read as due, never fresh"
+        );
         assert_eq!(s.source, "legacy");
         assert_eq!(s.elements.len(), 1);
         assert!(s.elements[0].line1.starts_with("1 25544U"));
@@ -19296,7 +22521,7 @@ mod tests {
             tempo_app::engine::Engine::new("KD9TAW", "EN52", 0),
         ));
         engine_lock(&shared).set_frequency(14.105, "20m", "USB");
-        let rig = super::EngineRig(shared);
+        let rig = super::EngineRig::new(shared);
         assert_eq!(rig.freq_hz(), 14_105_000);
     }
 
@@ -19332,6 +22557,9 @@ mod tests {
             state: None,
             band: band.into(),
             freq_mhz,
+            // #163: a satellite QSO keeps its downlink-derived FREQ and writes no FREQ_RX —
+            // the operator ruled the split pair TERRESTRIAL-only, and this fixture is a pass.
+            freq_rx_mhz: None,
             mode: "FM".into(),
             rst_sent: None,
             rst_rcvd: None,
@@ -19392,7 +22620,11 @@ mod tests {
     fn a_contact_logged_during_a_pass_earns_satellite_credit() {
         // SO-50: a V/U bird, so the operator's dial — and the record's band —
         // is the 70 cm downlink.
-        let mut e = engine_holding("SAUDISAT 1C (SO-50)|FM Voice Repeater", 145_850_000, 436_795_000);
+        let mut e = engine_holding(
+            "SAUDISAT 1C (SO-50)|FM Voice Repeater",
+            145_850_000,
+            436_795_000,
+        );
         e.log_qso(pass_qso("W1AW", "FN31", "70cm", 436.795));
 
         let logged = &e.get_log()[0];
@@ -19547,7 +22779,8 @@ mod tests {
 
             // The real fold, over a real logged contact, through the real
             // engine — as the Satellites strip builds it, mid-pass, untagged.
-            let mut e = engine_holding("FOX-1B (AO-91)|FM Voice Repeater", 435_250_000, 145_960_000);
+            let mut e =
+                engine_holding("FOX-1B (AO-91)|FM Voice Repeater", 435_250_000, 145_960_000);
             e.log_qso(pass_qso("W1AW", "FN31", band, mhz));
             let logged = &e.get_log()[0];
             let s = awards_fold_over(logged);
@@ -19563,7 +22796,11 @@ mod tests {
                 on_bird.then_some("SAT"),
                 "{band}: the stamp must fire exactly on the downlink"
             );
-            assert_eq!(s.vucc.sat_worked, usize::from(on_bird), "{band}: sat bucket");
+            assert_eq!(
+                s.vucc.sat_worked,
+                usize::from(on_bird),
+                "{band}: sat bucket"
+            );
             assert_eq!(
                 s.vucc.worked,
                 usize::from(!on_bird),
@@ -19654,8 +22891,14 @@ mod tests {
         )));
         let con = super::SatDopplerConsent::read(&e);
         assert!(con.downlink, "the one dial IS driven (downlink leg)");
-        assert!(!con.uplink, "no split exists to drive — the wire must not claim one");
-        assert_eq!(con.offer, "none", "nothing to confirm on a one-channel bird");
+        assert!(
+            !con.uplink,
+            "no split exists to drive — the wire must not claim one"
+        );
+        assert_eq!(
+            con.offer, "none",
+            "nothing to confirm on a one-channel bird"
+        );
 
         // Same bird, mapping NOT confirmed: still no offer — confirming here
         // would change nothing this pass, and the promise in the offer copy
@@ -20102,7 +23345,10 @@ mod tests {
             aliases: Default::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("\"fetchedAt\""), "wire keys are camelCase: {json}");
+        assert!(
+            json.contains("\"fetchedAt\""),
+            "wire keys are camelCase: {json}"
+        );
         assert!(write_json_atomic(&path, &json));
         let back = load_tle_snapshot_from(&path).expect("snapshot must load");
         assert_eq!(back.fetched_at, snap.fetched_at);
@@ -20133,10 +23379,16 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         // A crash mid-write under a NON-atomic writer: half the JSON.
         std::fs::write(&path, &json[..json.len() / 2]).unwrap();
-        assert!(load_tle_snapshot_from(&path).is_none(), "torn file must not load");
+        assert!(
+            load_tle_snapshot_from(&path).is_none(),
+            "torn file must not load"
+        );
         // The atomic writer replaces it wholesale and leaves no temp behind.
         assert!(write_json_atomic(&path, &json));
-        assert_eq!(load_tle_snapshot_from(&path).map(|s| s.fetched_at), Some(42));
+        assert_eq!(
+            load_tle_snapshot_from(&path).map(|s| s.fetched_at),
+            Some(42)
+        );
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         assert!(!tmp.exists(), "the rename must consume the temp file");
         let _ = std::fs::remove_file(&path);
@@ -20181,7 +23433,11 @@ mod tests {
         // So must ONE source changing while the unassisted flag stays put (e.g. the operator
         // turning the AI decoder off by hand) — otherwise the record would claim the decoder
         // was running when it was not.
-        assert!(assistance_posture_changed(&log, false, &posture(false, true, true)));
+        assert!(assistance_posture_changed(
+            &log,
+            false,
+            &posture(false, true, true)
+        ));
     }
 
     /// THE SELF-UPDATE SAFETY GATE. Installing restarts the app, and this app keys a
@@ -20230,7 +23486,7 @@ mod tests {
         assert_eq!(sanitize_profile("radio-a").as_deref(), Some("radio-a"));
         assert_eq!(sanitize_profile("K9_2m").as_deref(), Some("K9_2m"));
         assert_eq!(sanitize_profile("  hf  ").as_deref(), Some("hf")); // trimmed
-        // Anything that could escape the config root or split it into junk → None (default).
+                                                                       // Anything that could escape the config root or split it into junk → None (default).
         assert_eq!(sanitize_profile(""), None);
         assert_eq!(sanitize_profile("../evil"), None); // path escape
         assert_eq!(sanitize_profile("a/b"), None);
@@ -20323,7 +23579,10 @@ mod tests {
             Ok(None)
         ));
         // No elements at all → Ok(None) (the no-TLE path get_iss_pass short-circuits).
-        assert!(matches!(iss_pass_from_tles(&[], EN52, ISS_EPOCH_UNIX), Ok(None)));
+        assert!(matches!(
+            iss_pass_from_tles(&[], EN52, ISS_EPOCH_UNIX),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -20339,7 +23598,10 @@ mod tests {
             .expect("fresh elements pass the gate")
             .expect("ISS pass found mid-pass");
         assert_eq!(got.name, ISS_NAME);
-        assert!(got.los_unix > now, "the reported pass is still above the horizon");
+        assert!(
+            got.los_unix > now,
+            "the reported pass is still above the horizon"
+        );
         assert!(got.status.is_none(), "geometry only — no status stamped");
     }
 
@@ -20369,7 +23631,10 @@ mod tests {
         assert!((age - 15.0).abs() < 0.01, "age {age}");
         assert!((epoch - ISS_EPOCH_UNIX).abs() <= 1, "epoch {epoch}");
         let err = tle_act_gate(&iss_tle(), ISS_EPOCH_UNIX + 40 * day).unwrap_err();
-        assert!(err.contains("40 days old") && err.contains(ISS_NAME), "{err}");
+        assert!(
+            err.contains("40 days old") && err.contains(ISS_NAME),
+            "{err}"
+        );
     }
 
     // --- the SET-WIDE readout (field report 2026-08-01) -----------------------
@@ -20392,7 +23657,11 @@ mod tests {
             .iter()
             .filter_map(|t| propagation::sat::tle_age_days(&t.line1, SEED_NOW))
             .collect();
-        assert!(raw.len() >= 300, "the bundle must be present: {}", raw.len());
+        assert!(
+            raw.len() >= 300,
+            "the bundle must be present: {}",
+            raw.len()
+        );
         let newest = raw.iter().copied().fold(f64::INFINITY, f64::min);
         let ages: Vec<Option<f64>> = raw.iter().map(|a| Some(a - newest)).collect();
 
@@ -20411,7 +23680,11 @@ mod tests {
              {oldest_admitted:.1} d) — this test no longer reproduces the bug"
         );
 
-        let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            ages.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         assert!(c.usable >= 300, "usable birds: {}", c.usable);
         assert!(
             c.held_back > 0,
@@ -20442,7 +23715,11 @@ mod tests {
                 .map(|i| Some(0.2 + f64::from(i) * 0.001))
                 .chain((0..12).map(|i| Some(tail_top - f64::from(i) * 0.5)))
                 .collect();
-            let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+            let c = tle_set_currency(
+                ages.iter().copied(),
+                TLE_STALE_LINE_DAYS,
+                TLE_ACT_STALE_DAYS,
+            );
             let headline = c.median_age_days.expect("usable birds exist");
             assert!(
                 headline < 1.0,
@@ -20462,12 +23739,20 @@ mod tests {
             .map(|i| Some(16.0 + f64::from(i) * 0.7))
             .chain((0..4).map(|_| Some(0.5)))
             .collect();
-        let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            ages.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         let headline = c.median_age_days.expect("usable birds exist");
         assert!(headline > 14.0, "a rotting set must warn: {headline:.1} d");
 
         let rotten: Vec<Option<f64>> = (0..20).map(|i| Some(31.0 + f64::from(i))).collect();
-        let c = tle_set_currency(rotten.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            rotten.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         assert_eq!((c.usable, c.aging, c.held_back), (0, 0, 20));
         assert!(
             c.median_age_days.is_none(),
@@ -20481,11 +23766,19 @@ mod tests {
     #[test]
     fn unparseable_epochs_are_in_no_band_at_all() {
         let ages = [Some(0.4), Some(1.2), None, Some(44.0), None];
-        let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            ages.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         assert_eq!(c.usable, 2);
         assert_eq!(c.held_back, 1, "count - usable would say 3");
         assert_eq!(c.aging, 0);
-        assert_eq!(c.median_age_days, Some(1.2), "upper median, as validate_tles picks");
+        assert_eq!(
+            c.median_age_days,
+            Some(1.2),
+            "upper median, as validate_tles picks"
+        );
     }
 
     /// THE RESIDUAL FALSE CALM the median alone still allows: half the catalog
@@ -20503,7 +23796,11 @@ mod tests {
             .chain((0..49).map(|i| Some(29.0 - f64::from(i) * 0.01)))
             .chain((0..30).map(|i| Some(31.0 + f64::from(i))))
             .collect();
-        let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            ages.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         // ONE bucket per bird, and the bands are readable as a share:
         // `aging` sits INSIDE `usable` (those birds are still drawn),
         // `held_back` is disjoint from it (those sit out) — so
@@ -20523,7 +23820,11 @@ mod tests {
     #[test]
     fn the_band_edges_match_the_per_bird_gates() {
         let ages = [Some(14.0), Some(14.01), Some(30.0), Some(30.01)];
-        let c = tle_set_currency(ages.iter().copied(), TLE_STALE_LINE_DAYS, TLE_ACT_STALE_DAYS);
+        let c = tle_set_currency(
+            ages.iter().copied(),
+            TLE_STALE_LINE_DAYS,
+            TLE_ACT_STALE_DAYS,
+        );
         assert_eq!((c.usable, c.aging, c.held_back), (3, 2, 1));
     }
 
@@ -20707,7 +24008,11 @@ mod tests {
             .iter()
             .find(|t| propagation::sat::norad_id(&t.line1) == Some(99_999))
             .unwrap();
-        assert!(n99.line1.contains("26180."), "newest epoch kept: {}", n99.line1);
+        assert!(
+            n99.line1.contains("26180."),
+            "newest epoch kept: {}",
+            n99.line1
+        );
         // …and an OLDER re-import of 11111 is ignored.
         tle_merge_imports(&mut snap, vec![bird(11_111, 26, 120.0)], now);
         let n11 = snap
@@ -20715,7 +24020,11 @@ mod tests {
             .iter()
             .find(|t| propagation::sat::norad_id(&t.line1) == Some(11_111))
             .unwrap();
-        assert!(n11.line1.contains("26200."), "older import ignored: {}", n11.line1);
+        assert!(
+            n11.line1.contains("26200."),
+            "older import ignored: {}",
+            n11.line1
+        );
         // The MERGED view: 3 birds (group 2 + the new launch), with the
         // imported 11111 (day 200) beating the group's day-100 copy.
         let merged = tle_merged_elements(&snap);
@@ -20724,7 +24033,11 @@ mod tests {
             .iter()
             .find(|t| propagation::sat::norad_id(&t.line1) == Some(11_111))
             .unwrap();
-        assert!(m11.line1.contains("26200."), "import beats older group: {}", m11.line1);
+        assert!(
+            m11.line1.contains("26200."),
+            "import beats older group: {}",
+            m11.line1
+        );
         // A group refresh catching up PAST the import (day 300) wins back —
         // and the import list itself persisted untouched across it.
         snap.elements = vec![bird(11_111, 26, 300.0), iss_tle()];
@@ -20733,7 +24046,11 @@ mod tests {
             .iter()
             .find(|t| propagation::sat::norad_id(&t.line1) == Some(11_111))
             .unwrap();
-        assert!(m11.line1.contains("26300."), "fresher group wins: {}", m11.line1);
+        assert!(
+            m11.line1.contains("26300."),
+            "fresher group wins: {}",
+            m11.line1
+        );
         assert_eq!(snap.imported.len(), 2, "imports persist across refreshes");
     }
 
@@ -20756,7 +24073,10 @@ mod tests {
             bird(55_555, 26, 100.0),
         ];
         tle_record_aliases(&mut a);
-        assert!(write_json_atomic(&path, &serde_json::to_string(&a).unwrap()));
+        assert!(write_json_atomic(
+            &path,
+            &serde_json::to_string(&a).unwrap()
+        ));
         // Instance B's in-memory snapshot: a fresher group refresh, no
         // knowledge of A's import — plus its OWN fresher import of 55555.
         let mut b = snap_with(vec![bird(11_111, 26, 200.0)]);
@@ -20783,7 +24103,10 @@ mod tests {
             n55.line1
         );
         // …and elements stayed OURS — absorb never merges the group.
-        assert!(b.elements[0].line1.contains("26200."), "elements are last-writer-wins");
+        assert!(
+            b.elements[0].line1.contains("26200."),
+            "elements are last-writer-wins"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -20796,8 +24119,14 @@ mod tests {
         let now = 1_785_542_400i64;
         let path = scratch("shared-tles-catalog.json");
         let mut a = snap_with(vec![bird(11_111, 26, 100.0)]);
-        a.catalog = vec![catalog_entry(11_111, "alive"), catalog_entry(25_544, "alive")];
-        assert!(write_json_atomic(&path, &serde_json::to_string(&a).unwrap()));
+        a.catalog = vec![
+            catalog_entry(11_111, "alive"),
+            catalog_entry(25_544, "alive"),
+        ];
+        assert!(write_json_atomic(
+            &path,
+            &serde_json::to_string(&a).unwrap()
+        ));
 
         let mut b = snap_with(vec![bird(11_111, 26, 200.0)]); // catalog-less
         let disk = load_tle_snapshot_from(&path).expect("A's write must load");
@@ -20841,7 +24170,10 @@ mod tests {
         // And a catalog-bearing snapshot round-trips through the same writer.
         let mut with = snap_with(vec![bird(25_544, 26, 200.0)]);
         with.catalog = vec![catalog_entry(25_544, "alive")];
-        assert!(write_json_atomic(&path, &serde_json::to_string(&with).unwrap()));
+        assert!(write_json_atomic(
+            &path,
+            &serde_json::to_string(&with).unwrap()
+        ));
         let loaded = load_tle_snapshot_from(&path).expect("round-trip");
         assert_eq!(loaded.catalog, with.catalog);
         let _ = std::fs::remove_file(&path);
@@ -20966,7 +24298,10 @@ mod tests {
         assert_eq!(snap.elements.len(), n_el);
         assert_eq!(snap.catalog.len(), n_cat);
         assert_eq!(snap.count, n_el);
-        assert!(snap.etag.is_none(), "there is no ETag for a file we shipped");
+        assert!(
+            snap.etag.is_none(),
+            "there is no ETag for a file we shipped"
+        );
         assert!(snap.imported.is_empty());
         // …and the refresh decision agrees: no stamp = no cache age = fetch
         // at the first opportunity, and the ratchet treats a bundled set as
@@ -21020,7 +24355,10 @@ mod tests {
         // seed must never restamp a real fetch.
         assert_eq!(snap.fetched_at, was_fetched, "the seed restamped fetchedAt");
         assert_eq!(snap.source, was_source, "the seed rewrote the provenance");
-        assert_eq!(snap.etag, was_etag, "the seed cleared the conditional-GET ETag");
+        assert_eq!(
+            snap.etag, was_etag,
+            "the seed cleared the conditional-GET ETag"
+        );
         assert_eq!(snap.generated, was_generated);
     }
 
@@ -21094,7 +24432,7 @@ mod tests {
     #[test]
     fn a_bird_that_stops_being_workable_keeps_a_row_that_says_why() {
         let now = 1_785_542_400i64; // 2026-08-01T00:00:00Z (day 213)
-        // Two held element sets: one drawn on the map, one aged past 30 d.
+                                    // Two held element sets: one drawn on the map, one aged past 30 d.
         let held = vec![bird(25_544, 26, 213.0), bird(43_017, 26, 150.0)];
         let drawn: std::collections::HashSet<u32> = [25_544].into_iter().collect();
         let mut catalog = std::collections::HashMap::new();
@@ -21102,8 +24440,8 @@ mod tests {
         catalog.insert(43_017, catalog_entry(43_017, "alive"));
         // …and three the mirror LISTS but publishes no elements for.
         for (norad, status, amateur) in [
-            (53_106, "dead", true),      // silent orbit, transmitter record lags
-            (40_967, "alive", false),    // in orbit, every transmitter gone quiet
+            (53_106, "dead", true),       // silent orbit, transmitter record lags
+            (40_967, "alive", false),     // in orbit, every transmitter gone quiet
             (50_988, "re-entered", true), // gone
         ] {
             let mut c = catalog_entry(norad, status);
@@ -21113,9 +24451,20 @@ mod tests {
         }
 
         let out = sat_excluded(&held, &drawn, &catalog, now);
-        let row = |n: u32| out.iter().find(|e| e.norad == n).expect("a row for every one");
-        assert_eq!(out.len(), 4, "everything unplaceable is reported, nothing else");
-        assert!(!out.iter().any(|e| e.norad == 25_544), "a drawn bird is not excluded");
+        let row = |n: u32| {
+            out.iter()
+                .find(|e| e.norad == n)
+                .expect("a row for every one")
+        };
+        assert_eq!(
+            out.len(),
+            4,
+            "everything unplaceable is reported, nothing else"
+        );
+        assert!(
+            !out.iter().any(|e| e.norad == 25_544),
+            "a drawn bird is not excluded"
+        );
         assert_eq!(row(43_017).reason, "staleElements");
         assert_eq!(row(53_106).reason, "noElements");
         assert_eq!(row(53_106).status.as_deref(), Some("dead"));
@@ -21123,7 +24472,11 @@ mod tests {
         // THE regression: an alive-but-silent bird is exactly the case the
         // old `if c.amateur` filter deleted.
         assert_eq!(row(40_967).status.as_deref(), Some("alive"));
-        assert_eq!(row(40_967).amateur, Some(false), "and it says WHY it is gone");
+        assert_eq!(
+            row(40_967).amateur,
+            Some(false),
+            "and it says WHY it is gone"
+        );
         // The catalog's answer rides to the UI; a bird the catalog does not
         // know stays silent about it (absent = never asked, never "no").
         let json = serde_json::to_value(row(40_967)).unwrap();
@@ -21131,7 +24484,10 @@ mod tests {
         let unknown = sat_excluded(&held, &drawn, &Default::default(), now);
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].amateur, None);
-        assert!(serde_json::to_value(&unknown[0]).unwrap().get("amateur").is_none());
+        assert!(serde_json::to_value(&unknown[0])
+            .unwrap()
+            .get("amateur")
+            .is_none());
     }
 
     /// The CATALOG marks a bird's row carries. `status` alone could not
@@ -21538,10 +24894,16 @@ mod tests {
             s.dxcc_credited, s.dxcc_confirmed,
             "CREDIT_GRANTED rode in on the same rows (the 23-of-248 gap)"
         );
-        assert_eq!(s.slots_confirmed, s.slots_worked, "Challenge entity×band slots");
+        assert_eq!(
+            s.slots_confirmed, s.slots_worked,
+            "Challenge entity×band slots"
+        );
         assert_eq!(s.ready_to_submit, 0, "confirmed − credited");
         assert_eq!(s.waz_confirmed, s.waz_worked, "WAZ zones");
-        assert_eq!(s.was.confirmed, 2, "WAS — STATE only rides on a matched row");
+        assert_eq!(
+            s.was.confirmed, 2,
+            "WAS — STATE only rides on a matched row"
+        );
         assert_eq!(s.was.worked, 2);
     }
 
@@ -21579,7 +24941,10 @@ mod tests {
     #[test]
     fn the_call_as_typed_is_always_asked_first() {
         let c = callbook_candidates("W1AW/1");
-        assert_eq!(c[0], "W1AW/1", "the operator asked for this call, not for its base");
+        assert_eq!(
+            c[0], "W1AW/1",
+            "the operator asked for this call, not for its base"
+        );
     }
 
     /// An ordinary call must not cost a second network round trip on every miss.
@@ -21601,7 +24966,6 @@ mod tests {
             );
         }
     }
-
 
     /// #28 item 4: a backup is only useful if a restore can tell it apart from any other JSON.
     /// These pin the REFUSALS, because a partial restore of a mangled file is worse than a
@@ -21650,6 +25014,121 @@ mod tests {
              here and drop it from BACKUP_REDACTED_FIELDS; if it was RENAMED, the redaction is \
              now silently missing a live credential"
         );
+    }
+
+    /// A park is placed by the feed's own coordinates when it has them, and by its
+    /// grid square only as a fallback — which must announce itself as approximate.
+    /// SOTA has neither, so a summit is not placeable from its spot feed at all and
+    /// must be dropped rather than plotted at a guess.
+    #[test]
+    fn parks_are_placed_by_coordinates_then_grid_then_not_at_all() {
+        let base = propagation::OtaSpot {
+            program: "POTA".into(),
+            reference: "US-1352".into(),
+            name: "Fort Washington".into(),
+            activator: "N3ES".into(),
+            freq_khz: 14049.0,
+            mode: "CW".into(),
+            spotter: None,
+            comment: None,
+            grid: None,
+            lat: None,
+            lon: None,
+            spot_time_unix: None,
+        };
+
+        // Exact coordinates win, and are NOT flagged approximate.
+        let exact = propagation::OtaSpot {
+            lat: Some(40.1209),
+            lon: Some(-75.2237),
+            grid: Some("FN20jc".into()),
+            ..base.clone()
+        };
+        let (la, lo, approx) = crate::place_ota(&exact).expect("a park with coordinates was dropped");
+        assert!((la - 40.1209).abs() < 1e-9 && (lo - -75.2237).abs() < 1e-9);
+        assert!(!approx, "exact coordinates were reported as approximate");
+
+        // No coordinates: the grid centre, flagged approximate.
+        let gridded = propagation::OtaSpot { grid: Some("FN20jc".into()), ..base.clone() };
+        let (gla, glo, gapprox) = crate::place_ota(&gridded).expect("a gridded park was dropped");
+        assert!(gapprox, "a grid-placed park did not admit it is approximate");
+        // Same square, so within a few km of the exact fix above.
+        assert!((gla - 40.1209).abs() < 0.1 && (glo - -75.2237).abs() < 0.1);
+
+        // Neither — the SOTA case. Dropped, never guessed.
+        assert!(
+            crate::place_ota(&base).is_none(),
+            "a spot with no position was placed anyway — a summit plotted at a guess"
+        );
+
+        // A grid too short to resolve is also not a guess.
+        let junk = propagation::OtaSpot { grid: Some("F".into()), ..base };
+        assert!(crate::place_ota(&junk).is_none());
+    }
+
+
+    /// #184 (akhepcat): "just because I'm not licensed to transmit in the US, there are no
+    /// restrictions on receiving. The correct behavior should be to block transmit when
+    /// out-of-band, but not to prevent reception. This is what the radio does already."
+    ///
+    /// He is right, and the band dropdown was applying a TRANSMIT rule to a TUNING list: a
+    /// band whose class held no segment was omitted entirely, so a US General could not
+    /// select 4 m at all. Now every band is listed and `tx` says which may be keyed.
+    ///
+    /// ⚠️ THE HALF THAT MUST NOT MOVE: listing a band is not permission to transmit on it.
+    /// `privileges::tx_allowed` is the gate and it is untouched — this asserts both halves
+    /// together, because the fix is only correct if the second one still refuses.
+    #[test]
+    fn a_band_you_cannot_key_is_still_listed_for_listening() {
+        use tempo_app::settings::{LicenseClass, OperatingMode};
+
+        let general = crate::licensed_bands(LicenseClass::General, OperatingMode::Digital);
+        let four = general
+            .iter()
+            .find(|c| c.band == "4m")
+            .expect("4 m vanished from a General's band list — that is the reported bug");
+        assert!(!four.tx, "4 m must be marked receive-only for a US General");
+        assert!(
+            four.dial_mhz >= 70.0 && four.dial_mhz < 71.0,
+            "a receive-only row still needs a sensible listening dial, got {}",
+            four.dial_mhz
+        );
+
+        // The gate is unchanged: still no US 4 m transmit privilege at any class.
+        assert!(
+            !tempo_app::privileges::tx_allowed(LicenseClass::General, 70.2, OperatingMode::Digital),
+            "listing 4 m must NOT have granted transmit on it"
+        );
+
+        // A band the class CAN key is listed as before, and marked transmit-capable.
+        let twenty = general
+            .iter()
+            .find(|c| c.band == "20m")
+            .expect("20 m missing for a General");
+        assert!(twenty.tx, "20 m is a General's own band and must be keyable");
+        assert!(tempo_app::privileges::tx_allowed(
+            LicenseClass::General,
+            twenty.dial_mhz,
+            OperatingMode::Digital
+        ));
+
+        // A Technician has no 20 m data privilege — listed, and marked receive-only.
+        let tech = crate::licensed_bands(LicenseClass::Technician, OperatingMode::Digital);
+        let t20 = tech
+            .iter()
+            .find(|c| c.band == "20m")
+            .expect("20 m vanished for a Technician — they may still listen there");
+        assert!(!t20.tx, "a Technician must not be told they can key 20 m data");
+
+        // Open (non-US / undeclared) keeps everything transmit-capable.
+        let open = crate::licensed_bands(LicenseClass::Open, OperatingMode::Digital);
+        assert!(
+            open.iter().all(|c| c.tx),
+            "the Open class is trusted everywhere and must show nothing as receive-only"
+        );
+        // And nobody LOSES a band by this change: every class lists the same set.
+        assert_eq!(general.len(), open.len());
+        assert_eq!(tech.len(), open.len());
     }
 
 }
