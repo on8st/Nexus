@@ -1922,6 +1922,9 @@ pub struct Engine {
     /// Manual PTT for live phone (operator push-to-talk): the radio loop keys the rig
     /// while true. Gated by `tx_enabled` (Monitor). Operator-initiated only.
     manual_ptt: bool,
+    /// DIAGNOSTIC BUILD ONLY — who last cleared `manual_ptt`. NOT FOR MERGE.
+    diag_ptt_cleared_by: Option<String>,
+    diag_ptt_why: Option<String>,
     /// Desired RF output power as a 0.0–1.0 fraction; `None` = leave the rig's power
     /// alone. The radio loop applies it via `rig.set_power` when it changes.
     rf_power: Option<f32>,
@@ -3675,6 +3678,8 @@ impl Engine {
             cw_peer_state: String::new(),
             cw_abort: false,
             manual_ptt: false,
+            diag_ptt_cleared_by: None,
+            diag_ptt_why: None,
             rf_power: None,
             rig_rf_power: None,
             mic_gain: None,
@@ -6472,8 +6477,23 @@ impl Engine {
 
     /// Manually key (true) / unkey (false) the rig for live phone. Gated by Monitor:
     /// a key request is ignored while TX is disabled. The radio loop applies it.
+    /// DIAGNOSTIC BUILD ONLY — `#[track_caller]` so the breadcrumb names the CALLER, the same
+    /// trick `set_tx_enabled` uses. NOT FOR MERGE.
+    #[track_caller]
     pub fn set_ptt(&mut self, on: bool) {
+        let was = self.manual_ptt;
         self.manual_ptt = on && self.tx_enabled && self.tx_allowed();
+        // Record BOTH edges, so the log carries the latch as well as the drop: without the
+        // rising edge there is no way to say how long a held key actually lasted.
+        if was != self.manual_ptt {
+            self.diag_ptt_cleared_by = Some(format!(
+                "set_ptt(on={on}) from {} why={} (tx_enabled={} tx_allowed={})",
+                std::panic::Location::caller(),
+                self.diag_ptt_why.as_deref().unwrap_or("-"),
+                self.tx_enabled,
+                self.tx_allowed()
+            ));
+        }
     }
 
     /// Whether the operator is holding manual PTT (live phone) — read by the loop. Also
@@ -6546,6 +6566,31 @@ impl Engine {
     /// two transmissions here with no precomputed end, so a stuck one must expire on a wall clock
     /// rather than on anything the operator or the UI is still doing.
     pub const LIVE_MIC_MAX_MS: u64 = Self::RTTY_MAX_LATCH_MS;
+
+    /// DIAGNOSTIC BUILD ONLY — the three inputs `manual_ptt()` ANDs, so the loop can say WHICH
+    /// one dropped a held key. NOT FOR MERGE.
+    pub fn diag_ptt_cleared_by(&self) -> String {
+        self.diag_ptt_cleared_by.clone().unwrap_or_else(|| "(none recorded)".into())
+    }
+
+    /// DIAGNOSTIC BUILD ONLY — the UI's own label for WHY it is calling [`Self::set_ptt`].
+    /// Every `set_ptt` caller in the frontend funnels through ONE Tauri command, so
+    /// `#[track_caller]` alone cannot tell an operator release from the `[lock]` effect
+    /// cleanup: both report the same call site. The label crosses that boundary. NOT FOR MERGE.
+    pub fn set_ptt_why(&mut self, why: Option<String>) {
+        self.diag_ptt_why = why;
+    }
+
+    pub fn diag_ptt_parts(&self) -> (bool, bool, bool, f64, String, String) {
+        (
+            self.manual_ptt,
+            self.broker_ptt,
+            self.tx_enabled,
+            self.settings.dial_mhz,
+            format!("{:?}", self.settings.operating_mode),
+            self.settings.sideband.clone(),
+        )
+    }
 
     pub fn manual_ptt(&self) -> bool {
         (self.manual_ptt || self.broker_ptt) && self.tx_enabled && self.tx_allowed()
@@ -8921,6 +8966,10 @@ impl Engine {
         // Drop any LATCHED key intent too (manual PTT-lock / a broker client holding
         // T 1): Stop TX and a radio switch must release PTT, not merely mask it until
         // TX re-enables — else re-arming TX re-keys the radio with nobody holding it.
+        if self.manual_ptt {
+            self.diag_ptt_cleared_by =
+                Some(format!("cleared at {}", std::panic::Location::caller()));
+        }
         self.manual_ptt = false;
         self.broker_ptt = false;
         // A pending snappy-TX request dies with the halt — otherwise the loop
@@ -9260,6 +9309,10 @@ impl Engine {
             // same `manual_ptt()` OR, so leaving it latched would preserve the defect through
             // the other input. A broker that still wants the key re-asserts it on its next
             // message; a broker that has gone away must not leave one behind.
+            if self.manual_ptt {
+                self.diag_ptt_cleared_by =
+                    Some(format!("cleared at {}", std::panic::Location::caller()));
+            }
             self.manual_ptt = false;
             self.broker_ptt = false;
             // A SLOT over already in flight is NOT cut here. Operator (2026-07-31):

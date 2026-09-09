@@ -1193,8 +1193,13 @@ export async function setCwKeyer(
 }
 
 /** Manual PTT for live phone — key (true) / unkey (false) the rig. */
-export async function setPtt(on: boolean): Promise<AppSnapshot> {
-  return invoke<AppSnapshot>('set_ptt', { on })
+/** DIAGNOSTIC BUILD ONLY — write a line into /tmp/nexus-ptt-diag.log. NOT FOR MERGE. */
+export async function diagNote(msg: string): Promise<void> {
+  return invoke<void>('diag_note', { msg })
+}
+
+export async function setPtt(on: boolean, why?: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_ptt', { on, why })
 }
 
 /** Set RF output power as a 0.0–1.0 fraction. */

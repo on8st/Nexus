@@ -10633,11 +10633,32 @@ fn stop_cw(state: State<'_, SharedEngine>) -> Result<AppSnapshot, String> {
     Ok(eng.snapshot())
 }
 
+/// DIAGNOSTIC BUILD ONLY — append a line from the FRONTEND to the PTT diagnostic log, so a
+/// cockpit mount/unmount lands in the same timeline as the latch/unlatch edges. This is how we
+/// find out whether `PhoneCockpit` remounts on its own: a remount runs the `[lock]` effect
+/// cleanup, which calls `set_ptt(false)` and drops a held key. NOT FOR MERGE.
+#[tauri::command(async)]
+fn diag_note(msg: String) {
+    use std::io::Write as _;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/nexus-ptt-diag.log")
+    {
+        let _ = writeln!(f, "{msg} t={t}");
+    }
+}
+
 /// Manual PTT for live phone — key (true) / unkey (false) the rig. Operator push-to-
 /// talk; respects Monitor (a key request is ignored while TX is disabled).
 #[tauri::command(async)]
-fn set_ptt(state: State<'_, SharedEngine>, on: bool) -> Result<AppSnapshot, String> {
+fn set_ptt(state: State<'_, SharedEngine>, on: bool, why: Option<String>) -> Result<AppSnapshot, String> {
     let mut eng = engine_lock(&state);
+    eng.set_ptt_why(why); // DIAGNOSTIC BUILD ONLY — NOT FOR MERGE
     eng.set_ptt(on);
     Ok(eng.snapshot())
 }
@@ -17644,6 +17665,7 @@ fn build_app(d: BuildDeps) -> tauri::Result<tauri::App> {
             stop_cw,
             set_cw_keyer,
             set_ptt,
+            diag_note, // DIAGNOSTIC BUILD ONLY — NOT FOR MERGE
             set_rf_power,
             set_mic_gain,
             set_nr_level,

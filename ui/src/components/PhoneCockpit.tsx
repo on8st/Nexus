@@ -30,6 +30,7 @@ import { LiveLevelMeter, useSmeterDb } from './LiveMeters'
 import { LogEntry } from './LogEntry'
 import {
   setPtt,
+  diagNote,
   setRfPower,
   setLiveMic,
   setMicGain,
@@ -334,6 +335,9 @@ const FLEX_SPANS = [
   { label: '2M', hz: 2_000_000 },
 ] as const
 
+// DIAGNOSTIC BUILD ONLY — NOT FOR MERGE.
+let phoneMountCounter = 0
+
 export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, fieldDay, phoneMode, wheelSensitivity, spots, needByCall, typeByCall, onWorkSpot, onRecallMemory, onOpenMemories, onOpenSettings, panels }: Props) {
   // Live S-meter (shared 100 ms poll, lock-free backend) — used to arrive via the 300 ms
   // snapshot on top of the backend's own sampling, which read as a laggy needle. smeterDb-only
@@ -429,6 +433,18 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     void setScopeRef(tenths)
   }
   const [keyed, setKeyed] = useState(false)
+
+  // DIAGNOSTIC BUILD ONLY — does this cockpit remount on its own? A remount runs the [lock]
+  // effect's cleanup, which calls setPtt(false) and drops a held key with a tag that looks
+  // exactly like a deliberate Lock untick. This effect has an EMPTY dep array, so its cleanup
+  // fires on a REAL unmount and nothing else. NOT FOR MERGE.
+  useEffect(() => {
+    const id = ++phoneMountCounter
+    void diagNote(`MOUNT   PhoneCockpit #${id}`)
+    return () => {
+      void diagNote(`UNMOUNT PhoneCockpit #${id}`)
+    }
+  }, [])
 
   // ⚠️ THE STALE "ON AIR" BUTTON IS A KNOWN, UNFIXED BUG — and the obvious fix is WRONG.
   //
@@ -648,7 +664,7 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
   // reads the CURRENT TX-allowed privilege state through key() — not whatever existed when bound.
   const snapRef = useRef(snap)
   snapRef.current = snap
-  const key = (on: boolean) => {
+  const key = (on: boolean, why = 'key') => {
     // Don't key (or show ON-AIR) outside license privileges — the engine blocks it anyway.
     if (on && !snapRef.current.radio.txAllowed) {
       pushToast(t('phone.tx.locked'), 'info', 3500)
@@ -684,17 +700,17 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
       return
     }
     setKeyed(on)
-    void setPtt(on)
+    void setPtt(on, why) // DIAGNOSTIC BUILD ONLY — the `why` tag. NOT FOR MERGE.
   }
   const onPttDown = () => {
     if (lock) {
-      key(!keyed) // hands-free: toggle
+      key(!keyed, keyed ? 'button-lock-toggle-off' : 'button-lock-toggle-on') // hands-free: toggle
     } else {
-      key(true)
+      key(true, 'button-hold-down')
     }
   }
   const onPttUp = () => {
-    if (!lock) key(false)
+    if (!lock) key(false, 'button-hold-up-or-leave')
   }
   const changePower = (pct: number) => {
     setPower(pct)
@@ -736,13 +752,13 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     const down = (e: KeyboardEvent) => {
       if (e.code === 'Space' && !e.repeat && !isField(e.target) && !lock) {
         e.preventDefault()
-        key(true)
+        key(true, 'space-down')
       }
     }
     const up = (e: KeyboardEvent) => {
       if (e.code === 'Space' && !isField(e.target) && !lock) {
         e.preventDefault()
-        key(false)
+        key(false, 'space-up')
       }
     }
     window.addEventListener('keydown', down)
@@ -750,7 +766,10 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
     return () => {
       window.removeEventListener('keydown', down)
       window.removeEventListener('keyup', up)
-      void setPtt(false) // safety: never leave the rig keyed on unmount
+      // DIAGNOSTIC BUILD ONLY — the tag is the whole point of this build. The dep array is
+      // [lock], so React runs this cleanup on EVERY Lock toggle as well as on a real unmount;
+      // both look identical to an operator release in the backend log without it. NOT FOR MERGE.
+      void setPtt(false, 'effect-cleanup[lock-change-or-unmount]') // safety: never leave the rig keyed on unmount
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lock])
@@ -1595,7 +1614,7 @@ export function PhoneCockpit({ snap, theme, pendingWork, onConsumeWork, onSnap, 
           onKeyDown={(e) => {
             if (lock && (e.key === 'Enter' || e.key === ' ')) {
               e.preventDefault()
-              key(!keyed)
+              key(!keyed, keyed ? 'kbd-lock-toggle-off' : 'kbd-lock-toggle-on')
             }
           }}
           disabled={!snap.radio.txAllowed}

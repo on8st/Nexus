@@ -6969,6 +6969,29 @@ impl RadioLoop {
             // successful key with nothing on the wire. `manual_ptt_applied` stays false, so a
             // held mic keys FOR REAL on the first tick the loop owns the right rig. An UNKEY
             // is never gated — it must always reach the radio.
+            // DIAGNOSTIC BUILD ONLY — name the cause when a HELD key drops on its own.
+            if ptt != self.manual_ptt_applied {
+                let (mp, bp, txen, dial, mode, sb) = { engine_lock(engine).diag_ptt_parts() };
+                let allowed = { engine_lock(engine).tx_allowed() };
+                let who = { engine_lock(engine).diag_ptt_cleared_by() };
+                let line = format!(
+                    "{} t={now:.0} manual_ptt={mp} broker_ptt={bp} tx_enabled={txen} \
+                     tx_allowed={allowed} dial={dial:.6} mode={mode} sideband={sb} \
+                     may_key={} live_mic_open={} CLEARED_BY=[{}]\n",
+                    if ptt { "LATCH  " } else { "UNLATCH" },
+                    self.may_key(),
+                    self.live_mic_open,
+                    who,
+                );
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/nexus-ptt-diag.log")
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
             if ptt != self.manual_ptt_applied && (!ptt || self.may_key()) {
                 if ptt {
                     self.ensure_commanded(rig); // read-only launch: assert before key
